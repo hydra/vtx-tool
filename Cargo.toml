@@ -7,5 +7,6 @@ edition = "2021"
 serialport = "4"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.34"
-egui = "0.34"
+eframe = "=0.34.0"
+egui = "=0.34.0"
+log = "0.4"
