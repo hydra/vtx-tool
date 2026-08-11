@@ -1,0 +1,11 @@
+[package]
+name = "rf-cal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serialport = "4"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.34"
+egui = "0.34"
