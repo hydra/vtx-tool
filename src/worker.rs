@@ -38,8 +38,9 @@ pub struct SharedState {
     /// this kind's max_update_hz() right away.
     pub meter_kind: PowerMeterKind,
     /// User-configured polling rate, clamped to meter_kind.max_update_hz()
-    /// wherever it's set (see pages/calibration.rs).
-    pub update_hz: u32,
+    /// wherever it's set (see pages/calibration.rs). f64 rather than an
+    /// integer Hz -- the dropdown includes fractional rates (0.5Hz).
+    pub update_hz: f64,
     /// Last thing the VTX itself reported when WE queried it -- a
     /// debug/confirmation aid, unrelated to the passive auto-responder.
     pub vtx_config: Option<msp::VtxConfig>,
@@ -53,7 +54,7 @@ impl Default for SharedState {
             last_dbm: None,
             power_history: VecDeque::new(),
             meter_kind: PowerMeterKind::default(),
-            update_hz: 5, // conservative default, within every currently-known meter's max
+            update_hz: 1.0, // conservative default; ImmersionRC V1's own max is now 5Hz, so this leaves headroom below it and stays valid for any future slower-max meter too
             vtx_config: None,
             connected: false,
         }
@@ -69,6 +70,15 @@ pub enum Command {
     Disconnect,
     RefreshCalTable,
     RefreshVtxConfig,
+    /// Actively sends the current VtxTableConfig selection (band/channel/
+    /// frequency/pitmode/power) to the VTX, unprompted -- unlike the
+    /// passive auto-responder (which only answers the VTX's own empty
+    /// MSP_VTX_CONFIG query), this pushes the same 15-byte payload as a
+    /// command. vtx_msp.c's dispatch only branches on payload size
+    /// (empty = query, >=15 bytes = apply), not on the request/response
+    /// marker, so this is processed by the exact same
+    /// handle_msp_set_vtx_config() path a real FC's push would hit.
+    PushVtxConfig,
 }
 
 pub fn spawn(
@@ -110,7 +120,7 @@ pub fn spawn(
                         let mut s = state.lock().unwrap();
                         s.connected = vtx.is_some() && meter.is_some();
                         s.meter_kind = meter_kind;
-                        s.update_hz = s.update_hz.min(meter_kind.max_update_hz()).max(1);
+                        s.update_hz = s.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
                         s.power_history.clear();
                         drop(s);
                         last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
@@ -152,6 +162,18 @@ pub fn spawn(
                             error!(target: "vtx", "RefreshVtxConfig requested while disconnected");
                         }
                     }
+
+                    Command::PushVtxConfig => {
+                        if let Some(link) = vtx.as_mut() {
+                            let payload = vtx_table.lock().unwrap().encode_vtx_config_response();
+                            match link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                Ok(()) => debug!(target: "vtx", "pushed VTX_CONFIG (Save)"),
+                                Err(e) => error!(target: "vtx", "failed to push VTX_CONFIG: {e}"),
+                            }
+                        } else {
+                            error!(target: "vtx", "PushVtxConfig requested while disconnected");
+                        }
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -179,8 +201,8 @@ pub fn spawn(
             // actually achievable, not just theoretically requested.
             if let Some(m) = meter.as_mut() {
                 let interval = {
-                    let hz = state.lock().unwrap().update_hz.max(1);
-                    Duration::from_secs_f64(1.0 / hz as f64)
+                    let hz = state.lock().unwrap().update_hz.max(0.01);
+                    Duration::from_secs_f64(1.0 / hz)
                 };
                 if last_meter_read.elapsed() >= interval {
                     last_meter_read = Instant::now();

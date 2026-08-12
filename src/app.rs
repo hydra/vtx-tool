@@ -190,7 +190,9 @@ impl eframe::App for App {
                                     // Reflected immediately (even before Connect) so the
                                     // calibration page's update-rate dropdown can clamp
                                     // to this kind's max_update_hz() right away.
-                                    self.state.lock().unwrap().meter_kind = kind;
+                                    let mut s = self.state.lock().unwrap();
+                                    s.meter_kind = kind;
+                                    s.update_hz = s.update_hz.min(kind.max_update_hz() as f64);
                                 }
                             }
                         });

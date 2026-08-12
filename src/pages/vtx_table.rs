@@ -118,7 +118,7 @@ pub fn show(
 
     // ---- Selected: what this tool reports to the VTX when it asks ---
     ui.group(|ui| {
-        ui.strong("Selected (reported to the VTX when it queries MSP_VTX_CONFIG)");
+        ui.strong("Frequency");
 
         ui.checkbox(&mut cfg.pitmode, "Pit mode");
 
@@ -181,6 +181,10 @@ pub fn show(
         ui.add(egui::Slider::new(&mut cfg.selected_power, 1..=power_count).text("Power level"));
         if let Some(p) = cfg.power_levels.iter().find(|p| p.index == cfg.selected_power) {
             ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
+        }
+
+        if ui.button("Save").clicked() {
+            let _ = cmd_tx.send(Command::PushVtxConfig);
         }
     });
 
