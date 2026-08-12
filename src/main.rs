@@ -10,7 +10,7 @@
 //! of whether auto-connect fires.
 
 mod app;
-mod calibration;
+mod calibration_engine;
 mod conn_status;
 mod logging;
 mod msp;

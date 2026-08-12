@@ -10,12 +10,12 @@
 //! dedicated read-until-quiet loop), a PASSIVE responder (answering the
 //! VTX's own unsolicited MSP_VTX_CONFIG query), and -- new in this
 //! revision -- the calibration sweep engine's PACALIBRATION response
-//! listener. The sweep itself (calibration.rs) is advanced one step per
+//! listener. The sweep itself (calibration_engine.rs) is advanced one step per
 //! tick here too, rather than run as a blocking loop, so meter polling
 //! and the passive responder keep working throughout a sweep that can
 //! take several minutes.
 
-use crate::calibration::{self, SweepEngine};
+use crate::calibration_engine::{self, SweepEngine};
 use crate::msp::{self, function, MspLink};
 use crate::power_meter::{PowerMeter, PowerMeterKind};
 use crate::vtxtable::VtxTableConfig;
@@ -44,7 +44,7 @@ pub struct SharedState {
     /// every push evicts an old entry), this never plateaus. The sweep
     /// engine's "wait for K new readings" tracking uses this instead of
     /// power_history.len() for exactly that reason -- using len() was a
-    /// real bug (see calibration.rs's SampleWait doc comment).
+    /// real bug (see calibration_engine.rs's SampleWait doc comment).
     pub reading_seq: u64,
     /// Selected power meter kind -- set immediately when the user picks
     /// it in the left panel's dropdown (even before connecting), so the
@@ -126,12 +126,12 @@ pub enum Command {
     /// UI confirms the user has retuned a manual-frequency meter.
     ConfirmFrequency,
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
-    /// state (see calibration::safe_state_payload).
+    /// state (see calibration_engine::safe_state_payload).
     AbortSweep,
     /// User clicked Continue on the "VTX not responding" dialog after
     /// SharedState::vtx_ready came back true -- resumes the sweep,
     /// setting a hard limit on the level that was active when it
-    /// happened (see calibration::SweepEngine::resume_after_recovery).
+    /// happened (see calibration_engine::SweepEngine::resume_after_recovery).
     ResumeAfterVtxRecovery,
     /// Pushes the working pa_table's calibration[]/detector[] for every
     /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
@@ -194,6 +194,27 @@ pub fn spawn(
                         drop(s);
                         last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
                         last_meter_alive_check = Instant::now() - Duration::from_secs(1); // force an immediate first alive-check
+
+                        // Push a pitmode-safe VTX_CONFIG immediately on connect,
+                        // regardless of what the VTX was doing before. This isn't
+                        // specific to the VTX_CONFIG payload itself -- what actually
+                        // matters is that vtx_apply_hw() runs at all, which
+                        // unconditionally calls rf_pa_apply_level(NULL) as its very
+                        // first step, and THAT clears g_calibration_override
+                        // regardless of pitmode. A prior session's sweep can leave
+                        // that flag set (it suspends the closed loop so a manual mV
+                        // override holds still -- see rf_pa_set_calibration() in the
+                        // firmware), and if left set across a reconnect, a fresh
+                        // session inherits a VTX that's not running its normal
+                        // closed loop. This guarantees a known-clean starting point
+                        // every time, independent of how the previous session ended.
+                        if let Some(link) = vtx.as_mut() {
+                            let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                            match link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
+                                Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
+                            }
+                        }
                     }
 
                     Command::Disconnect => {
@@ -219,6 +240,7 @@ pub fn spawn(
                                     state.lock().unwrap().pa_table = table;
                                     if let Some(engine) = sweep.lock().unwrap().as_mut() {
                                         engine.clear_hard_limits();
+                                        engine.clear_cell_status();
                                     }
                                 }
                                 Err(e) => error!(target: "vtx", "PA table read failed: {e}"),
@@ -310,7 +332,7 @@ pub fn spawn(
                     }
 
                     Command::AbortSweep => {
-                        let payload = calibration::safe_state_payload(&vtx_table.lock().unwrap());
+                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
                         if let Some(link) = vtx.as_mut() {
                             match link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                 Ok(()) => debug!(target: "vtx", "sweep aborted, pitmode-safe state sent"),

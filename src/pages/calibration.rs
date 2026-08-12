@@ -1,10 +1,10 @@
 //! Calibration page: live power meter reading (with a rolling plot), the
 //! PA calibration table (now with per-level checkboxes, boost/RTC6705
 //! display columns, and a live calibration-status column), and the
-//! Re-calibrate sweep controls (see calibration.rs for the actual sweep
+//! Re-calibrate sweep controls (see calibration_engine.rs for the actual sweep
 //! state machine this drives).
 
-use crate::calibration::{self, LevelStatus};
+use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
@@ -56,6 +56,36 @@ impl Default for CalibrationPageState {
             tolerance_pct: 10.0, // matches rf_calibration.py's own scanDetector default (max(0.1, mW*0.1))
             checked: HashMap::new(),
             show_confirm_dialog: false,
+        }
+    }
+}
+
+/// Group-header band colors -- deliberately muted/desaturated to sit
+/// quietly in a dark theme rather than compete with the per-cell status
+/// colors below, which are the ones actually meant to draw the eye.
+const GROUP_CAL_COLOR: egui::Color32 = egui::Color32::from_rgb(45, 55, 70);
+const GROUP_DET_COLOR: egui::Color32 = egui::Color32::from_rgb(55, 48, 66);
+
+fn cell_color(status: CellStatus) -> Option<egui::Color32> {
+    match status {
+        CellStatus::Default => None,
+        CellStatus::Calibrated => Some(egui::Color32::from_rgb(50, 120, 65)), // green
+        CellStatus::Current => Some(egui::Color32::from_rgb(50, 100, 170)),   // blue
+        CellStatus::LimitHit => Some(egui::Color32::from_rgb(165, 55, 55)),   // red
+        CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(185, 125, 40)), // orange
+    }
+}
+
+/// Renders one calibration/detector value cell, background-tinted per
+/// its CellStatus (or left as a plain label, letting the Grid's own
+/// striping show through, when Default).
+fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
+    match cell_color(status) {
+        Some(color) => {
+            ui.label(egui::RichText::new(text).background_color(color));
+        }
+        None => {
+            ui.label(text);
         }
     }
 }
@@ -141,7 +171,7 @@ pub fn show(
     let awaiting_freq_mhz = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match e.state {
-            calibration::EngineState::AwaitingFreqConfirm { freq_mhz } => Some(freq_mhz),
+            calibration_engine::EngineState::AwaitingFreqConfirm { freq_mhz } => Some(freq_mhz),
             _ => None,
         })
     };
@@ -167,7 +197,7 @@ pub fn show(
     let unresponsive = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match e.state {
-            calibration::EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } => {
+            calibration_engine::EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } => {
                 Some((level, freq_mhz, mv_at_loss))
             }
             _ => None,
@@ -204,12 +234,42 @@ pub fn show(
 
     // ---- Table -----------------------------------------------------------
     let pa_table = shared.lock().unwrap().pa_table.clone();
+    let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
+
     egui::Grid::new("pa_table").striped(true).show(ui, |ui| {
+        // Group-header band: every cell in a span gets the same tinted
+        // background (via RichText::background_color), with the label only
+        // in the middle cell -- egui::Grid has no native merged/spanning
+        // cell, so a shared-color band across the span is the closest
+        // equivalent without pulling in a heavier table widget. This has
+        // to be a row WITHIN this same Grid (not a separate one) so its
+        // column widths are computed together with the label/data rows
+        // below and everything actually lines up.
+        for _ in 0..3 {
+            ui.label(""); // checkbox / idx / mW -- not part of either group
+        }
+        for i in 0..7 {
+            let text = if i == 3 { "Calibration (mV)" } else { "" };
+            ui.label(egui::RichText::new(text).background_color(GROUP_CAL_COLOR));
+        }
+        for i in 0..7 {
+            let text = if i == 3 { "Detector (mV)" } else { "" };
+            ui.label(egui::RichText::new(text).background_color(GROUP_DET_COLOR));
+        }
+        for _ in 0..4 {
+            ui.label(""); // Boost / RTC6705 / Limit / Status -- not part of either group
+        }
+        ui.end_row();
+
         ui.strong("");
         ui.strong("idx");
         ui.strong("mW");
-        ui.strong("calibration[] (mV)");
-        ui.strong("detector[] (mV)");
+        for f in frequencies {
+            ui.strong(format!("{f}"));
+        }
+        for f in frequencies {
+            ui.strong(format!("{f}"));
+        }
         ui.strong("Boost");
         ui.strong("RTC6705");
         ui.strong("Limit (mV)");
@@ -228,19 +288,29 @@ pub fn show(
             ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
             ui.label(entry.idx.to_string());
             ui.label(entry.m_w.to_string());
-            ui.label(format!("{:?}", entry.value));
-            ui.label(format!("{:?}", entry.detector));
+
+            let (cal_status, det_status, level_status, limit) = {
+                let g = sweep.lock().unwrap();
+                let cal_status: [CellStatus; 7] =
+                    std::array::from_fn(|i| g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default));
+                let det_status: [CellStatus; 7] =
+                    std::array::from_fn(|i| g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default));
+                let level_status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
+                let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
+                (cal_status, det_status, level_status, limit)
+            };
+
+            for i in 0..7 {
+                colored_cell(ui, entry.value[i].to_string(), cal_status[i]);
+            }
+            for i in 0..7 {
+                colored_cell(ui, entry.detector[i].to_string(), det_status[i]);
+            }
+
             ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
             ui.label(entry.rtc6705_level.to_string());
-
-            let (status, limit) = {
-                let g = sweep.lock().unwrap();
-                let status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
-                let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
-                (status, limit)
-            };
             ui.label(limit.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
-            ui.label(status_text(status.as_ref()));
+            ui.label(status_text(level_status.as_ref()));
             ui.end_row();
         }
     });

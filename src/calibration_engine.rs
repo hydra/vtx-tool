@@ -69,6 +69,32 @@ pub enum LevelStatus {
     Aborted,
 }
 
+/// Status of one (level, frequency) cell in the calibration/detector
+/// grids -- separate from LevelStatus (which is per-level, for the
+/// Status column), since a level spans 7 frequencies that can each be
+/// in a different state. Deliberately has no color/rendering baked in
+/// here -- that mapping lives in the UI (pages/calibration.rs), keeping
+/// this file free of an egui dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellStatus {
+    Default,
+    /// Successfully calibrated this run.
+    Calibrated,
+    /// Actively being worked on right now.
+    Current,
+    /// This is the specific point where a hard limit was discovered
+    /// (the VTX went unresponsive while sitting at this value). Sticky
+    /// -- once set, later Calibrated/Uncalibrated outcomes for the same
+    /// cell don't overwrite it (see set_cell_status), since the point
+    /// of this color is "this is where the trip happened", not "this
+    /// is this cell's current state".
+    LimitHit,
+    /// Could not be properly calibrated -- gave up because a hard limit
+    /// (or the physical DAC range) made the target unreachable, or a
+    /// search got pinned without ever reaching the tolerance band.
+    Uncalibrated,
+}
+
 /// Tracks "wait for `needed` new power readings since this was created".
 ///
 /// BUG FIX: this used to compare `power_history.len()` before/after --
@@ -187,6 +213,13 @@ pub struct SweepEngine {
     last_send: Instant,
 
     pub per_level_status: HashMap<u8, LevelStatus>,
+    /// Per (level, freq_idx) cell status for the calibration[] / detector[]
+    /// grid columns -- see CellStatus. Keyed separately since a level's
+    /// calibration cell and detector cell for the same frequency are
+    /// often in different states at any given moment (e.g. calibration
+    /// done/green while detector is current/blue).
+    pub cal_cell_status: HashMap<(u8, usize), CellStatus>,
+    pub det_cell_status: HashMap<(u8, usize), CellStatus>,
     pub total_steps: usize,
     pub completed_steps: usize,
 
@@ -273,6 +306,8 @@ impl SweepEngine {
             step: None,
             last_send: Instant::now() - SEND_INTERVAL,
             per_level_status,
+            cal_cell_status: HashMap::new(),
+            det_cell_status: HashMap::new(),
             total_steps,
             completed_steps: 0,
             pending_result: None,
@@ -377,6 +412,15 @@ impl SweepEngine {
                 let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
                 debug!(target: "vtx", "[sweep] no response from VTX for {:?} -- pausing (level={level} freq={freq_mhz}MHz mv={mv_at_loss}), likely a power-limited supply tripping",
                     since.elapsed());
+                match &self.step {
+                    Some(StepState::Pa(_)) => {
+                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    }
+                    Some(StepState::Detector(_)) => {
+                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    }
+                    None => {}
+                }
                 self.state = EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss };
                 return Ok(());
             }
@@ -430,6 +474,7 @@ impl SweepEngine {
                 level,
                 LevelStatus::InProgress(format!("{} / coarse ramp @ {freq_mhz}MHz", SweepOp::ScanPa.label())),
             );
+            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Current);
         }
 
         let now_seq = reading_seq;
@@ -477,7 +522,7 @@ impl SweepEngine {
                             // a previous VTX power-loss on this level) without reaching 80% -- bail
                             // this (level, freq) as best-effort.
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at mv={} without reaching 80% target -- bailing this (level,freq) as best-effort", st.mv);
-                            self.finish_scan_pa(level, st.mv);
+                            self.finish_scan_pa(level, st.mv, false);
                             return Ok(());
                         } else {
                             st.mv += up * COARSE_RAMP_STEP_MV;
@@ -499,15 +544,19 @@ impl SweepEngine {
                             st.wait = None;
                             if st.pinned_count >= PINNED_LIMIT {
                                 debug!(target: "vtx", "[sweep] ScanPa level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_pa(level, st.mv);
+                                self.finish_scan_pa(level, st.mv, false);
                                 return Ok(());
                             }
                         }
                     }
                     ScanPaPhase::Fine => {
-                        if avg_mw >= target_mw || !(bound_lo..=bound_hi).contains(&(st.mv + up)) {
+                        if avg_mw >= target_mw {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at mv={} ({avg_mw:.4}mW)", st.mv);
-                            self.finish_scan_pa(level, st.mv);
+                            self.finish_scan_pa(level, st.mv, true);
+                            return Ok(());
+                        } else if !(bound_lo..=bound_hi).contains(&(st.mv + up)) {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{bound_lo},{bound_hi}] at mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.mv);
+                            self.finish_scan_pa(level, st.mv, false);
                             return Ok(());
                         } else {
                             st.mv += up;
@@ -578,7 +627,7 @@ impl SweepEngine {
                             st.wait = None;
                             if st.pinned_count >= PINNED_LIMIT {
                                 debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_detector(level, detector_now);
+                                self.finish_scan_detector(level, detector_now, false);
                                 return Ok(());
                             }
                         }
@@ -613,14 +662,14 @@ impl SweepEngine {
                         if st.pinned_count >= PINNED_LIMIT {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={detector_now} as a rough (not interpolated) fallback",
                                 st.pinned_count);
-                            self.finish_scan_detector(level, detector_now);
+                            self.finish_scan_detector(level, detector_now, false);
                             return Ok(());
                         }
 
                         if let (Some(below), Some(above)) = (st.below, st.above) {
                             let detector = interpolate(target_mw, below, above);
                             debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
-                            self.finish_scan_detector(level, detector);
+                            self.finish_scan_detector(level, detector, true);
                             return Ok(());
                         }
                     }
@@ -743,13 +792,34 @@ impl SweepEngine {
         self.hard_limits.clear();
     }
 
+    /// Resets every cell in the calibration/detector grid back to
+    /// Default. Called on Refresh (alongside clear_hard_limits) -- per
+    /// spec, a Refresh should forget what a previous run marked, not
+    /// just the hard limits it found.
+    pub fn clear_cell_status(&mut self) {
+        self.cal_cell_status.clear();
+        self.det_cell_status.clear();
+    }
+
+    /// Sets `map[key] = status`, except LimitHit is sticky -- once a
+    /// cell is marked as the point where a trip happened, a later
+    /// Calibrated/Uncalibrated/Current outcome for that same cell
+    /// doesn't overwrite it (the point of that color is "this is where
+    /// it happened", not "this cell's current state").
+    fn set_cell_status(map: &mut HashMap<(u8, usize), CellStatus>, key: (u8, usize), status: CellStatus) {
+        if matches!(map.get(&key), Some(CellStatus::LimitHit)) && status != CellStatus::LimitHit {
+            return;
+        }
+        map.insert(key, status);
+    }
+
     fn send_calibration(&self, link: &mut MspLink, level: u8, mv: i32) -> anyhow::Result<()> {
         let (lo, hi) = self.effective_bounds(level);
         let mv = mv.clamp(lo, hi) as u16;
         link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(mv))))
     }
 
-    fn finish_scan_pa(&mut self, level: u8, mv: i32) {
+    fn finish_scan_pa(&mut self, level: u8, mv: i32, success: bool) {
         self.completed_steps += 1;
         self.pending_result = Some(SweepResult {
             level,
@@ -757,6 +827,11 @@ impl SweepEngine {
             calibration_mv: Some(mv.clamp(0, 3300) as u16),
             detector_mv: None,
         });
+        Self::set_cell_status(
+            &mut self.cal_cell_status,
+            (level, self.freq_idx),
+            if success { CellStatus::Calibrated } else { CellStatus::Uncalibrated },
+        );
         // ScanDetector runs immediately after ScanPa for the same (level, freq).
         // Starting point is a small step toward LESS power from the just-found
         // calibration value (matches the original script's intent: start
@@ -771,6 +846,7 @@ impl SweepEngine {
         let up = power_up_step(self.sign_inverted);
         let (bound_lo, bound_hi) = self.effective_bounds(level);
         let detector_start_mv = (mv - up * 5).clamp(bound_lo, bound_hi);
+        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Current);
         self.step = Some(StepState::Detector(ScanDetectorState {
             phase: ScanDetectorPhase::Backoff,
             mv: detector_start_mv,
@@ -781,7 +857,7 @@ impl SweepEngine {
         }));
     }
 
-    fn finish_scan_detector(&mut self, level: u8, detector_mv: u16) {
+    fn finish_scan_detector(&mut self, level: u8, detector_mv: u16, success: bool) {
         self.completed_steps += 1;
         self.pending_result = Some(SweepResult {
             level,
@@ -789,6 +865,11 @@ impl SweepEngine {
             calibration_mv: None,
             detector_mv: Some(detector_mv),
         });
+        Self::set_cell_status(
+            &mut self.det_cell_status,
+            (level, self.freq_idx),
+            if success { CellStatus::Calibrated } else { CellStatus::Uncalibrated },
+        );
         self.step = None;
         self.level_idx += 1;
         self.per_level_status.insert(level, LevelStatus::Done);
