@@ -6,9 +6,9 @@
 
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
+use crate::msp;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -75,16 +75,165 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
     }
 }
 
-/// Renders one calibration/detector value cell inside a TableBuilder
+/// Renders one calibration/detector value cell inside an egui_table
 /// column, filling the ENTIRE cell rect with its status color (painted
 /// first, full width/height) rather than just tinting behind the text --
 /// RichText::background_color only covers the glyphs' own bounding box,
-/// which is what this replaces.
+/// which is what this replaces. Also forces no-wrap (Truncate, matching
+/// the pattern egui_table's own demo uses for a long cell) -- without
+/// it, a narrow column wraps text one character per line rather than
+/// clipping it.
 fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
     if let Some(color) = cell_color(status) {
         ui.painter().rect_filled(ui.max_rect(), 0.0, color);
     }
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     ui.centered_and_justified(|ui| ui.label(text));
+}
+
+/// Column widths, in the same 21-column order used throughout: checkbox,
+/// idx, mW, 7 calibration columns, 7 detector columns, Boost, RTC6705,
+/// Limit, Status. Fixed/explicit (not content-driven), which is what
+/// actually stops any column from growing to fit a header label.
+const COL_WIDTHS: [f32; 21] = [
+    24.0, 28.0, 40.0, // checkbox, idx, mW
+    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, // calibration x7
+    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, // detector x7
+    45.0, 65.0, 70.0, 160.0, // Boost, RTC6705, Limit, Status
+];
+const GROUP_ROW_HEIGHT: f32 = 18.0;
+const HEADER_ROW_HEIGHT: f32 = 18.0;
+const DATA_ROW_HEIGHT: f32 = 20.0;
+
+/// egui_table::TableDelegate implementation for the PA calibration
+/// table. Unlike egui_extras::TableBuilder's closures (which directly
+/// capture surrounding variables), egui_table's Table::show() drives a
+/// delegate object across possibly-multiple frames/prefetch passes, so
+/// state it needs has to be gathered up front into an owned/borrowed
+/// struct rather than closed over ad hoc.
+struct PaTableDelegate<'a> {
+    entries: Vec<msp::PaCalibration>, // owned, filtered to idx > 0
+    frequencies: [u16; 7],
+    checked: &'a mut HashMap<u8, bool>,
+    sweep_active: bool,
+    cal_status: Vec<[CellStatus; 7]>,
+    det_status: Vec<[CellStatus; 7]>,
+    level_status: Vec<Option<LevelStatus>>,
+    limits: Vec<Option<i32>>,
+    row_height: f32,
+}
+
+impl PaTableDelegate<'_> {
+    fn column_label(&self, col: usize) -> String {
+        match col {
+            0 => String::new(),
+            1 => "idx".to_string(),
+            2 => "mW".to_string(),
+            3..=9 => self.frequencies[col - 3].to_string(),
+            10..=16 => self.frequencies[col - 10].to_string(),
+            17 => "Boost".to_string(),
+            18 => "RTC6705".to_string(),
+            19 => "Limit (mV)".to_string(),
+            20 => "Status".to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+impl egui_table::TableDelegate for PaTableDelegate<'_> {
+    fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {
+        // Nothing to lazily load -- everything's already gathered up
+        // front into owned Vecs before the Table is constructed.
+    }
+
+    fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell_inf: &egui_table::HeaderCellInfo) {
+        let egui_table::HeaderCellInfo { group_index, row_nr, .. } = cell_inf;
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        match row_nr {
+            0 => {
+                // Group band row. group_index here is the GROUP's own index
+                // (0..4, matching the `groups` Vec passed to HeaderRow), not
+                // a column index. Groups 1/2 are Calibration/Detector;
+                // 0 and 3 are the unlabeled surrounding columns.
+                let text = match group_index {
+                    1 => "Calibration (mV)",
+                    2 => "Detector (mV)",
+                    _ => "",
+                };
+                if !text.is_empty() {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.strong(text);
+                    });
+                }
+            }
+            1 => {
+                // Second header row has no explicit `groups`, so
+                // egui_table gives each column its own trivial group --
+                // group_index here IS the column index directly.
+                ui.strong(self.column_label(*group_index));
+            }
+            _ => {}
+        }
+    }
+
+    fn row_ui(&mut self, _ui: &mut egui::Ui, _row_nr: u64) {
+        // No special per-row interaction/highlight needed beyond what
+        // cell_ui already paints.
+    }
+
+    fn cell_ui(&mut self, ui: &mut egui::Ui, cell_info: &egui_table::CellInfo) {
+        let egui_table::CellInfo { row_nr, col_nr, .. } = *cell_info;
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        let row_nr = row_nr as usize;
+        let Some(entry) = self.entries.get(row_nr) else {
+            return;
+        };
+
+        match col_nr {
+            0 => {
+                // Default-checked: levels that engage the boost stage
+                // (ext_pa_enable) -- those are what scanPa/scanDetector's
+                // detector-based closed loop is meant for; the RTC6705-alone
+                // levels are simple/structural and were never really
+                // candidates for this procedure. Only applies the FIRST
+                // time a given idx is seen -- a user's manual (un)check is
+                // never overwritten by this, including across Refreshes.
+                let checked = self.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
+                ui.add_enabled(!self.sweep_active, egui::Checkbox::new(checked, ""));
+            }
+            1 => {
+                ui.label(entry.idx.to_string());
+            }
+            2 => {
+                ui.label(entry.m_w.to_string());
+            }
+            3..=9 => {
+                let i = col_nr - 3;
+                colored_cell(ui, entry.value[i].to_string(), self.cal_status[row_nr][i]);
+            }
+            10..=16 => {
+                let i = col_nr - 10;
+                colored_cell(ui, entry.detector[i].to_string(), self.det_status[row_nr][i]);
+            }
+            17 => {
+                ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
+            }
+            18 => {
+                ui.label(entry.rtc6705_level.to_string());
+            }
+            19 => {
+                ui.label(self.limits[row_nr].map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            }
+            20 => {
+                ui.label(status_text(self.level_status[row_nr].as_ref()));
+            }
+            _ => {}
+        }
+    }
+
+    fn row_top_offset(&self, _ctx: &egui::Context, _table_id: egui::Id, row_nr: u64) -> f32 {
+        row_nr as f32 * self.row_height // uniform row height, no per-row expand/collapse
+    }
 }
 
 fn status_text(status: Option<&LevelStatus>) -> String {
@@ -232,146 +381,70 @@ pub fn show(
     // ---- Table -----------------------------------------------------------
     let pa_table = shared.lock().unwrap().pa_table.clone();
     let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
-    let filtered: Vec<_> = pa_table.iter().filter(|e| e.idx > 0).collect();
+    let entries: Vec<msp::PaCalibration> = pa_table.iter().filter(|e| e.idx > 0).cloned().collect();
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .column(Column::exact(24.0)) // checkbox
-        .column(Column::exact(28.0)) // idx
-        .column(Column::exact(40.0)) // mW
-        .columns(Column::exact(55.0), 7) // calibration, one per frequency
-        .columns(Column::exact(55.0), 7) // detector, one per frequency
-        .column(Column::exact(45.0)) // Boost
-        .column(Column::exact(65.0)) // RTC6705
-        .column(Column::exact(70.0)) // Limit
-        .column(Column::remainder()) // Status
-        .header(18.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("");
+    let mut cal_status = Vec::with_capacity(entries.len());
+    let mut det_status = Vec::with_capacity(entries.len());
+    let mut level_status = Vec::with_capacity(entries.len());
+    let mut limits = Vec::with_capacity(entries.len());
+    {
+        let g = sweep.lock().unwrap();
+        for entry in &entries {
+            let cal: [CellStatus; 7] = std::array::from_fn(|i| {
+                g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
             });
-            header.col(|ui| {
-                ui.strong("idx");
+            let det: [CellStatus; 7] = std::array::from_fn(|i| {
+                g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
             });
-            header.col(|ui| {
-                ui.strong("mW");
-            });
-            for f in frequencies {
-                header.col(|ui| {
-                    ui.strong(format!("{f}"));
-                });
-            }
-            for f in frequencies {
-                header.col(|ui| {
-                    ui.strong(format!("{f}"));
-                });
-            }
-            header.col(|ui| {
-                ui.strong("Boost");
-            });
-            header.col(|ui| {
-                ui.strong("RTC6705");
-            });
-            header.col(|ui| {
-                ui.strong("Limit (mV)");
-            });
-            header.col(|ui| {
-                ui.strong("Status");
-            });
-        })
-        .body(|mut body| {
-            // Group-band row: label left-aligned over just the FIRST column
-            // of each group, no background fill (spec: group headers
-            // shouldn't have a non-default background) -- fixed-width
-            // columns mean a longer label just clips rather than forcing
-            // anything to expand, so the text is kept short on purpose.
-            body.row(16.0, |mut row| {
-                row.col(|ui| {
-                    ui.label("");
-                });
-                row.col(|ui| {
-                    ui.label("");
-                });
-                row.col(|ui| {
-                    ui.label("");
-                });
-                for i in 0..7 {
-                    row.col(|ui| {
-                        if i == 0 {
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.weak("Cal (mV)");
-                            });
-                        }
-                    });
-                }
-                for i in 0..7 {
-                    row.col(|ui| {
-                        if i == 0 {
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.weak("Det (mV)");
-                            });
-                        }
-                    });
-                }
-                row.col(|_ui| {});
-                row.col(|_ui| {});
-                row.col(|_ui| {});
-                row.col(|_ui| {});
-            });
+            cal_status.push(cal);
+            det_status.push(det);
+            level_status.push(g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned()));
+            limits.push(g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied()));
+        }
+    }
 
-            for entry in filtered.iter() {
-                // Default-checked: levels that engage the boost stage (ext_pa_enable) --
-                // those are what scanPa/scanDetector's detector-based closed loop is
-                // meant for; the RTC6705-alone levels are simple/structural and were
-                // never really candidates for this procedure (see the target power
-                // table's own comments). Only applies the FIRST time a given idx is
-                // seen -- a user's manual (un)check is never overwritten by this,
-                // including across table Refreshes.
-                let checked = page.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
+    let mut delegate = PaTableDelegate {
+        entries,
+        frequencies,
+        checked: &mut page.checked,
+        sweep_active,
+        cal_status,
+        det_status,
+        level_status,
+        limits,
+        row_height: DATA_ROW_HEIGHT,
+    };
 
-                let (cal_status, det_status, level_status, limit) = {
-                    let g = sweep.lock().unwrap();
-                    let cal_status: [CellStatus; 7] = std::array::from_fn(|i| {
-                        g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
-                    });
-                    let det_status: [CellStatus; 7] = std::array::from_fn(|i| {
-                        g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
-                    });
-                    let level_status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
-                    let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
-                    (cal_status, det_status, level_status, limit)
-                };
-
-                body.row(20.0, |mut row| {
-                    row.col(|ui| {
-                        ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
-                    });
-                    row.col(|ui| {
-                        ui.label(entry.idx.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(entry.m_w.to_string());
-                    });
-                    for i in 0..7 {
-                        row.col(|ui| colored_cell(ui, entry.value[i].to_string(), cal_status[i]));
-                    }
-                    for i in 0..7 {
-                        row.col(|ui| colored_cell(ui, entry.detector[i].to_string(), det_status[i]));
-                    }
-                    row.col(|ui| {
-                        ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
-                    });
-                    row.col(|ui| {
-                        ui.label(entry.rtc6705_level.to_string());
-                    });
-                    row.col(|ui| {
-                        ui.label(limit.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
-                    });
-                    row.col(|ui| {
-                        ui.label(status_text(level_status.as_ref()));
-                    });
-                });
-            }
-        });
+    let columns: Vec<egui_table::Column> = COL_WIDTHS.iter().map(|&w| egui_table::Column::new(w).resizable(true)).collect();
+    let num_rows = delegate.entries.len() as f32;
+    // egui_table::Table is built for virtualized scrolling of potentially
+    // huge datasets, so its scroll region defaults to filling whatever
+    // vertical space the parent ui hands it -- for our handful of rows
+    // that left a large empty gap below the real content. Constraining
+    // the allocation to the table's actual content height (both header
+    // rows + N data rows, plus a little slack) fixes that; it'll still
+    // scroll internally if a future table genuinely has more rows than fit.
+    let table_height = GROUP_ROW_HEIGHT + HEADER_ROW_HEIGHT + num_rows * DATA_ROW_HEIGHT + 4.0;
+    ui.allocate_ui(egui::vec2(ui.available_width(), table_height), |ui| {
+        egui_table::Table::new()
+            .id_salt("pa_table")
+            .num_rows(delegate.entries.len() as u64)
+            .columns(columns)
+            .num_sticky_cols(0)
+            .headers([
+                // Row 0: group band -- spans verified against egui_table's own
+                // demo (rerun-io/egui_table, demo/src/table_demo.rs), which is
+                // the actual mechanism for this (egui::Grid/egui_extras::Table
+                // have no equivalent). Groups don't need to cover every column;
+                // 0..3 and 17..21 are left as trivial/unlabeled groups.
+                egui_table::HeaderRow {
+                    height: GROUP_ROW_HEIGHT,
+                    groups: vec![0..3, 3..10, 10..17, 17..21],
+                },
+                egui_table::HeaderRow::new(HEADER_ROW_HEIGHT),
+            ])
+            .show(ui, &mut delegate);
+    });
 
     // ---- Progress bars -------------------------------------------------
     {
