@@ -173,6 +173,16 @@ pub struct SweepEngine {
     pub completed_steps: usize,
 
     pub pending_result: Option<SweepResult>, // set when a (level, freq) finishes; caller drains it into the working table
+
+    requires_manual_frequency: bool, // cached from start()'s argument, so poll()'s own frequency-advance logic can honor it too, not just the first frequency
+    /// Set whenever the sweep needs to push a new frequency to the VTX
+    /// (entering the first frequency in start(), or after confirm_frequency()).
+    /// poll() sends this via MSP_VTX_CONFIG at the top of its next call,
+    /// then clears it. This was missing entirely in the first version of
+    /// this file -- the sweep only ever sent SET_PACALIBRATION (selecting
+    /// a power level + DAC mv), never actually retuned the VTX, so it
+    /// stayed on whatever frequency it was last configured to.
+    pending_frequency_push: Option<u16>,
 }
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
@@ -207,6 +217,8 @@ impl SweepEngine {
             total_steps,
             completed_steps: 0,
             pending_result: None,
+            requires_manual_frequency: false, // set for real in start()
+            pending_frequency_push: None,
         }
     }
 
@@ -228,20 +240,23 @@ impl SweepEngine {
         self.freq_idx = 0;
         self.level_idx = 0;
         self.step = None;
+        self.requires_manual_frequency = requires_manual_frequency;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, manual_freq={requires_manual_frequency}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz);
         if requires_manual_frequency {
             self.state = EngineState::AwaitingFreqConfirm { freq_mhz: self.frequencies[0] };
         } else {
             self.state = EngineState::Running;
+            self.pending_frequency_push = Some(self.frequencies[0]);
         }
     }
 
     /// UI calls this after the user confirms they've retuned the meter.
     pub fn confirm_frequency(&mut self) {
-        if matches!(self.state, EngineState::AwaitingFreqConfirm { .. }) {
-            debug!(target: "vtx", "[sweep] frequency confirmed, resuming");
+        if let EngineState::AwaitingFreqConfirm { freq_mhz } = self.state {
+            debug!(target: "vtx", "[sweep] frequency confirmed, resuming at {freq_mhz}MHz");
             self.state = EngineState::Running;
+            self.pending_frequency_push = Some(freq_mhz);
         }
     }
 
@@ -294,10 +309,24 @@ impl SweepEngine {
                 debug!(target: "vtx", "[sweep] all frequencies complete");
                 return Ok(());
             }
-            debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {}MHz",
-                self.freq_idx, self.frequencies.len(), self.frequencies[self.freq_idx]);
-            self.state = EngineState::AwaitingFreqConfirm { freq_mhz: self.frequencies[self.freq_idx] };
+            let next_freq = self.frequencies[self.freq_idx];
+            debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {next_freq}MHz",
+                self.freq_idx, self.frequencies.len());
+            if self.requires_manual_frequency {
+                self.state = EngineState::AwaitingFreqConfirm { freq_mhz: next_freq };
+            } else {
+                self.state = EngineState::Running;
+                self.pending_frequency_push = Some(next_freq);
+            }
             return Ok(());
+        }
+
+        if let Some(freq_mhz) = self.pending_frequency_push.take() {
+            let level = self.levels.first().copied().unwrap_or(1);
+            let payload = build_vtx_config_frequency_payload(freq_mhz, level);
+            link.send_v1(function::VTX_CONFIG as u8, &payload)?;
+            debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
+            return Ok(()); // let the retune land before the next tick starts sending SET_PACALIBRATION
         }
 
         let level = self.levels[self.level_idx];
@@ -555,6 +584,34 @@ impl SweepEngine {
         self.level_idx += 1;
         self.per_level_status.insert(level, LevelStatus::Done);
     }
+}
+
+/// Builds an MSP_VTX_CONFIG payload that retunes the VTX to `freq_mhz`
+/// directly (band=0) -- independent of the stored VtxTableConfig's
+/// "Selected" state (a separate, user-facing concept the sweep
+/// shouldn't disturb). `power` just needs to be a valid level index so
+/// vtx_apply_hw() picks a sensible RTC6705 register while retuning; the
+/// SET_PACALIBRATION calls that immediately follow set the real level
+/// and DAC value regardless (and re-set the RTC6705 register too, via
+/// vtx_msp_set_calibration()), so this doesn't need to be exact.
+fn build_vtx_config_frequency_payload(freq_mhz: u16, power: u8) -> Vec<u8> {
+    let mut p = vec![0u8; 15];
+    p[0] = 5; // VTXDEV_MSP
+    p[1] = 0; // band=0 -> use the raw frequency field directly
+    p[2] = 0; // channel (unused when band=0)
+    p[3] = power;
+    p[4] = 0; // pitmode=false, matches rf_calibration.py's own convention throughout scanPa/scanDetector
+    p[5] = (freq_mhz & 0xff) as u8;
+    p[6] = (freq_mhz >> 8) as u8;
+    p[7] = 1; // device_ready
+    p[8] = 0; // low_power_disarm
+    p[9] = 0;
+    p[10] = 0; // pit_mode_freq
+    p[11] = 1; // vtx_table_available -- MUST be nonzero or handle_msp_set_vtx_config() ignores the whole push
+    p[12] = 0; // band_count -- not meaningful for a direct-frequency push; a mismatch just makes the VTX re-broadcast its own table afterward, harmless
+    p[13] = 0; // channel_count
+    p[14] = 0; // power_level_count
+    p
 }
 
 /// Linear interpolation of the detector value at exactly `target_mw`,
