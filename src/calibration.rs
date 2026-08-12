@@ -108,6 +108,12 @@ impl SampleWait {
     }
 }
 
+/// Starting point for the coarse ramp -- extracted as a constant since
+/// sub_progress() needs the same value to compute how far the ramp has
+/// traveled toward the DAC boundary.
+const COARSE_RAMP_START_MV: i32 = 3200;
+const COARSE_RAMP_STEP_MV: i32 = 50;
+
 enum ScanPaPhase {
     CoarseRamp,
     Backoff,
@@ -118,6 +124,7 @@ struct ScanPaState {
     phase: ScanPaPhase,
     mv: i32,
     wait: Option<SampleWait>,
+    coarse_steps_taken: u32, // how many 50mV coarse-ramp steps so far -- drives sub_progress()
 }
 
 enum ScanDetectorPhase {
@@ -138,10 +145,19 @@ enum StepState {
     Detector(ScanDetectorState),
 }
 
+#[derive(Clone, Copy)]
 pub enum EngineState {
     Idle,
     AwaitingFreqConfirm { freq_mhz: u16 },
     Running,
+    /// No traffic at all from the VTX for longer than a sweep in
+    /// progress should ever go quiet -- most likely explanation is a
+    /// current-limited supply tripping and power-cycling the VTX.
+    /// Paused here (not aborted) so the user can power it back on and
+    /// continue; captures where things were when it happened so
+    /// resume_after_recovery() can back off to a safe point and set a
+    /// hard ceiling on `level` for the rest of the sweep.
+    VtxUnresponsive { level: u8, freq_mhz: u16, mv_at_loss: i32 },
 }
 
 /// One (level, frequency) result as it's produced -- applied to the
@@ -183,7 +199,29 @@ pub struct SweepEngine {
     /// a power level + DAC mv), never actually retuned the VTX, so it
     /// stayed on whatever frequency it was last configured to.
     pending_frequency_push: Option<u16>,
+
+    /// Per-level mV ceiling discovered when the VTX went unresponsive
+    /// mid-scan (see EngineState::VtxUnresponsive / resume_after_recovery).
+    /// pub so the UI can show it in a table column; cleared by
+    /// clear_hard_limits() when the PA table is Refreshed.
+    pub hard_limits: HashMap<u8, i32>,
+    /// First time this poll() saw the VTX go quiet while Running, or
+    /// None if it's currently responsive. A SUSTAINED silence (not a
+    /// single missed tick) is what actually triggers VtxUnresponsive --
+    /// see HEARTBEAT_TIMEOUT.
+    unresponsive_since: Option<Instant>,
 }
+
+/// How long the VTX can go completely silent while a sweep is Running
+/// before it's treated as having lost power. Deliberately generous --
+/// avoids false positives from ordinary jitter -- since the cost of
+/// waiting a couple extra seconds is nothing next to the cost of
+/// misdiagnosing a live VTX as dead mid-sweep.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How far to back off (in the safe/less-power direction) from the mV
+/// value that was active when the VTX went unresponsive, when setting
+/// the new hard limit for that level.
+const HEARTBEAT_BACKOFF_MV: i32 = 20;
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
 
@@ -219,6 +257,8 @@ impl SweepEngine {
             pending_result: None,
             requires_manual_frequency: false, // set for real in start()
             pending_frequency_push: None,
+            hard_limits: HashMap::new(),
+            unresponsive_since: None,
         }
     }
 
@@ -286,17 +326,39 @@ impl SweepEngine {
     /// reading arrived" instead of history.len() (see SampleWait's doc
     /// comment for why that distinction matters); `latest_reading` is
     /// the most recent decoded MSP_PACALIBRATION response, if one
-    /// arrived this tick (worker.rs is responsible for routing that
-    /// frame here).
+    /// arrived this tick; `vtx_ready` is SharedState::vtx_ready -- true
+    /// if ANY frame (not just ones addressed to the sweep) has been seen
+    /// from the VTX recently, used to detect a current-limited supply
+    /// power-cycling it mid-sweep.
     pub fn poll(
         &mut self,
         link: &mut MspLink,
         history: &VecDeque<(f64, f32)>,
         reading_seq: u64,
         latest_reading: Option<msp::PaCalibrationReading>,
+        vtx_ready: bool,
     ) -> anyhow::Result<()> {
         if !matches!(self.state, EngineState::Running) {
             return Ok(());
+        }
+
+        if vtx_ready {
+            self.unresponsive_since = None;
+        } else {
+            let since = *self.unresponsive_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > HEARTBEAT_TIMEOUT {
+                let mv_at_loss = match &self.step {
+                    Some(StepState::Pa(st)) => st.mv,
+                    Some(StepState::Detector(st)) => st.mv,
+                    None => 0,
+                };
+                let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
+                let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
+                debug!(target: "vtx", "[sweep] no response from VTX for {:?} -- pausing (level={level} freq={freq_mhz}MHz mv={mv_at_loss}), likely a power-limited supply tripping",
+                    since.elapsed());
+                self.state = EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss };
+                return Ok(());
+            }
         }
 
         if self.level_idx >= self.levels.len() {
@@ -335,13 +397,13 @@ impl SweepEngine {
 
         if self.step.is_none() {
             // Entering a fresh (level, freq): start with ScanPa's coarse ramp.
-            let start_mv = 3200i32; // safe/near-off starting point, matches VTX_BIAS_OFF_MV's neighborhood
             self.step = Some(StepState::Pa(ScanPaState {
                 phase: ScanPaPhase::CoarseRamp,
-                mv: start_mv,
+                mv: COARSE_RAMP_START_MV,
                 wait: None,
+                coarse_steps_taken: 0,
             }));
-            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from mv={start_mv}");
+            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from mv={COARSE_RAMP_START_MV}");
             self.per_level_status.insert(
                 level,
                 LevelStatus::InProgress(format!("{} / coarse ramp @ {freq_mhz}MHz", SweepOp::ScanPa.label())),
@@ -379,6 +441,7 @@ impl SweepEngine {
 
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
+                let (bound_lo, bound_hi) = self.effective_bounds(level);
                 debug!(target: "vtx", "[sweep] ScanPa level={level} freq={freq_mhz}MHz mv={} avg={avg_mw:.4}mW target={target_mw}mW", st.mv);
 
                 match st.phase {
@@ -387,13 +450,16 @@ impl SweepEngine {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp reached 80% ({avg_mw:.4}mW >= {:.4}mW) at mv={}, entering backoff", target_mw * 0.80, st.mv);
                             st.phase = ScanPaPhase::Backoff;
                             st.wait = None;
-                        } else if !(0..=3300).contains(&(st.mv + up * 50)) {
-                            // Ran off the end of the DAC range without reaching 80% -- bail this (level, freq) as best-effort.
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit DAC bound at mv={} without reaching 80% target -- bailing this (level,freq) as best-effort", st.mv);
+                        } else if !(bound_lo..=bound_hi).contains(&(st.mv + up * COARSE_RAMP_STEP_MV)) {
+                            // Ran off the end of the allowed range (DAC bound, or a hard limit from
+                            // a previous VTX power-loss on this level) without reaching 80% -- bail
+                            // this (level, freq) as best-effort.
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at mv={} without reaching 80% target -- bailing this (level,freq) as best-effort", st.mv);
                             self.finish_scan_pa(level, st.mv);
                             return Ok(());
                         } else {
-                            st.mv += up * 50;
+                            st.mv += up * COARSE_RAMP_STEP_MV;
+                            st.coarse_steps_taken += 1;
                             st.wait = None;
                         }
                     }
@@ -403,12 +469,12 @@ impl SweepEngine {
                             st.phase = ScanPaPhase::Fine;
                             st.wait = None;
                         } else {
-                            st.mv -= up * 5;
+                            st.mv = (st.mv - up * 5).clamp(bound_lo, bound_hi);
                             st.wait = None;
                         }
                     }
                     ScanPaPhase::Fine => {
-                        if avg_mw >= target_mw || !(0..=3300).contains(&(st.mv + up)) {
+                        if avg_mw >= target_mw || !(bound_lo..=bound_hi).contains(&(st.mv + up)) {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at mv={} ({avg_mw:.4}mW)", st.mv);
                             self.finish_scan_pa(level, st.mv);
                             return Ok(());
@@ -462,6 +528,7 @@ impl SweepEngine {
 
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
+                let (bound_lo, bound_hi) = self.effective_bounds(level);
                 let detector_now = latest_reading.map(|r| r.detector_mv).unwrap_or(0);
                 debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={detector_now}", st.mv);
 
@@ -472,24 +539,24 @@ impl SweepEngine {
                             st.phase = ScanDetectorPhase::Bracket;
                             st.wait = None;
                         } else {
-                            st.mv -= up;
+                            st.mv = (st.mv - up).clamp(bound_lo, bound_hi);
                             st.wait = None;
                         }
                     }
                     ScanDetectorPhase::Bracket => {
                         let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
                         if avg_mw < target_mw - dev {
-                            st.mv += up * 2;
+                            st.mv = (st.mv + up * 2).clamp(bound_lo, bound_hi);
                         } else if avg_mw > target_mw + dev {
-                            st.mv -= up * 2;
+                            st.mv = (st.mv - up * 2).clamp(bound_lo, bound_hi);
                         } else if avg_mw < target_mw {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.below = Some((avg_mw, detector_now));
-                            st.mv += up;
+                            st.mv = (st.mv + up).clamp(bound_lo, bound_hi);
                         } else {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.above = Some((avg_mw, detector_now));
-                            st.mv -= up;
+                            st.mv = (st.mv - up).clamp(bound_lo, bound_hi);
                         }
                         st.wait = None;
 
@@ -523,13 +590,28 @@ impl SweepEngine {
 
     /// Progress within the CURRENT (level, freq, op) step only -- coarse,
     /// phase-block-based (not fine-grained, since these are open-ended
-    /// searches with no fixed step count to measure against). Returns
-    /// (0.0, "") when nothing is in progress.
+    /// searches with no fixed step count to measure against), EXCEPT for
+    /// CoarseRamp: since it steps in known, fixed 50mV increments toward
+    /// a known boundary, the fraction of that distance already covered
+    /// gives a real (if approximate -- we don't know in advance how many
+    /// steps it'll actually take to reach 80% target) sense of movement,
+    /// rather than a static placeholder. Returns (0.0, "") when nothing
+    /// is in progress.
     pub fn sub_progress(&self) -> (f32, &'static str) {
         match &self.step {
             None => (0.0, ""),
             Some(StepState::Pa(st)) => match st.phase {
-                ScanPaPhase::CoarseRamp => (0.15, "ScanPa: coarse ramp"),
+                ScanPaPhase::CoarseRamp => {
+                    let up = power_up_step(self.sign_inverted);
+                    let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
+                    let (bound_lo, bound_hi) = self.effective_bounds(level);
+                    let boundary = if up > 0 { bound_hi } else { bound_lo };
+                    let total_possible = ((boundary - COARSE_RAMP_START_MV) as f32 / COARSE_RAMP_STEP_MV as f32)
+                        .abs()
+                        .max(1.0);
+                    let frac = (st.coarse_steps_taken as f32 / total_possible).clamp(0.0, 1.0);
+                    (0.4 * frac, "ScanPa: coarse ramp")
+                }
                 ScanPaPhase::Backoff => (0.55, "ScanPa: backoff"),
                 ScanPaPhase::Fine => (0.85, "ScanPa: fine creep"),
             },
@@ -549,8 +631,64 @@ impl SweepEngine {
         }
     }
 
+    /// (min_mv, max_mv) for `level` -- the full 0..=3300 DAC range,
+    /// narrowed on whichever side is "more power" if a hard limit was
+    /// set for this level (see EngineState::VtxUnresponsive /
+    /// resume_after_recovery).
+    fn effective_bounds(&self, level: u8) -> (i32, i32) {
+        let up = power_up_step(self.sign_inverted);
+        let (mut lo, mut hi) = (0i32, 3300i32);
+        if let Some(&limit) = self.hard_limits.get(&level) {
+            if up > 0 {
+                hi = hi.min(limit);
+            } else {
+                lo = lo.max(limit);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Called after the user confirms the VTX is back (SharedState::vtx_ready
+    /// true) and clicks Continue. Sets a hard limit for the level that was
+    /// active when the VTX went quiet -- backed off HEARTBEAT_BACKOFF_MV
+    /// from the trip point, in the safe (less power) direction -- backs
+    /// the in-progress step off to that same safe point (continuing right
+    /// at the trip point would just trip it again), and re-pushes the
+    /// current frequency, since the VTX's own reboot means it needs
+    /// retuning and level reselection from scratch.
+    pub fn resume_after_recovery(&mut self) {
+        if let EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } = self.state {
+            let up = power_up_step(self.sign_inverted);
+            let safe_mv = (mv_at_loss - up * HEARTBEAT_BACKOFF_MV).clamp(0, 3300);
+            self.hard_limits.insert(level, safe_mv);
+            debug!(target: "vtx", "[sweep] resuming after VTX recovery: level={level} freq={freq_mhz}MHz, hard limit set to {safe_mv}mV (backed off {HEARTBEAT_BACKOFF_MV}mV from trip point {mv_at_loss}mV)");
+            match &mut self.step {
+                Some(StepState::Pa(st)) => {
+                    st.mv = safe_mv;
+                    st.wait = None;
+                }
+                Some(StepState::Detector(st)) => {
+                    st.mv = safe_mv;
+                    st.wait = None;
+                }
+                None => {}
+            }
+            self.unresponsive_since = None;
+            self.state = EngineState::Running;
+            self.pending_frequency_push = Some(freq_mhz);
+        }
+    }
+
+    /// Discards any hard limits discovered so far -- called when the PA
+    /// table is Refreshed, per the explicit requirement that a refresh
+    /// should forget them.
+    pub fn clear_hard_limits(&mut self) {
+        self.hard_limits.clear();
+    }
+
     fn send_calibration(&self, link: &mut MspLink, level: u8, mv: i32) -> anyhow::Result<()> {
-        let mv = mv.clamp(0, 3300) as u16;
+        let (lo, hi) = self.effective_bounds(level);
+        let mv = mv.clamp(lo, hi) as u16;
         link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(mv))))
     }
 
