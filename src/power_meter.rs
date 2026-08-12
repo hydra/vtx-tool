@@ -125,23 +125,42 @@ impl PowerMeter {
         }
     }
 
+    /// Sends the meter's presence-check command ("V\r\n" for ImmersionRC
+    /// V1 -- a version query, going by convention with D=reading,
+    /// F=frequency) and returns Ok(()) if ANY reply comes back, without
+    /// caring what it says. Used purely to detect "is something actually
+    /// there answering" -- separate from read_dbm's power polling, which
+    /// is used for the graph/sweep and runs on its own (usually much
+    /// slower) update_hz-driven cadence.
+    pub fn check_alive(&mut self, timeout: Duration) -> Result<()> {
+        match self.kind {
+            PowerMeterKind::ImmersionRcV1 => self.send_and_read_line(b"V\r\n", timeout).map(|_| ()),
+        }
+    }
+
     /// ImmersionRC Power Meter V1 serial protocol: send "D\r\n", receive
     /// back a dBm reading as ASCII text terminated by CRLF, e.g.
     /// "-40.91\r\n". This is deliberately NOT a port of cImmersionRC.py
     /// -- that script targets the V2 meter, which also supports a
     /// frequency-set command and async push updates; nothing here
     /// assumes the V1 meter supports those.
-    ///
-    /// Reads a full line via a BufReader rather than one byte at a time,
-    /// and clears stale input before writing each command -- both are
-    /// fixes for real symptoms seen on Windows (spurious "semaphore
-    /// timeout" errors and misaligned command/response pairs from a
-    /// byte-by-byte read loop).
     fn read_dbm_immersionrc_v1(&mut self, timeout: Duration) -> Result<f32> {
+        let line = self.send_and_read_line(b"D\r\n", timeout)?;
+        line.parse::<f32>()
+            .map_err(|e| anyhow::anyhow!("meter replied '{line}' (not a number): {e}"))
+    }
+
+    /// Sends `cmd`, reads back one non-empty line. Clears stale input
+    /// before writing each command -- a fix for a real symptom seen on
+    /// Windows (misaligned command/response pairs from a byte-by-byte
+    /// read loop this used to use). Reads a full line via a BufReader
+    /// rather than one byte at a time -- the other Windows-specific fix,
+    /// for spurious "semaphore timeout" errors under rapid tiny reads.
+    fn send_and_read_line(&mut self, cmd: &[u8], timeout: Duration) -> Result<String> {
         let _ = self.reader.get_mut().clear(ClearBuffer::Input);
 
         self.reader.get_mut().set_timeout(timeout)?;
-        self.reader.get_mut().write_all(b"D\r\n")?;
+        self.reader.get_mut().write_all(cmd)?;
 
         let mut line = String::new();
         loop {
@@ -151,12 +170,9 @@ impl PowerMeter {
                 bail!("power meter closed the connection");
             }
             let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
             }
-            return trimmed.parse::<f32>().map_err(|e| {
-                anyhow::anyhow!("meter replied '{trimmed}' (not a number): {e}")
-            });
         }
     }
 

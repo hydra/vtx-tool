@@ -213,15 +213,26 @@ pub struct SweepEngine {
 }
 
 /// How long the VTX can go completely silent while a sweep is Running
-/// before it's treated as having lost power. Deliberately generous --
-/// avoids false positives from ordinary jitter -- since the cost of
-/// waiting a couple extra seconds is nothing next to the cost of
-/// misdiagnosing a live VTX as dead mid-sweep.
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+/// before it's treated as having lost power.
+///
+/// TUNED DOWN from an initial 2s: the actual failure mode observed was
+/// that during the detection window, the sweep kept stepping mV further
+/// in the "more power" direction, because once the VTX dies the RF
+/// signal disappears and the power meter reads near-zero -- which the
+/// algorithm reads as "need more power, keep pushing" rather than "the
+/// device is gone". By the time VtxUnresponsive fired, mv_at_loss could
+/// already be well past the actual trip point, so backing off a small
+/// margin from THAT point wasn't actually safe -- the reported "sets a
+/// limit, trips again, sets a new limit" cycle is exactly what that
+/// looks like. Shortening this reduces (but for a genuinely fast
+/// hardware overcurrent trip, can't fully eliminate) how far the sweep
+/// can wander past the real limit before noticing.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 /// How far to back off (in the safe/less-power direction) from the mV
 /// value that was active when the VTX went unresponsive, when setting
-/// the new hard limit for that level.
-const HEARTBEAT_BACKOFF_MV: i32 = 20;
+/// the new hard limit for that level. Increased alongside the shorter
+/// HEARTBEAT_TIMEOUT above, as a second, independent margin of safety.
+const HEARTBEAT_BACKOFF_MV: i32 = 50;
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
 

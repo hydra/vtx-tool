@@ -10,6 +10,8 @@
 //! of whether auto-connect fires.
 
 mod app;
+mod calibration;
+mod conn_status;
 mod logging;
 mod msp;
 mod pages;
@@ -17,7 +19,6 @@ mod power_meter;
 mod settings;
 mod vtxtable;
 mod worker;
-mod calibration;
 
 use clap::Parser;
 use log::LevelFilter;

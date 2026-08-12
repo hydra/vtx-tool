@@ -16,6 +16,7 @@
 //! worker owns the actual open ports and there's no live "change port"
 //! operation, only disconnect-then-reconnect.
 
+use crate::conn_status;
 use crate::logging;
 use crate::logging::SharedLogs;
 use crate::pages;
@@ -182,15 +183,28 @@ impl eframe::App for App {
                 ui.separator();
                 ui.heading("Connection");
 
-                let connected = self.state.lock().unwrap().connected;
+                let (connected, vtx_ready, meter_ready) = {
+                    let s = self.state.lock().unwrap();
+                    (s.connected, s.vtx_ready, s.meter_ready)
+                };
 
-                ui.label("VTX");
+                ui.horizontal(|ui| {
+                    ui.label("VTX");
+                    if connected {
+                        conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(vtx_ready)));
+                    }
+                });
                 ui.add_enabled(
                     !connected,
                     egui::TextEdit::singleline(&mut self.vtx_port_input).hint_text("VTX port"),
                 );
 
-                ui.label("Power Meter");
+                ui.horizontal(|ui| {
+                    ui.label("Power Meter");
+                    if connected {
+                        conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(meter_ready)));
+                    }
+                });
                 ui.add_enabled(
                     !connected,
                     egui::TextEdit::singleline(&mut self.meter_port_input).hint_text("Power meter port"),

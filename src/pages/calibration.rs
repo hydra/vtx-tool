@@ -5,6 +5,7 @@
 //! state machine this drives).
 
 use crate::calibration::{self, LevelStatus};
+use crate::conn_status;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -186,11 +187,7 @@ pub fn show(
                 ui.label("Please power the VTX back on.");
                 ui.horizontal(|ui| {
                     ui.label("Connection status:");
-                    if vtx_ready {
-                        ui.colored_label(egui::Color32::GREEN, "Ready");
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Disconnected");
-                    }
+                    conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(vtx_ready)));
                 });
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(vtx_ready, |ui| {
@@ -220,7 +217,14 @@ pub fn show(
         ui.end_row();
 
         for entry in pa_table.iter().filter(|e| e.idx > 0) {
-            let checked = page.checked.entry(entry.idx).or_insert(false);
+            // Default-checked: levels that engage the boost stage (ext_pa_enable) --
+            // those are what scanPa/scanDetector's detector-based closed loop is
+            // meant for; the RTC6705-alone levels are simple/structural and were
+            // never really candidates for this procedure (see the target power
+            // table's own comments). Only applies the FIRST time a given idx is
+            // seen -- a user's manual (un)check is never overwritten by this,
+            // including across table Refreshes.
+            let checked = page.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
             ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
             ui.label(entry.idx.to_string());
             ui.label(entry.m_w.to_string());
@@ -270,8 +274,13 @@ pub fn show(
             if ui.button("Stop").clicked() {
                 let _ = cmd_tx.send(Command::AbortSweep);
             }
-        } else if ui.button("Re-calibrate").clicked() {
-            page.show_confirm_dialog = true;
+        } else {
+            let any_checked = page.checked.values().any(|&v| v);
+            ui.add_enabled_ui(any_checked, |ui| {
+                if ui.button("Re-calibrate").clicked() {
+                    page.show_confirm_dialog = true;
+                }
+            });
         }
     });
 
