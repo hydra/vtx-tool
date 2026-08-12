@@ -1,9 +1,14 @@
-//! Calibration page: live power meter reading (with a rolling plot) +
-//! PA calibration table pull.
+//! Calibration page: live power meter reading (with a rolling plot), the
+//! PA calibration table (now with per-level checkboxes, boost/RTC6705
+//! display columns, and a live calibration-status column), and the
+//! Re-calibrate sweep controls (see calibration.rs for the actual sweep
+//! state machine this drives).
 
-use crate::worker::{Command, SharedState, HISTORY_WINDOW_SECS};
+use crate::calibration::{self, LevelStatus};
+use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +43,39 @@ fn format_power(mw: f32) -> String {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, shared: &Arc<Mutex<SharedState>>, cmd_tx: &Sender<Command>) {
+pub struct CalibrationPageState {
+    pub tolerance_pct: f32,
+    pub checked: HashMap<u8, bool>,
+    show_confirm_dialog: bool,
+}
+
+impl Default for CalibrationPageState {
+    fn default() -> Self {
+        Self {
+            tolerance_pct: 10.0, // matches rf_calibration.py's own scanDetector default (max(0.1, mW*0.1))
+            checked: HashMap::new(),
+            show_confirm_dialog: false,
+        }
+    }
+}
+
+fn status_text(status: Option<&LevelStatus>) -> String {
+    match status {
+        None | Some(LevelStatus::NotCalibrated) => "Not calibrated".to_string(),
+        Some(LevelStatus::Pending) => "Pending".to_string(),
+        Some(LevelStatus::InProgress(s)) => s.clone(),
+        Some(LevelStatus::Done) => "Done".to_string(),
+        Some(LevelStatus::Aborted) => "Aborted".to_string(),
+    }
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    shared: &Arc<Mutex<SharedState>>,
+    sweep: &SharedSweep,
+    cmd_tx: &Sender<Command>,
+    page: &mut CalibrationPageState,
+) {
     ui.heading("RF Calibration");
 
     ui.separator();
@@ -84,10 +121,8 @@ pub fn show(ui: &mut egui::Ui, shared: &Arc<Mutex<SharedState>>, cmd_tx: &Sender
         egui::ComboBox::from_id_salt("update_hz")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
-                for &(candidate, label) in CANDIDATE_HZ {
-                    ui.add_enabled_ui(candidate <= max_hz, |ui| {
-                        ui.selectable_value(&mut hz, candidate, label);
-                    });
+                for &(h, l) in CANDIDATE_HZ.iter().filter(|&&(h, _)| h <= max_hz) {
+                    ui.selectable_value(&mut hz, h, l);
                 }
             });
         shared.lock().unwrap().update_hz = hz;
@@ -95,23 +130,145 @@ pub fn show(ui: &mut egui::Ui, shared: &Arc<Mutex<SharedState>>, cmd_tx: &Sender
 
     ui.separator();
     ui.heading("PA calibration table");
-    if ui.button("Refresh from VTX").clicked() {
+    if ui.button("Refresh").clicked() {
         let _ = cmd_tx.send(Command::RefreshCalTable);
     }
 
-    let state = shared.lock().unwrap();
+    let sweep_active = sweep.lock().unwrap().as_ref().map(|e| e.is_active()).unwrap_or(false);
+
+    // ---- Frequency-change gate (manual-frequency meters) ---------------
+    let awaiting_freq_mhz = {
+        let g = sweep.lock().unwrap();
+        g.as_ref().and_then(|e| match e.state {
+            calibration::EngineState::AwaitingFreqConfirm { freq_mhz } => Some(freq_mhz),
+            _ => None,
+        })
+    };
+    if let Some(freq_mhz) = awaiting_freq_mhz {
+        egui::Window::new("Set power meter frequency")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Set your power meter to {freq_mhz} MHz, then continue."));
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm").clicked() {
+                        let _ = cmd_tx.send(Command::ConfirmFrequency);
+                    }
+                    if ui.button("Abort").clicked() {
+                        let _ = cmd_tx.send(Command::AbortSweep);
+                    }
+                });
+            });
+    }
+
+    // ---- Table -----------------------------------------------------------
+    let pa_table = shared.lock().unwrap().pa_table.clone();
     egui::Grid::new("pa_table").striped(true).show(ui, |ui| {
+        ui.strong("");
         ui.strong("idx");
         ui.strong("mW");
         ui.strong("calibration[] (mV)");
         ui.strong("detector[] (mV)");
+        ui.strong("Boost");
+        ui.strong("RTC6705");
+        ui.strong("Status");
         ui.end_row();
-        for entry in &state.pa_table {
+
+        for entry in pa_table.iter().filter(|e| e.idx > 0) {
+            let checked = page.checked.entry(entry.idx).or_insert(false);
+            ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
             ui.label(entry.idx.to_string());
             ui.label(entry.m_w.to_string());
             ui.label(format!("{:?}", entry.value));
             ui.label(format!("{:?}", entry.detector));
+            ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
+            ui.label(entry.rtc6705_level.to_string());
+
+            let status = {
+                let g = sweep.lock().unwrap();
+                g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned())
+            };
+            ui.label(status_text(status.as_ref()));
             ui.end_row();
         }
+    });
+
+    // ---- Progress bar ------------------------------------------------
+    {
+        let g = sweep.lock().unwrap();
+        if let Some(engine) = g.as_ref() {
+            if engine.is_active() || engine.completed_steps > 0 {
+                ui.add(egui::ProgressBar::new(engine.progress()).show_percentage());
+            }
+        }
+    }
+
+    // ---- Tolerance + Re-calibrate/Stop --------------------------------
+    ui.horizontal(|ui| {
+        ui.label("Scan detector tolerance:");
+        ui.add(
+            egui::DragValue::new(&mut page.tolerance_pct)
+                .range(0.1..=50.0)
+                .suffix("%")
+                .speed(0.1),
+        );
+
+        if sweep_active {
+            if ui.button("Stop").clicked() {
+                let _ = cmd_tx.send(Command::AbortSweep);
+            }
+        } else if ui.button("Re-calibrate").clicked() {
+            page.show_confirm_dialog = true;
+        }
+    });
+
+    if page.show_confirm_dialog {
+        let mut open = true;
+        let mut confirmed = false;
+        egui::Window::new("Confirm Recalibration")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label("Recalibrate the checked power levels? This drives real RF output on the VTX.");
+                ui.horizontal(|ui| {
+                    if ui.button("Yes").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("No").clicked() {
+                        page.show_confirm_dialog = false;
+                    }
+                });
+            });
+        if !open {
+            // Closed via the window's own X -- default is No, per spec.
+            page.show_confirm_dialog = false;
+        }
+        if confirmed {
+            page.show_confirm_dialog = false;
+            let levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+            let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
+        }
+    }
+
+    // ---- Send to VTX / Save EEPROM (independent) -----------------------
+    ui.horizontal(|ui| {
+        if ui.button("Send to VTX").clicked() {
+            let _ = cmd_tx.send(Command::SendCalTableToVtx);
+        }
+
+        let any_calibrated = {
+            let g = sweep.lock().unwrap();
+            g.as_ref()
+                .map(|e| e.per_level_status.values().any(|s| matches!(s, LevelStatus::Done)))
+                .unwrap_or(false)
+        };
+        ui.add_enabled_ui(any_calibrated, |ui| {
+            if ui.button("Save EEPROM").clicked() {
+                let _ = cmd_tx.send(Command::SaveEeprom);
+            }
+        });
     });
 }
