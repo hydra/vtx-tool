@@ -17,6 +17,7 @@ mod power_meter;
 mod settings;
 mod vtxtable;
 mod worker;
+mod calibration;
 
 use clap::Parser;
 use log::LevelFilter;
@@ -74,6 +75,7 @@ fn main() -> eframe::Result<()> {
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
     state.lock().unwrap().meter_kind = initial_meter_kind;
     let vtx_table = Arc::new(Mutex::new(VtxTableConfig::default()));
+    let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();
 
     let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
@@ -83,7 +85,7 @@ fn main() -> eframe::Result<()> {
         "RF Calibration",
         native_options,
         Box::new(move |cc| {
-            worker::spawn(state.clone(), vtx_table.clone(), cmd_rx, cc.egui_ctx.clone());
+            worker::spawn(state.clone(), vtx_table.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
 
             if auto_connect {
                 let _ = cmd_tx.send(worker::Command::Connect {
@@ -96,6 +98,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(
                 state.clone(),
                 vtx_table.clone(),
+                sweep.clone(),
                 cmd_tx.clone(),
                 logs,
                 initial_settings,

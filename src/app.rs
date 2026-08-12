@@ -19,11 +19,12 @@
 use crate::logging;
 use crate::logging::SharedLogs;
 use crate::pages;
+use crate::pages::calibration::CalibrationPageState;
 use crate::pages::vtx_table::VtxTablePageState;
 use crate::power_meter::PowerMeterKind;
 use crate::settings::AppSettings;
 use crate::vtxtable::VtxTableConfig;
-use crate::worker::{Command, SharedState};
+use crate::worker::{Command, SharedState, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
 use egui_dock::{DockArea, DockState};
@@ -50,8 +51,10 @@ impl Page {
 struct TabViewer<'a> {
     shared: &'a Arc<Mutex<SharedState>>,
     vtx_table: &'a Arc<Mutex<VtxTableConfig>>,
+    sweep: &'a SharedSweep,
     cmd_tx: &'a Sender<Command>,
     vtx_table_page: &'a mut VtxTablePageState,
+    calibration_page: &'a mut CalibrationPageState,
 }
 
 impl egui_dock::TabViewer for TabViewer<'_> {
@@ -69,7 +72,9 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         match tab {
             Page::Home => pages::home::show(ui),
             Page::VtxTable => pages::vtx_table::show(ui, self.shared, self.vtx_table, self.cmd_tx, self.vtx_table_page),
-            Page::Calibration => pages::calibration::show(ui, self.shared, self.cmd_tx),
+            Page::Calibration => {
+                pages::calibration::show(ui, self.shared, self.sweep, self.cmd_tx, self.calibration_page)
+            }
         }
     }
 }
@@ -77,10 +82,12 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 pub struct App {
     state: Arc<Mutex<SharedState>>,
     vtx_table: Arc<Mutex<VtxTableConfig>>,
+    sweep: SharedSweep,
     cmd_tx: Sender<Command>,
     logs: &'static SharedLogs,
     dock_state: DockState<Page>,
     vtx_table_page: VtxTablePageState,
+    calibration_page: CalibrationPageState,
 
     vtx_port_input: String,
     meter_port_input: String,
@@ -91,6 +98,7 @@ impl App {
     pub fn new(
         state: Arc<Mutex<SharedState>>,
         vtx_table: Arc<Mutex<VtxTableConfig>>,
+        sweep: SharedSweep,
         cmd_tx: Sender<Command>,
         logs: &'static SharedLogs,
         initial_settings: AppSettings,
@@ -99,10 +107,12 @@ impl App {
         Self {
             state,
             vtx_table,
+            sweep,
             cmd_tx,
             logs,
             dock_state: DockState::new(vec![Page::Home]),
             vtx_table_page: VtxTablePageState::default(),
+            calibration_page: CalibrationPageState::default(),
             vtx_port_input: initial_settings.vtx_port,
             meter_port_input: initial_settings.meter_port,
             meter_kind: initial_meter_kind,
@@ -118,6 +128,14 @@ impl App {
             self.dock_state.set_active_tab(path);
         } else {
             self.dock_state.push_to_focused_leaf(page);
+            // Runs once, exactly when the tab is first created (not on
+            // every subsequent focus) -- the show() function itself
+            // gets called every frame the tab is visible, so triggering
+            // this there instead would mean re-sending the refresh
+            // constantly rather than just on first open.
+            if page == Page::Calibration {
+                let _ = self.cmd_tx.send(Command::RefreshCalTable);
+            }
         }
     }
 }
@@ -221,8 +239,10 @@ impl eframe::App for App {
             let mut viewer = TabViewer {
                 shared: &self.state,
                 vtx_table: &self.vtx_table,
+                sweep: &self.sweep,
                 cmd_tx: &self.cmd_tx,
                 vtx_table_page: &mut self.vtx_table_page,
+                calibration_page: &mut self.calibration_page,
             };
             DockArea::new(&mut self.dock_state).show_inside(ui, &mut viewer);
         });

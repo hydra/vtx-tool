@@ -2,12 +2,9 @@
 //! Ported from cMsp.py's wire protocol -- function IDs, payload byte
 //! layouts, and checksum algorithms match that reference exactly.
 //!
-//! NOT YET IMPLEMENTED HERE: the calibration sweep itself. MSP_SET_PACALIBRATION's
-//! exact semantics for value=0 vs value=1 vs a real mV number are only
-//! inferable from how the Python client happens to call it (see
-//! rf_calibration.py's scanPa/scanDetector) -- worth confirming against
-//! the actual VTX-side C handler before this crate sends live DAC
-//! commands to real hardware.
+//! The calibration sweep itself lives in calibration.rs, built on the
+//! types here (PaCalibration, PaCalibrationReading, and the
+//! encode/decode functions for SET_PACALIBRATION and MSP_PACALIBRATION).
 
 use anyhow::{bail, Result};
 use std::io::{Read, Write};
@@ -31,6 +28,43 @@ pub mod function {
     pub const SET_PACALIBRATION: u16 = 0x4803;
 }
 
+/// Decoded MSP_PACALIBRATION response -- vtx_msp_push_calibration()'s
+/// payload: [power_level, vref_mv(u16 LE), detector_mv(u16 LE)]. Sent by
+/// the VTX after every SET_PACALIBRATION it processes (see
+/// vtx_msp_set_calibration() in vtx_msp.c), whether that was a real mV
+/// override or just a value=0 telemetry poll.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaCalibrationReading {
+    pub power_level: u8,
+    pub vref_mv: u16,
+    pub detector_mv: u16,
+}
+
+pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationReading> {
+    if payload.len() < 5 {
+        bail!("PACALIBRATION payload too short: {} bytes", payload.len());
+    }
+    Ok(PaCalibrationReading {
+        power_level: payload[0],
+        vref_mv: (payload[1] as u16) | ((payload[2] as u16) << 8),
+        detector_mv: (payload[3] as u16) | ((payload[4] as u16) << 8),
+    })
+}
+
+/// Encodes a SET_PACALIBRATION request: select `power_level` (switches
+/// the VTX's active level if different from its current one) and
+/// optionally override the DAC directly. `mv = None` sends value=0 --
+/// a pure telemetry poll, doesn't touch the DAC (matches
+/// rf_calibration.py's send_MSP_SET_PACALIBRATION(0) pattern). `mv =
+/// Some(1)` is the script's own convention for "select this level and
+/// kick the DAC to a near-zero safe starting point" -- callers wanting
+/// that should pass Some(1) explicitly, this function doesn't special-
+/// case it.
+pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>) -> Vec<u8> {
+    let mv = mv.unwrap_or(0);
+    vec![power_level, (mv & 0xff) as u8, (mv >> 8) as u8]
+}
+
 /// One decoded PA calibration table entry, matching cMsp.py's
 /// PaCalibration (idx, mW, 7 calibration mV points, 7 detector points).
 #[derive(Debug, Clone, Default)]
@@ -39,6 +73,20 @@ pub struct PaCalibration {
     pub m_w: u16,
     pub value: [u16; 7],
     pub detector: [u16; 7],
+    /// Real levels (idx >= 1): whether this level engages the external
+    /// boost PA stage. Display-only -- not editable from this tool.
+    pub ext_pa_enable: bool,
+    /// Real levels (idx >= 1): the raw RTC6705 register value for this
+    /// level. Display-only.
+    pub rtc6705_level: u8,
+    /// Only meaningful when idx == 0 -- that entry has no real
+    /// ext_pa_enable, so vtx_msp.c repurposes that byte to carry the
+    /// board's DAC polarity instead: true if PA_DAC_SIGN > 0 (inverted,
+    /// e.g. RTC76401: lower DAC mV means MORE RF output), false if
+    /// PA_DAC_SIGN < 0 (normal/typical: higher DAC mV means more
+    /// output). The calibration sweep reads this off idx 0's entry to
+    /// know which direction to step the DAC.
+    pub dac_sign_inverted: bool,
 }
 
 /// Decoded MSP_VTX_CONFIG response, matching vtx_msp.c's
@@ -437,11 +485,24 @@ pub fn decode_pa_calibration(payload: &[u8]) -> Result<PaCalibration> {
     for i in 0..7 {
         entry.detector[i] = (payload[17 + i * 2] as u16) | ((payload[18 + i * 2] as u16) << 8);
     }
+    // Trailing 2 bytes are a newer addition -- tolerate a bare 31-byte
+    // payload (older firmware) by leaving these at their Default (false/0).
+    if payload.len() >= 33 {
+        if entry.idx == 0 {
+            entry.dac_sign_inverted = payload[31] != 0;
+        } else {
+            entry.ext_pa_enable = payload[31] != 0;
+        }
+        entry.rtc6705_level = payload[32];
+    }
     Ok(entry)
 }
 
 /// Encodes a PaCalibration entry into a SET_PACALTABLE payload (same
-/// layout as decode_pa_calibration expects).
+/// layout as decode_pa_calibration expects). Only used to push
+/// calibration[]/detector[] edits back -- ext_pa_enable/rtc6705_level/
+/// dac_sign_inverted are display-only and not meaningful to send, so
+/// this only encodes the original 31-byte shape.
 pub fn encode_pa_calibration(entry: &PaCalibration) -> Vec<u8> {
     let mut p = Vec::with_capacity(31);
     p.push(entry.idx);

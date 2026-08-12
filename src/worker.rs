@@ -4,14 +4,18 @@
 //! automatically at startup unless both were given on the command line
 //! (see main.rs).
 //!
-//! This thread plays two roles on the VTX link: an ACTIVE client
-//! (sending queries on Command) and a PASSIVE responder, answering the
-//! VTX's own unsolicited MSP_VTX_CONFIG query with the locally-held
-//! VtxTableConfig (see vtxtable.rs's header comment for the protocol
-//! background). Both share one serial link and one read call each loop
-//! iteration -- see the comment at the passive-poll site for the
-//! resulting (accepted) race condition.
+//! This thread plays several roles on the VTX link, all sharing ONE read
+//! call per loop tick (see the dispatch in the main loop below): an
+//! ACTIVE client (sending queries on Command, each with its own
+//! dedicated read-until-quiet loop), a PASSIVE responder (answering the
+//! VTX's own unsolicited MSP_VTX_CONFIG query), and -- new in this
+//! revision -- the calibration sweep engine's PACALIBRATION response
+//! listener. The sweep itself (calibration.rs) is advanced one step per
+//! tick here too, rather than run as a blocking loop, so meter polling
+//! and the passive responder keep working throughout a sweep that can
+//! take several minutes.
 
+use crate::calibration::{self, SweepEngine};
 use crate::msp::{self, function, MspLink};
 use crate::power_meter::{PowerMeter, PowerMeterKind};
 use crate::vtxtable::VtxTableConfig;
@@ -24,6 +28,8 @@ use std::time::{Duration, Instant};
 
 /// How long the power-meter plot's rolling history window covers.
 pub const HISTORY_WINDOW_SECS: f64 = 60.0;
+
+pub type SharedSweep = Arc<Mutex<Option<SweepEngine>>>;
 
 pub struct SharedState {
     pub pa_table: Vec<msp::PaCalibration>,
@@ -41,6 +47,10 @@ pub struct SharedState {
     /// wherever it's set (see pages/calibration.rs). f64 rather than an
     /// integer Hz -- the dropdown includes fractional rates (0.5Hz).
     pub update_hz: f64,
+    /// Set while a sweep is active: whatever update_hz was before the
+    /// sweep forced it to sweep_hz, so it can be restored when the sweep
+    /// finishes or aborts.
+    pub pre_sweep_update_hz: Option<f64>,
     /// Last thing the VTX itself reported when WE queried it -- a
     /// debug/confirmation aid, unrelated to the passive auto-responder.
     pub vtx_config: Option<msp::VtxConfig>,
@@ -55,6 +65,7 @@ impl Default for SharedState {
             power_history: VecDeque::new(),
             meter_kind: PowerMeterKind::default(),
             update_hz: 1.0, // conservative default; ImmersionRC V1's own max is now 5Hz, so this leaves headroom below it and stays valid for any future slower-max meter too
+            pre_sweep_update_hz: None,
             vtx_config: None,
             connected: false,
         }
@@ -79,11 +90,29 @@ pub enum Command {
     /// marker, so this is processed by the exact same
     /// handle_msp_set_vtx_config() path a real FC's push would hit.
     PushVtxConfig,
+    /// Starts a calibration sweep over `levels` (1-based indices into the
+    /// PA table, from the checked rows) at the given detector tolerance.
+    /// Frequencies and per-level mW targets come from the already-loaded
+    /// pa_table -- refresh it first if it's empty/stale.
+    StartSweep { levels: Vec<u8>, tolerance_pct: f32 },
+    /// UI confirms the user has retuned a manual-frequency meter.
+    ConfirmFrequency,
+    /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
+    /// state (see calibration::safe_state_payload).
+    AbortSweep,
+    /// Pushes the working pa_table's calibration[]/detector[] for every
+    /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
+    /// of SaveEeprom -- this only updates the VTX's RAM copy.
+    SendCalTableToVtx,
+    /// Commits whatever's currently in the VTX's RAM (including
+    /// anything sent by SendCalTableToVtx) to EEPROM.
+    SaveEeprom,
 }
 
 pub fn spawn(
     state: Arc<Mutex<SharedState>>,
     vtx_table: Arc<Mutex<VtxTableConfig>>,
+    sweep: SharedSweep,
     cmd_rx: Receiver<Command>,
     ctx: eframe::egui::Context,
 ) {
@@ -132,6 +161,7 @@ pub fn spawn(
                         debug!(target: "vtx", "disconnected");
                         debug!(target: "meter", "disconnected");
                         state.lock().unwrap().connected = false;
+                        *sweep.lock().unwrap() = None;
                     }
 
                     Command::RefreshCalTable => {
@@ -174,13 +204,115 @@ pub fn spawn(
                             error!(target: "vtx", "PushVtxConfig requested while disconnected");
                         }
                     }
+
+                    Command::StartSweep { levels, tolerance_pct } => {
+                        if vtx.is_none() {
+                            error!(target: "vtx", "StartSweep requested while disconnected");
+                        } else {
+                            let (pa_table, meter_kind, prev_update_hz) = {
+                                let s = state.lock().unwrap();
+                                (s.pa_table.clone(), s.meter_kind, s.update_hz)
+                            };
+                            let freq_entry = pa_table.iter().find(|e| e.idx == 0);
+                            let frequencies: Vec<u16> =
+                                freq_entry.map(|e| e.value.iter().copied().filter(|&f| f > 0).collect()).unwrap_or_default();
+                            let sign_inverted = freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
+
+                            let mut target_mw_by_level = std::collections::HashMap::new();
+                            for &lvl in &levels {
+                                if let Some(entry) = pa_table.iter().find(|e| e.idx == lvl) {
+                                    target_mw_by_level.insert(lvl, entry.m_w);
+                                }
+                            }
+
+                            if frequencies.is_empty() {
+                                error!(target: "vtx", "StartSweep: no frequency breakpoints in the PA table -- Refresh it first");
+                            } else if levels.is_empty() {
+                                error!(target: "vtx", "StartSweep: no power levels selected");
+                            } else {
+                                let mut engine = SweepEngine::new(
+                                    levels,
+                                    frequencies,
+                                    tolerance_pct,
+                                    sign_inverted,
+                                    target_mw_by_level,
+                                    meter_kind.max_update_hz(),
+                                );
+                                engine.start(meter_kind.requires_manual_frequency());
+                                let sweep_hz = engine.sweep_hz;
+                                debug!(target: "vtx", "sweep started: {} levels, {} frequencies, tolerance {tolerance_pct}%",
+                                    engine.levels.len(), engine.frequencies.len());
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.pre_sweep_update_hz = Some(prev_update_hz);
+                                    s.update_hz = sweep_hz;
+                                }
+                                *sweep.lock().unwrap() = Some(engine);
+                            }
+                        }
+                    }
+
+                    Command::ConfirmFrequency => {
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.confirm_frequency();
+                            debug!(target: "vtx", "frequency change confirmed by user");
+                        }
+                    }
+
+                    Command::AbortSweep => {
+                        let payload = calibration::safe_state_payload(&vtx_table.lock().unwrap());
+                        if let Some(link) = vtx.as_mut() {
+                            match link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                Ok(()) => debug!(target: "vtx", "sweep aborted, pitmode-safe state sent"),
+                                Err(e) => error!(target: "vtx", "abort: failed to send safe state: {e}"),
+                            }
+                        }
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.abort();
+                        }
+                        let mut s = state.lock().unwrap();
+                        if let Some(prev) = s.pre_sweep_update_hz.take() {
+                            s.update_hz = prev;
+                        }
+                    }
+
+                    Command::SendCalTableToVtx => {
+                        if let Some(link) = vtx.as_mut() {
+                            let pa_table = state.lock().unwrap().pa_table.clone();
+                            let mut sent = 0;
+                            for entry in pa_table.iter().filter(|e| e.idx > 0) {
+                                let payload = msp::encode_pa_calibration(entry);
+                                if link.send_v2(function::SET_PACALTABLE, Some(&payload)).is_ok() {
+                                    sent += 1;
+                                }
+                            }
+                            debug!(target: "vtx", "sent {sent} calibration table entries to VTX");
+                        } else {
+                            error!(target: "vtx", "SendCalTableToVtx requested while disconnected");
+                        }
+                    }
+
+                    Command::SaveEeprom => {
+                        if let Some(link) = vtx.as_mut() {
+                            match link.send_v1(function::EEPROM_WRITE as u8, &[]) {
+                                Ok(()) => debug!(target: "vtx", "sent EEPROM_WRITE"),
+                                Err(e) => error!(target: "vtx", "failed to send EEPROM_WRITE: {e}"),
+                            }
+                        } else {
+                            error!(target: "vtx", "SaveEeprom requested while disconnected");
+                        }
+                    }
                 }
                 ctx.request_repaint();
             }
 
-            // Passive: answer any unsolicited query from the VTX (chiefly
-            // MSP_VTX_CONFIG at its boot). See module doc for the shared
-            // read-call trade-off with the active command handlers above.
+            // One read per tick, dispatched to whichever consumer wants
+            // it: the passive VTX_CONFIG responder, or the sweep engine's
+            // PACALIBRATION response listener. See module doc for why
+            // this is consolidated into a single read rather than one
+            // per consumer (the earlier version's frame-stealing race
+            // between separate reads).
+            let mut pa_calibration_reading: Option<msp::PaCalibrationReading> = None;
             if let Some(link) = vtx.as_mut() {
                 if let Ok(Some(frame)) = link.read_frame(Duration::from_millis(20)) {
                     if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
@@ -190,7 +322,48 @@ pub fn spawn(
                             Err(e) => error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}"),
                         }
                         ctx.request_repaint();
+                    } else if frame.function == function::PACALIBRATION {
+                        if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload) {
+                            pa_calibration_reading = Some(reading);
+                        }
                     }
+                }
+            }
+
+            // Advance the sweep by one step, if active.
+            if let Some(link) = vtx.as_mut() {
+                let history_snapshot = state.lock().unwrap().power_history.clone();
+                let mut sweep_guard = sweep.lock().unwrap();
+                if let Some(engine) = sweep_guard.as_mut() {
+                    if let Err(e) = engine.poll(link, &history_snapshot, pa_calibration_reading) {
+                        error!(target: "vtx", "sweep step failed: {e}");
+                    }
+                    if let Some(result) = engine.pending_result.take() {
+                        let mut s = state.lock().unwrap();
+                        if let Some(entry) = s.pa_table.iter_mut().find(|e| e.idx == result.level) {
+                            if let Some(mv) = result.calibration_mv {
+                                if let Some(slot) = entry.value.get_mut(result.freq_idx) {
+                                    *slot = mv;
+                                }
+                            }
+                            if let Some(det) = result.detector_mv {
+                                if let Some(slot) = entry.detector.get_mut(result.freq_idx) {
+                                    *slot = det;
+                                }
+                            }
+                        }
+                        debug!(target: "vtx", "sweep result: level={} freq_idx={} cal={:?} det={:?}",
+                            result.level, result.freq_idx, result.calibration_mv, result.detector_mv);
+                    }
+                    if !engine.is_active() {
+                        // Sweep finished (not aborted -- AbortSweep restores this itself).
+                        let mut s = state.lock().unwrap();
+                        if let Some(prev) = s.pre_sweep_update_hz.take() {
+                            s.update_hz = prev;
+                        }
+                        debug!(target: "vtx", "sweep finished");
+                    }
+                    ctx.request_repaint();
                 }
             }
 

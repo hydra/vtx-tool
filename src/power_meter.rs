@@ -55,6 +55,19 @@ impl PowerMeterKind {
             PowerMeterKind::ImmersionRcV1 => 5,
         }
     }
+
+    /// True if this meter has no way for the tool to command its
+    /// listening frequency (cImmersionRC.py's "F<n>\r\n" is a V2-meter
+    /// command; nothing here assumes the V1 meter supports it -- see
+    /// read_dbm_immersionrc_v1's doc comment below). When true, the
+    /// calibration sweep must pause at each frequency change and get an
+    /// explicit user confirmation that they've retuned the meter by hand
+    /// before continuing.
+    pub fn requires_manual_frequency(self) -> bool {
+        match self {
+            PowerMeterKind::ImmersionRcV1 => true,
+        }
+    }
 }
 
 impl Default for PowerMeterKind {
