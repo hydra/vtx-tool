@@ -64,18 +64,23 @@ pub struct SharedState {
     pub vtx_config: Option<msp::VtxConfig>,
     pub connected: bool,
     /// True if ANY frame (not just ones a specific command was waiting
-    /// for) has been seen from the VTX within the last VTX_READY_WINDOW.
+    /// for) has been seen from the VTX within the last READY_WINDOW.
     /// Used by the sweep engine to detect a current-limited supply
     /// power-cycling the VTX mid-sweep, and shown live in the resulting
     /// "VTX not responding" dialog's status line.
     pub vtx_ready: bool,
+    /// Same idea as vtx_ready, for the power meter -- true if its last
+    /// "V" presence-check succeeded recently. See PowerMeter::check_alive
+    /// and the dedicated poll loop in spawn().
+    pub meter_ready: bool,
 }
 
-/// How recently the VTX must have said ANYTHING for vtx_ready to be
-/// true. The VTX's own firmware chatters (MSP_STATUS/MSP_RC) roughly
-/// every 100ms on its own, so this has real margin without being slow
-/// to notice a genuine loss.
-const VTX_READY_WINDOW: Duration = Duration::from_millis(500);
+/// How recently the VTX (or power meter) must have said ANYTHING for
+/// vtx_ready/meter_ready to be true. The VTX's own firmware chatters
+/// (MSP_STATUS/MSP_RC) roughly every 100ms on its own, and the meter's
+/// alive-check runs every 100ms too, so this has real margin without
+/// being slow to notice a genuine loss.
+const READY_WINDOW: Duration = Duration::from_millis(500);
 
 impl Default for SharedState {
     fn default() -> Self {
@@ -90,6 +95,7 @@ impl Default for SharedState {
             vtx_config: None,
             connected: false,
             vtx_ready: false,
+            meter_ready: false,
         }
     }
 }
@@ -149,6 +155,8 @@ pub fn spawn(
         let mut meter: Option<PowerMeter> = None;
         let mut last_meter_read = Instant::now();
         let mut vtx_last_seen: Option<Instant> = None;
+        let mut meter_last_seen: Option<Instant> = None; // updated on any successful reply (V check or D read)
+        let mut last_meter_alive_check = Instant::now(); // when the "V" presence-check last ran, for its own 100ms retry cadence
 
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -175,25 +183,30 @@ pub fn spawn(
                             }
                         };
                         vtx_last_seen = None;
+                        meter_last_seen = None;
                         let mut s = state.lock().unwrap();
                         s.connected = vtx.is_some() && meter.is_some();
                         s.vtx_ready = false;
+                        s.meter_ready = false;
                         s.meter_kind = meter_kind;
                         s.update_hz = s.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
                         s.power_history.clear();
                         drop(s);
                         last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
+                        last_meter_alive_check = Instant::now() - Duration::from_secs(1); // force an immediate first alive-check
                     }
 
                     Command::Disconnect => {
                         vtx = None;
                         meter = None;
                         vtx_last_seen = None;
+                        meter_last_seen = None;
                         debug!(target: "vtx", "disconnected");
                         debug!(target: "meter", "disconnected");
                         let mut s = state.lock().unwrap();
                         s.connected = false;
                         s.vtx_ready = false;
+                        s.meter_ready = false;
                         drop(s);
                         *sweep.lock().unwrap() = None;
                     }
@@ -357,24 +370,47 @@ pub fn spawn(
             // between separate reads). ANY frame received here also
             // counts as a heartbeat -- see vtx_last_seen/vtx_ready.
             let mut pa_calibration_reading: Option<msp::PaCalibrationReading> = None;
+            let mut vtx_link_lost = false;
             if let Some(link) = vtx.as_mut() {
-                if let Ok(Some(frame)) = link.read_frame(Duration::from_millis(20)) {
-                    vtx_last_seen = Some(Instant::now());
-                    if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
-                        let response = vtx_table.lock().unwrap().encode_vtx_config_response();
-                        match link.send_v1(function::VTX_CONFIG as u8, &response) {
-                            Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
-                            Err(e) => error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}"),
+                match link.read_frame(Duration::from_millis(20)) {
+                    Ok(Some(frame)) => {
+                        vtx_last_seen = Some(Instant::now());
+                        if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
+                            let response = vtx_table.lock().unwrap().encode_vtx_config_response();
+                            match link.send_v1(function::VTX_CONFIG as u8, &response) {
+                                Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
+                                Err(e) => {
+                                    error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}");
+                                    vtx_link_lost = true;
+                                }
+                            }
+                            ctx.request_repaint();
+                        } else if frame.function == function::PACALIBRATION {
+                            if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload) {
+                                pa_calibration_reading = Some(reading);
+                            }
                         }
-                        ctx.request_repaint();
-                    } else if frame.function == function::PACALIBRATION {
-                        if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload) {
-                            pa_calibration_reading = Some(reading);
-                        }
+                    }
+                    Ok(None) => {} // benign timeout -- no traffic, not an error
+                    Err(e) => {
+                        // A real I/O error (as opposed to a timeout) -- most likely
+                        // the port itself is gone (device unplugged). Disconnect
+                        // rather than spin retrying a dead port.
+                        error!(target: "vtx", "VTX link error, disconnecting: {e}");
+                        vtx_link_lost = true;
                     }
                 }
             }
-            let vtx_ready = vtx_last_seen.map(|t| t.elapsed() < VTX_READY_WINDOW).unwrap_or(false);
+            if vtx_link_lost {
+                vtx = None;
+                vtx_last_seen = None;
+                let mut s = state.lock().unwrap();
+                s.connected = false;
+                s.vtx_ready = false;
+                drop(s);
+                *sweep.lock().unwrap() = None;
+            }
+            let vtx_ready = vtx_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
             if vtx.is_some() {
                 state.lock().unwrap().vtx_ready = vtx_ready;
             }
@@ -387,6 +423,7 @@ pub fn spawn(
                 };
                 let mut sweep_guard = sweep.lock().unwrap();
                 if let Some(engine) = sweep_guard.as_mut() {
+                    let was_active = engine.is_active();
                     if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready) {
                         error!(target: "vtx", "sweep step failed: {e}");
                     }
@@ -407,23 +444,30 @@ pub fn spawn(
                         debug!(target: "vtx", "sweep result: level={} freq_idx={} cal={:?} det={:?}",
                             result.level, result.freq_idx, result.calibration_mv, result.detector_mv);
                     }
-                    if !engine.is_active() {
-                        // Sweep finished (not aborted -- AbortSweep restores this itself).
+                    if was_active && !engine.is_active() {
+                        // Just transitioned to finished this tick (not aborted --
+                        // AbortSweep restores update_hz itself). Only runs once,
+                        // not every tick afterward -- the engine object persists
+                        // after finishing, so gating on the transition (not just
+                        // "currently inactive") is what avoids re-doing this
+                        // every 10ms indefinitely.
                         let mut s = state.lock().unwrap();
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
                             s.update_hz = prev;
                         }
-                        //debug!(target: "vtx", "sweep finished");
                     }
                     ctx.request_repaint();
                 }
             }
 
-            // Power meter poll, rate-limited to the configured Hz
+            // Power meter reading, rate-limited to the configured Hz
             // (clamped to the connected meter's max -- see Command::Connect
             // and pages/calibration.rs's dropdown). Outer loop tick is
             // 10ms so higher Hz settings (e.g. 20Hz = 50ms interval) are
-            // actually achievable, not just theoretically requested.
+            // actually achievable, not just theoretically requested. This
+            // is NOT the connect/disconnect signal (see the separate V-based
+            // check below) -- an unparseable reply here is usually just
+            // meter noise, not proof the device is gone, so it only logs.
             if let Some(m) = meter.as_mut() {
                 let interval = {
                     let hz = state.lock().unwrap().update_hz.max(0.01);
@@ -452,6 +496,44 @@ pub fn spawn(
                     }
                     ctx.request_repaint();
                 }
+            }
+
+            // Power meter presence check ("V"), independent of the D-based
+            // reading above -- runs on its own ~100ms cadence regardless of
+            // update_hz, since detecting connect/disconnect quickly matters
+            // more here than the graph's sample rate. Distinguishes an
+            // ordinary timeout (meter just didn't answer this cycle --
+            // retried next cycle, not treated as disconnection) from a real
+            // I/O error (port gone -- e.g. unplugged), which disconnects
+            // immediately rather than spinning on a dead port.
+            let mut meter_link_lost = false;
+            if let Some(m) = meter.as_mut() {
+                if last_meter_alive_check.elapsed() >= Duration::from_millis(100) {
+                    last_meter_alive_check = Instant::now();
+                    match m.check_alive(Duration::from_millis(300)) {
+                        Ok(()) => meter_last_seen = Some(Instant::now()),
+                        Err(e) => {
+                            let is_timeout = e
+                                .downcast_ref::<std::io::Error>()
+                                .map(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                                .unwrap_or(false);
+                            if is_timeout {
+                                debug!(target: "meter", "alive-check timed out, retrying");
+                            } else {
+                                error!(target: "meter", "power meter link error, disconnecting: {e}");
+                                meter_link_lost = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if meter_link_lost {
+                meter = None;
+                meter_last_seen = None;
+            }
+            let meter_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
+            if meter.is_some() || meter_link_lost {
+                state.lock().unwrap().meter_ready = meter_ready;
             }
 
             std::thread::sleep(Duration::from_millis(10));
