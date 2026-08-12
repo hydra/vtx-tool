@@ -1,42 +1,71 @@
 //! Background I/O thread. eframe's UI thread must never block on serial
-//! I/O, so all MSP/power-meter communication happens here. Unlike the
-//! earlier version, ports are opened/closed on demand (Connect/Disconnect
-//! commands) rather than once at startup -- see app.rs's left-panel
-//! connect controls.
+//! I/O, so all MSP/power-meter communication happens here. Ports are
+//! opened/closed on demand (Connect/Disconnect commands), not
+//! automatically at startup unless both were given on the command line
+//! (see main.rs).
 //!
-//! This thread now plays two roles on the VTX link: an ACTIVE client
-//! (sending queries on Command, e.g. RefreshCalTable) and a PASSIVE
-//! responder, answering the VTX's own unsolicited MSP_VTX_CONFIG query
-//! (empty payload) with the locally-held VtxTableConfig, the same way
-//! Betaflight's own vtxTableConfig() answers a VTX at boot (see
-//! vtxtable.rs's header comment for the protocol background this is
-//! based on). Both share one serial link and one read call each loop
+//! This thread plays two roles on the VTX link: an ACTIVE client
+//! (sending queries on Command) and a PASSIVE responder, answering the
+//! VTX's own unsolicited MSP_VTX_CONFIG query with the locally-held
+//! VtxTableConfig (see vtxtable.rs's header comment for the protocol
+//! background). Both share one serial link and one read call each loop
 //! iteration -- see the comment at the passive-poll site for the
 //! resulting (accepted) race condition.
 
 use crate::msp::{self, function, MspLink};
-use crate::power_meter::PowerMeter;
+use crate::power_meter::{PowerMeter, PowerMeterKind};
 use crate::vtxtable::VtxTableConfig;
 use anyhow::Result;
 use log::{debug, error};
+use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Default)]
+/// How long the power-meter plot's rolling history window covers.
+pub const HISTORY_WINDOW_SECS: f64 = 60.0;
+
 pub struct SharedState {
     pub pa_table: Vec<msp::PaCalibration>,
     pub last_dbm: Option<f32>,
+    /// (elapsed_secs_since_worker_start, mW) pairs, pruned to the last
+    /// HISTORY_WINDOW_SECS. elapsed-seconds rather than wall-clock time
+    /// so the plot's x-axis is a simple, always-increasing float.
+    pub power_history: VecDeque<(f64, f32)>,
+    /// Selected power meter kind -- set immediately when the user picks
+    /// it in the left panel's dropdown (even before connecting), so the
+    /// calibration page's update-rate dropdown can clamp its options to
+    /// this kind's max_update_hz() right away.
+    pub meter_kind: PowerMeterKind,
+    /// User-configured polling rate, clamped to meter_kind.max_update_hz()
+    /// wherever it's set (see pages/calibration.rs).
+    pub update_hz: u32,
     /// Last thing the VTX itself reported when WE queried it -- a
-    /// debug/confirmation aid, separate from (and unrelated to) the
-    /// passive auto-responder below, which answers the VTX's queries
-    /// rather than making them.
+    /// debug/confirmation aid, unrelated to the passive auto-responder.
     pub vtx_config: Option<msp::VtxConfig>,
     pub connected: bool,
 }
 
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
+            pa_table: Vec::new(),
+            last_dbm: None,
+            power_history: VecDeque::new(),
+            meter_kind: PowerMeterKind::default(),
+            update_hz: 5, // conservative default, within every currently-known meter's max
+            vtx_config: None,
+            connected: false,
+        }
+    }
+}
+
 pub enum Command {
-    Connect { vtx_port: String, meter_port: String },
+    Connect {
+        vtx_port: String,
+        meter_port: String,
+        meter_kind: PowerMeterKind,
+    },
     Disconnect,
     RefreshCalTable,
     RefreshVtxConfig,
@@ -49,13 +78,15 @@ pub fn spawn(
     ctx: eframe::egui::Context,
 ) {
     std::thread::spawn(move || {
+        let start = Instant::now();
         let mut vtx: Option<MspLink> = None;
         let mut meter: Option<PowerMeter> = None;
+        let mut last_meter_read = Instant::now();
 
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
-                    Command::Connect { vtx_port, meter_port } => {
+                    Command::Connect { vtx_port, meter_port, meter_kind } => {
                         vtx = match MspLink::open(&vtx_port, 115200) {
                             Ok(l) => {
                                 debug!(target: "vtx", "opened {vtx_port}");
@@ -66,9 +97,9 @@ pub fn spawn(
                                 None
                             }
                         };
-                        meter = match PowerMeter::open(&meter_port, 115200) {
+                        meter = match PowerMeter::open(meter_kind, &meter_port) {
                             Ok(m) => {
-                                debug!(target: "meter", "opened {meter_port}");
+                                debug!(target: "meter", "opened {meter_port} ({})", meter_kind.name());
                                 Some(m)
                             }
                             Err(e) => {
@@ -76,7 +107,13 @@ pub fn spawn(
                                 None
                             }
                         };
-                        state.lock().unwrap().connected = vtx.is_some() && meter.is_some();
+                        let mut s = state.lock().unwrap();
+                        s.connected = vtx.is_some() && meter.is_some();
+                        s.meter_kind = meter_kind;
+                        s.update_hz = s.update_hz.min(meter_kind.max_update_hz()).max(1);
+                        s.power_history.clear();
+                        drop(s);
+                        last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
                     }
 
                     Command::Disconnect => {
@@ -120,15 +157,8 @@ pub fn spawn(
             }
 
             // Passive: answer any unsolicited query from the VTX (chiefly
-            // MSP_VTX_CONFIG at its boot). Shares the same read call
-            // budget as the active command handlers above -- if a query
-            // happens to arrive in the same narrow window as an active
-            // command awaiting its own reply, one can "steal" the
-            // other's frame (the loser just times out and, for a button
-            // click, can simply be retried; VTX_CONFIG queries only
-            // really happen once at VTX boot in this firmware, so this
-            // is an accepted trade-off rather than a full frame-dispatch
-            // queue).
+            // MSP_VTX_CONFIG at its boot). See module doc for the shared
+            // read-call trade-off with the active command handlers above.
             if let Some(link) = vtx.as_mut() {
                 if let Ok(Some(frame)) = link.read_frame(Duration::from_millis(20)) {
                     if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
@@ -142,18 +172,41 @@ pub fn spawn(
                 }
             }
 
+            // Power meter poll, rate-limited to the configured Hz
+            // (clamped to the connected meter's max -- see Command::Connect
+            // and pages/calibration.rs's dropdown). Outer loop tick is
+            // 10ms so higher Hz settings (e.g. 20Hz = 50ms interval) are
+            // actually achievable, not just theoretically requested.
             if let Some(m) = meter.as_mut() {
-                match m.read_dbm(Duration::from_millis(300)) {
-                    Ok(dbm) => {
-                        debug!(target: "meter", "{dbm:.2} dBm");
-                        state.lock().unwrap().last_dbm = Some(dbm);
+                let interval = {
+                    let hz = state.lock().unwrap().update_hz.max(1);
+                    Duration::from_secs_f64(1.0 / hz as f64)
+                };
+                if last_meter_read.elapsed() >= interval {
+                    last_meter_read = Instant::now();
+                    match m.read_dbm(Duration::from_millis(300)) {
+                        Ok(dbm) => {
+                            let mw = 10f32.powf(dbm / 10.0);
+                            debug!(target: "meter", "{dbm:.2} dBm ({mw:.6} mW)");
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let mut s = state.lock().unwrap();
+                            s.last_dbm = Some(dbm);
+                            s.power_history.push_back((elapsed, mw));
+                            while let Some(&(t, _)) = s.power_history.front() {
+                                if elapsed - t > HISTORY_WINDOW_SECS {
+                                    s.power_history.pop_front();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => error!(target: "meter", "read failed: {e}"),
                     }
-                    Err(e) => error!(target: "meter", "read failed: {e}"),
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
             }
 
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
         }
     });
 }
