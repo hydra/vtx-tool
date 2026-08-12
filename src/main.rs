@@ -1,9 +1,13 @@
 //! rf-cal: PA calibration + VTX table tool.
 //!
 //! Connection is manual by default (Connect button in the left panel);
-//! auto-connects at startup only if BOTH --vtx-port and --meter-port are
-//! given on the command line. Last-used ports are remembered (settings.rs)
-//! and pre-filled in the port fields regardless.
+//! auto-connects at startup only if ALL THREE of --vtx-port,
+//! --meter-port, and --meter-kind are given on the command line (the
+//! meter kind determines the serial protocol/baud used to open the
+//! meter port, so it's just as required as the ports themselves for an
+//! actually-working auto-connect, not optional). Last-used ports are
+//! remembered (settings.rs) and pre-filled in the port fields regardless
+//! of whether auto-connect fires.
 
 mod app;
 mod logging;
@@ -16,6 +20,7 @@ mod worker;
 
 use clap::Parser;
 use log::LevelFilter;
+use power_meter::PowerMeterKind;
 use settings::AppSettings;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -29,10 +34,17 @@ struct Args {
     #[arg(long)]
     vtx_port: Option<String>,
 
-    /// Serial port for the ImmersionRC power meter. Same rule as
-    /// --vtx-port: auto-connect only fires if BOTH are given.
+    /// Serial port for the power meter. Auto-connect only fires if this,
+    /// --vtx-port, AND --meter-kind are all given.
     #[arg(long)]
     meter_port: Option<String>,
+
+    /// Power meter model, e.g. immersionrc-v1. Determines the serial
+    /// protocol/baud used to talk to it -- required (alongside the two
+    /// ports) for auto-connect, since there's no correct way to open the
+    /// meter port without knowing this.
+    #[arg(long)]
+    meter_kind: Option<PowerMeterKind>,
 
     /// Minimum log level to record (error, warn, info, debug, trace)
     #[arg(long, default_value = "debug")]
@@ -51,12 +63,14 @@ fn main() -> eframe::Result<()> {
     if let Some(p) = &args.meter_port {
         initial_settings.meter_port = p.clone();
     }
+    let initial_meter_kind = args.meter_kind.unwrap_or_default();
 
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
+    state.lock().unwrap().meter_kind = initial_meter_kind;
     let vtx_table = Arc::new(Mutex::new(VtxTableConfig::default()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
 
-    let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some();
+    let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -69,6 +83,7 @@ fn main() -> eframe::Result<()> {
                 let _ = cmd_tx.send(worker::Command::Connect {
                     vtx_port: initial_settings.vtx_port.clone(),
                     meter_port: initial_settings.meter_port.clone(),
+                    meter_kind: initial_meter_kind,
                 });
             }
 
@@ -78,6 +93,7 @@ fn main() -> eframe::Result<()> {
                 cmd_tx.clone(),
                 logs,
                 initial_settings,
+                initial_meter_kind,
             )))
         }),
     )

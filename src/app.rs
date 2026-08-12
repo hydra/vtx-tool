@@ -20,6 +20,7 @@ use crate::logging;
 use crate::logging::SharedLogs;
 use crate::pages;
 use crate::pages::vtx_table::VtxTablePageState;
+use crate::power_meter::PowerMeterKind;
 use crate::settings::AppSettings;
 use crate::vtxtable::VtxTableConfig;
 use crate::worker::{Command, SharedState};
@@ -83,6 +84,7 @@ pub struct App {
 
     vtx_port_input: String,
     meter_port_input: String,
+    meter_kind: PowerMeterKind,
 }
 
 impl App {
@@ -92,6 +94,7 @@ impl App {
         cmd_tx: Sender<Command>,
         logs: &'static SharedLogs,
         initial_settings: AppSettings,
+        initial_meter_kind: PowerMeterKind,
     ) -> Self {
         Self {
             state,
@@ -102,6 +105,7 @@ impl App {
             vtx_table_page: VtxTablePageState::default(),
             vtx_port_input: initial_settings.vtx_port,
             meter_port_input: initial_settings.meter_port,
+            meter_kind: initial_meter_kind,
         }
     }
 
@@ -162,14 +166,35 @@ impl eframe::App for App {
 
                 let connected = self.state.lock().unwrap().connected;
 
+                ui.label("VTX");
                 ui.add_enabled(
                     !connected,
                     egui::TextEdit::singleline(&mut self.vtx_port_input).hint_text("VTX port"),
                 );
+
+                ui.label("Power Meter");
                 ui.add_enabled(
                     !connected,
                     egui::TextEdit::singleline(&mut self.meter_port_input).hint_text("Power meter port"),
                 );
+
+                ui.add_enabled_ui(!connected, |ui| {
+                    egui::ComboBox::from_id_salt("meter_kind")
+                        .selected_text(self.meter_kind.name())
+                        .show_ui(ui, |ui| {
+                            for &kind in PowerMeterKind::ALL {
+                                if ui
+                                    .selectable_value(&mut self.meter_kind, kind, kind.name())
+                                    .changed()
+                                {
+                                    // Reflected immediately (even before Connect) so the
+                                    // calibration page's update-rate dropdown can clamp
+                                    // to this kind's max_update_hz() right away.
+                                    self.state.lock().unwrap().meter_kind = kind;
+                                }
+                            }
+                        });
+                });
 
                 if connected {
                     if ui.button("Disconnect").clicked() {
@@ -184,6 +209,7 @@ impl eframe::App for App {
                     let _ = self.cmd_tx.send(Command::Connect {
                         vtx_port: self.vtx_port_input.clone(),
                         meter_port: self.meter_port_input.clone(),
+                        meter_kind: self.meter_kind,
                     });
                 }
             });
