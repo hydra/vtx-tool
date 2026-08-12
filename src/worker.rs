@@ -63,7 +63,19 @@ pub struct SharedState {
     /// debug/confirmation aid, unrelated to the passive auto-responder.
     pub vtx_config: Option<msp::VtxConfig>,
     pub connected: bool,
+    /// True if ANY frame (not just ones a specific command was waiting
+    /// for) has been seen from the VTX within the last VTX_READY_WINDOW.
+    /// Used by the sweep engine to detect a current-limited supply
+    /// power-cycling the VTX mid-sweep, and shown live in the resulting
+    /// "VTX not responding" dialog's status line.
+    pub vtx_ready: bool,
 }
+
+/// How recently the VTX must have said ANYTHING for vtx_ready to be
+/// true. The VTX's own firmware chatters (MSP_STATUS/MSP_RC) roughly
+/// every 100ms on its own, so this has real margin without being slow
+/// to notice a genuine loss.
+const VTX_READY_WINDOW: Duration = Duration::from_millis(500);
 
 impl Default for SharedState {
     fn default() -> Self {
@@ -77,6 +89,7 @@ impl Default for SharedState {
             pre_sweep_update_hz: None,
             vtx_config: None,
             connected: false,
+            vtx_ready: false,
         }
     }
 }
@@ -109,6 +122,11 @@ pub enum Command {
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
     /// state (see calibration::safe_state_payload).
     AbortSweep,
+    /// User clicked Continue on the "VTX not responding" dialog after
+    /// SharedState::vtx_ready came back true -- resumes the sweep,
+    /// setting a hard limit on the level that was active when it
+    /// happened (see calibration::SweepEngine::resume_after_recovery).
+    ResumeAfterVtxRecovery,
     /// Pushes the working pa_table's calibration[]/detector[] for every
     /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
     /// of SaveEeprom -- this only updates the VTX's RAM copy.
@@ -130,6 +148,7 @@ pub fn spawn(
         let mut vtx: Option<MspLink> = None;
         let mut meter: Option<PowerMeter> = None;
         let mut last_meter_read = Instant::now();
+        let mut vtx_last_seen: Option<Instant> = None;
 
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -155,8 +174,10 @@ pub fn spawn(
                                 None
                             }
                         };
+                        vtx_last_seen = None;
                         let mut s = state.lock().unwrap();
                         s.connected = vtx.is_some() && meter.is_some();
+                        s.vtx_ready = false;
                         s.meter_kind = meter_kind;
                         s.update_hz = s.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
                         s.power_history.clear();
@@ -167,9 +188,13 @@ pub fn spawn(
                     Command::Disconnect => {
                         vtx = None;
                         meter = None;
+                        vtx_last_seen = None;
                         debug!(target: "vtx", "disconnected");
                         debug!(target: "meter", "disconnected");
-                        state.lock().unwrap().connected = false;
+                        let mut s = state.lock().unwrap();
+                        s.connected = false;
+                        s.vtx_ready = false;
+                        drop(s);
                         *sweep.lock().unwrap() = None;
                     }
 
@@ -179,6 +204,9 @@ pub fn spawn(
                                 Ok(table) => {
                                     debug!(target: "vtx", "PA table refreshed: {} entries", table.len());
                                     state.lock().unwrap().pa_table = table;
+                                    if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                                        engine.clear_hard_limits();
+                                    }
                                 }
                                 Err(e) => error!(target: "vtx", "PA table read failed: {e}"),
                             }
@@ -285,6 +313,12 @@ pub fn spawn(
                         }
                     }
 
+                    Command::ResumeAfterVtxRecovery => {
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.resume_after_recovery();
+                        }
+                    }
+
                     Command::SendCalTableToVtx => {
                         if let Some(link) = vtx.as_mut() {
                             let pa_table = state.lock().unwrap().pa_table.clone();
@@ -320,10 +354,12 @@ pub fn spawn(
             // PACALIBRATION response listener. See module doc for why
             // this is consolidated into a single read rather than one
             // per consumer (the earlier version's frame-stealing race
-            // between separate reads).
+            // between separate reads). ANY frame received here also
+            // counts as a heartbeat -- see vtx_last_seen/vtx_ready.
             let mut pa_calibration_reading: Option<msp::PaCalibrationReading> = None;
             if let Some(link) = vtx.as_mut() {
                 if let Ok(Some(frame)) = link.read_frame(Duration::from_millis(20)) {
+                    vtx_last_seen = Some(Instant::now());
                     if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
                         let response = vtx_table.lock().unwrap().encode_vtx_config_response();
                         match link.send_v1(function::VTX_CONFIG as u8, &response) {
@@ -338,6 +374,10 @@ pub fn spawn(
                     }
                 }
             }
+            let vtx_ready = vtx_last_seen.map(|t| t.elapsed() < VTX_READY_WINDOW).unwrap_or(false);
+            if vtx.is_some() {
+                state.lock().unwrap().vtx_ready = vtx_ready;
+            }
 
             // Advance the sweep by one step, if active.
             if let Some(link) = vtx.as_mut() {
@@ -347,7 +387,7 @@ pub fn spawn(
                 };
                 let mut sweep_guard = sweep.lock().unwrap();
                 if let Some(engine) = sweep_guard.as_mut() {
-                    if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading) {
+                    if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready) {
                         error!(target: "vtx", "sweep step failed: {e}");
                     }
                     if let Some(result) = engine.pending_result.take() {
@@ -373,7 +413,7 @@ pub fn spawn(
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
                             s.update_hz = prev;
                         }
-                        debug!(target: "vtx", "sweep finished");
+                        //debug!(target: "vtx", "sweep finished");
                     }
                     ctx.request_repaint();
                 }

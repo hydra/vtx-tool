@@ -162,6 +162,49 @@ pub fn show(
             });
     }
 
+    // ---- VTX-unresponsive gate (current-limited supply power-cycled it) --
+    let unresponsive = {
+        let g = sweep.lock().unwrap();
+        g.as_ref().and_then(|e| match e.state {
+            calibration::EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } => {
+                Some((level, freq_mhz, mv_at_loss))
+            }
+            _ => None,
+        })
+    };
+    if let Some((level, freq_mhz, mv_at_loss)) = unresponsive {
+        let vtx_ready = shared.lock().unwrap().vtx_ready;
+        egui::Window::new("VTX not responding")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "No response from the VTX while calibrating level {level} at {freq_mhz}MHz (mv={mv_at_loss}). \
+                     If it's on a current-limited supply, it may have powered off."
+                ));
+                ui.label("Please power the VTX back on.");
+                ui.horizontal(|ui| {
+                    ui.label("Connection status:");
+                    if vtx_ready {
+                        ui.colored_label(egui::Color32::GREEN, "Ready");
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Disconnected");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(vtx_ready, |ui| {
+                        if ui.button("Continue").clicked() {
+                            let _ = cmd_tx.send(Command::ResumeAfterVtxRecovery);
+                        }
+                    });
+                    if ui.button("Abort").clicked() {
+                        let _ = cmd_tx.send(Command::AbortSweep);
+                    }
+                });
+            });
+    }
+
     // ---- Table -----------------------------------------------------------
     let pa_table = shared.lock().unwrap().pa_table.clone();
     egui::Grid::new("pa_table").striped(true).show(ui, |ui| {
@@ -172,6 +215,7 @@ pub fn show(
         ui.strong("detector[] (mV)");
         ui.strong("Boost");
         ui.strong("RTC6705");
+        ui.strong("Limit (mV)");
         ui.strong("Status");
         ui.end_row();
 
@@ -185,10 +229,13 @@ pub fn show(
             ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
             ui.label(entry.rtc6705_level.to_string());
 
-            let status = {
+            let (status, limit) = {
                 let g = sweep.lock().unwrap();
-                g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned())
+                let status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
+                let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
+                (status, limit)
             };
+            ui.label(limit.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
             ui.label(status_text(status.as_ref()));
             ui.end_row();
         }
