@@ -128,7 +128,7 @@ impl eframe::App for App {
         egui::Panel::bottom("logs_panel")
             .resizable(true)
             .default_size(220.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let half_width = (ui.available_width() - 8.0) / 2.0;
 
@@ -148,7 +148,7 @@ impl eframe::App for App {
         egui::Panel::left("nav_panel")
             .resizable(false)
             .default_size(180.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.heading("Pages");
                 ui.separator();
                 if ui.button("Home").clicked() {
@@ -215,7 +215,7 @@ impl eframe::App for App {
             });
 
         // Center: whichever pages are open, as dock tabs.
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let mut viewer = TabViewer {
                 shared: &self.state,
                 vtx_table: &self.vtx_table,

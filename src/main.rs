@@ -43,7 +43,13 @@ struct Args {
     /// protocol/baud used to talk to it -- required (alongside the two
     /// ports) for auto-connect, since there's no correct way to open the
     /// meter port without knowing this.
-    #[arg(long)]
+    ///
+    /// Parsed via power_meter::parse_cli, a plain function, rather than
+    /// clap's ValueEnum -- see power_meter.rs's PowerMeterKind::cli_name()
+    /// doc comment for why. The field type is still the real
+    /// PowerMeterKind enum either way, just not going through
+    /// #[arg(value_enum)]'s trait-based codegen path.
+    #[arg(long, value_parser = power_meter::parse_cli)]
     meter_kind: Option<PowerMeterKind>,
 
     /// Minimum log level to record (error, warn, info, debug, trace)

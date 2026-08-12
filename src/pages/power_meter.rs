@@ -13,31 +13,31 @@ pub enum PowerMeterKind {
     ImmersionRcV1,
 }
 
+// Implemented by hand rather than #[derive(clap::ValueEnum)] -- the
+// derive was failing to satisfy ValueEnum's own trait bounds in a real
+// build (clap_builder-4.6.6), for reasons not pinned down from the error
+// alone. Only two small methods for one variant right now, so hand-
+// written sidesteps needing to diagnose a macro/version interaction
+// blind; revisit the derive if this gets unwieldy once more meter kinds
+// exist.
+impl clap::ValueEnum for PowerMeterKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[PowerMeterKind::ImmersionRcV1]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            PowerMeterKind::ImmersionRcV1 => clap::builder::PossibleValue::new("immersionrc-v1"),
+        })
+    }
+}
+
 impl PowerMeterKind {
     pub const ALL: &'static [PowerMeterKind] = &[PowerMeterKind::ImmersionRcV1];
 
     pub fn name(self) -> &'static str {
         match self {
             PowerMeterKind::ImmersionRcV1 => "ImmersionRC V1",
-        }
-    }
-
-    /// The string used on the command line (--meter-kind immersionrc-v1).
-    /// Kept in sync with parse_cli() below by hand (one match arm each);
-    /// with only one variant right now that's simpler than any macro
-    /// trickery, and avoids depending on clap's ValueEnum/value_parser!
-    /// inference, which two separate attempts (derived, then hand-
-    /// implemented ValueEnum) both failed to get past -- same identical
-    /// "trait bounds not satisfied" error either way, which points at a
-    /// dependency-graph issue (most likely two incompatible copies of
-    /// clap/clap_builder resolved -- the same class of problem this
-    /// session already hit once with egui/egui_dock) rather than
-    /// anything wrong with the impl itself. `cargo tree -i clap_builder`
-    /// would confirm/fix that, but it's no longer blocking anything --
-    /// see parse_cli() below, which sidesteps the whole trait chain.
-    pub fn cli_name(self) -> &'static str {
-        match self {
-            PowerMeterKind::ImmersionRcV1 => "immersionrc-v1",
         }
     }
 
@@ -63,25 +63,6 @@ impl Default for PowerMeterKind {
     fn default() -> Self {
         PowerMeterKind::ImmersionRcV1
     }
-}
-
-/// clap value_parser function for --meter-kind (wired in via
-/// `#[arg(long, value_parser = power_meter::parse_cli)]` in main.rs).
-/// The Args field stays a real `PowerMeterKind`, not a String -- clap
-/// calls this function with the raw argument text and uses whatever it
-/// returns (or reports the Err string back to the user as a normal
-/// clap parse error), no ValueEnum/trait-inference machinery involved
-/// at all. This is the standard, well-supported clap mechanism for a
-/// custom type that isn't going through #[derive(ValueEnum)].
-pub fn parse_cli(s: &str) -> Result<PowerMeterKind, String> {
-    PowerMeterKind::ALL
-        .iter()
-        .copied()
-        .find(|k| k.cli_name().eq_ignore_ascii_case(s))
-        .ok_or_else(|| {
-            let choices: Vec<&str> = PowerMeterKind::ALL.iter().map(|k| k.cli_name()).collect();
-            format!("unknown power meter kind '{s}' (expected one of: {})", choices.join(", "))
-        })
 }
 
 pub struct PowerMeter {
