@@ -47,14 +47,12 @@ impl PowerMeterKind {
         }
     }
 
-    /// UNVERIFIED against real hardware timing -- a conservative
-    /// placeholder based on the protocol just being a simple ASCII
-    /// "D\r\n" -> text reply exchange, not a documented rate spec from
-    /// ImmersionRC. Tighten this once you've bench-tested how fast the
-    /// meter can actually respond reliably without falling behind.
+    /// Bench-confirmed: faster than this produces errors in practice on
+    /// real hardware (not a placeholder guess anymore, unlike when this
+    /// was first written at 20Hz).
     pub fn max_update_hz(self) -> u32 {
         match self {
-            PowerMeterKind::ImmersionRcV1 => 20,
+            PowerMeterKind::ImmersionRcV1 => 5,
         }
     }
 }

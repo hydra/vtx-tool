@@ -7,9 +7,21 @@ use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-/// Candidate update rates -- filtered down to whatever's <= the
-/// connected meter's max_update_hz() each frame (see show()).
-const CANDIDATE_HZ: &[u32] = &[20, 10, 5];
+/// Candidate update rates, always shown -- entries exceeding the
+/// connected meter's max_update_hz() are disabled (not hidden), so the
+/// available range is visible even before a rate becomes selectable.
+/// Hardcoded (hz, label) pairs rather than a formatting function: with
+/// only five fixed values, direct control over exact wording ("1 second"
+/// singular vs "2 seconds" plural, "ms" vs "second(s)") is simpler and
+/// less error-prone than generic period-formatting logic for such a
+/// small, fixed set.
+const CANDIDATE_HZ: &[(f64, &str)] = &[
+    (20.0, "20 Hz (50ms)"),
+    (10.0, "10 Hz (100ms)"),
+    (5.0, "5 Hz (200ms)"),
+    (1.0, "1 Hz (1 second)"),
+    (0.5, "0.5 Hz (2 seconds)"),
+];
 
 /// Formats a power reading with unit scaling (uW/mW/W) rather than a
 /// fixed "X.XXX mW" -- at typical calibration-sweep low-power readings
@@ -63,12 +75,19 @@ pub fn show(ui: &mut egui::Ui, shared: &Arc<Mutex<SharedState>>, cmd_tx: &Sender
     ui.horizontal(|ui| {
         ui.label("Update frequency:");
         let mut hz = shared.lock().unwrap().update_hz;
-        let max_hz = shared.lock().unwrap().meter_kind.max_update_hz();
+        let max_hz = shared.lock().unwrap().meter_kind.max_update_hz() as f64;
+        let selected_label = CANDIDATE_HZ
+            .iter()
+            .find(|&&(h, _)| h == hz)
+            .map(|&(_, label)| label.to_string())
+            .unwrap_or_else(|| format!("{hz} Hz"));
         egui::ComboBox::from_id_salt("update_hz")
-            .selected_text(format!("{hz} Hz"))
+            .selected_text(selected_label)
             .show_ui(ui, |ui| {
-                for &candidate in CANDIDATE_HZ.iter().filter(|&&h| h <= max_hz) {
-                    ui.selectable_value(&mut hz, candidate, format!("{candidate} Hz"));
+                for &(candidate, label) in CANDIDATE_HZ {
+                    ui.add_enabled_ui(candidate <= max_hz, |ui| {
+                        ui.selectable_value(&mut hz, candidate, label);
+                    });
                 }
             });
         shared.lock().unwrap().update_hz = hz;
