@@ -125,6 +125,7 @@ struct ScanPaState {
     mv: i32,
     wait: Option<SampleWait>,
     coarse_steps_taken: u32, // how many 50mV coarse-ramp steps so far -- drives sub_progress()
+    pinned_count: u32, // consecutive steps clamped at a bound without progress -- see PINNED_LIMIT
 }
 
 enum ScanDetectorPhase {
@@ -138,6 +139,7 @@ struct ScanDetectorState {
     wait: Option<SampleWait>,
     below: Option<(f32, u16)>, // (power_mw, detector_mv)
     above: Option<(f32, u16)>,
+    pinned_count: u32, // consecutive steps clamped at a bound without progress -- see PINNED_LIMIT
 }
 
 enum StepState {
@@ -233,6 +235,14 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 /// the new hard limit for that level. Increased alongside the shorter
 /// HEARTBEAT_TIMEOUT above, as a second, independent margin of safety.
 const HEARTBEAT_BACKOFF_MV: i32 = 50;
+/// How many consecutive steps can get clamped at a bound (DAC range or
+/// a hard limit) without the reading ever reaching the target/tolerance
+/// band before giving up on that (level, freq) as unreachable. Without
+/// this, a target that's genuinely unreachable within a hard limit
+/// (confirmed by a real run: ScanDetector pinned at a limit for many
+/// minutes, since the target was never getting anywhere close) spins
+/// forever with no exit condition.
+const PINNED_LIMIT: u32 = 5;
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
 
@@ -413,6 +423,7 @@ impl SweepEngine {
                 mv: COARSE_RAMP_START_MV,
                 wait: None,
                 coarse_steps_taken: 0,
+                pinned_count: 0,
             }));
             debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from mv={COARSE_RAMP_START_MV}");
             self.per_level_status.insert(
@@ -479,9 +490,18 @@ impl SweepEngine {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: backoff crossed below target at mv={}, entering fine creep", st.mv);
                             st.phase = ScanPaPhase::Fine;
                             st.wait = None;
+                            st.pinned_count = 0;
                         } else {
-                            st.mv = (st.mv - up * 5).clamp(bound_lo, bound_hi);
+                            let desired = st.mv - up * 5;
+                            let clamped = desired.clamp(bound_lo, bound_hi);
+                            st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                            st.mv = clamped;
                             st.wait = None;
+                            if st.pinned_count >= PINNED_LIMIT {
+                                debug!(target: "vtx", "[sweep] ScanPa level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
+                                self.finish_scan_pa(level, st.mv);
+                                return Ok(());
+                            }
                         }
                     }
                     ScanPaPhase::Fine => {
@@ -549,27 +569,53 @@ impl SweepEngine {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at mv={}, entering bracket search", st.mv);
                             st.phase = ScanDetectorPhase::Bracket;
                             st.wait = None;
+                            st.pinned_count = 0;
                         } else {
-                            st.mv = (st.mv - up).clamp(bound_lo, bound_hi);
+                            let desired = st.mv - up;
+                            let clamped = desired.clamp(bound_lo, bound_hi);
+                            st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                            st.mv = clamped;
                             st.wait = None;
+                            if st.pinned_count >= PINNED_LIMIT {
+                                debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
+                                self.finish_scan_detector(level, detector_now);
+                                return Ok(());
+                            }
                         }
                     }
                     ScanDetectorPhase::Bracket => {
                         let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
-                        if avg_mw < target_mw - dev {
-                            st.mv = (st.mv + up * 2).clamp(bound_lo, bound_hi);
+                        let desired = if avg_mw < target_mw - dev {
+                            st.mv + up * 2
                         } else if avg_mw > target_mw + dev {
-                            st.mv = (st.mv - up * 2).clamp(bound_lo, bound_hi);
+                            st.mv - up * 2
                         } else if avg_mw < target_mw {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.below = Some((avg_mw, detector_now));
-                            st.mv = (st.mv + up).clamp(bound_lo, bound_hi);
+                            st.mv + up
                         } else {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.above = Some((avg_mw, detector_now));
-                            st.mv = (st.mv - up).clamp(bound_lo, bound_hi);
-                        }
+                            st.mv - up
+                        };
+                        let clamped = desired.clamp(bound_lo, bound_hi);
+                        // The critical case this closes: with a hard limit active,
+                        // the target can be genuinely unreachable within the safe
+                        // range (confirmed by a real run: this got clamped at the
+                        // same bound for the whole rest of the scan, since the
+                        // reading was nowhere near target and never could be).
+                        // Without counting consecutive clamps, that has no exit
+                        // condition and spins forever.
+                        st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                        st.mv = clamped;
                         st.wait = None;
+
+                        if st.pinned_count >= PINNED_LIMIT {
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={detector_now} as a rough (not interpolated) fallback",
+                                st.pinned_count);
+                            self.finish_scan_detector(level, detector_now);
+                            return Ok(());
+                        }
 
                         if let (Some(below), Some(above)) = (st.below, st.above) {
                             let detector = interpolate(target_mw, below, above);
@@ -712,12 +758,26 @@ impl SweepEngine {
             detector_mv: None,
         });
         // ScanDetector runs immediately after ScanPa for the same (level, freq).
+        // Starting point is a small step toward LESS power from the just-found
+        // calibration value (matches the original script's intent: start
+        // slightly on the safe side before searching for where the reading
+        // crosses target). BUG FIXED here: the original script (and this
+        // file's first version) used a hardcoded "mv - 5", which only means
+        // "less power" under normal polarity -- on an inverted board (like
+        // our confirmed RTC76401) that's actually 5mV toward MORE power. A
+        // real run showed this seeding ScanDetector 5mV past a hard limit
+        // that had just been set. Now direction-aware via power_up_step(),
+        // and clamped to the current bounds regardless.
+        let up = power_up_step(self.sign_inverted);
+        let (bound_lo, bound_hi) = self.effective_bounds(level);
+        let detector_start_mv = (mv - up * 5).clamp(bound_lo, bound_hi);
         self.step = Some(StepState::Detector(ScanDetectorState {
             phase: ScanDetectorPhase::Backoff,
-            mv: (mv - 5).max(0),
+            mv: detector_start_mv,
             wait: None,
             below: None,
             above: None,
+            pinned_count: 0,
         }));
     }
 
