@@ -194,12 +194,17 @@ pub fn show(
         }
     });
 
-    // ---- Progress bar ------------------------------------------------
+    // ---- Progress bars -------------------------------------------------
     {
         let g = sweep.lock().unwrap();
         if let Some(engine) = g.as_ref() {
             if engine.is_active() || engine.completed_steps > 0 {
-                ui.add(egui::ProgressBar::new(engine.progress()).show_percentage());
+                ui.add(egui::ProgressBar::new(engine.progress()).text("Overall").show_percentage());
+
+                let (sub, label) = engine.sub_progress();
+                if !label.is_empty() {
+                    ui.add(egui::ProgressBar::new(sub).text(label));
+                }
             }
         }
     }

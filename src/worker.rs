@@ -38,6 +38,14 @@ pub struct SharedState {
     /// HISTORY_WINDOW_SECS. elapsed-seconds rather than wall-clock time
     /// so the plot's x-axis is a simple, always-increasing float.
     pub power_history: VecDeque<(f64, f32)>,
+    /// Total power readings ever taken, monotonically increasing --
+    /// unlike power_history.len() (which is capped by the rolling
+    /// HISTORY_WINDOW_SECS window and stops growing once it fills, since
+    /// every push evicts an old entry), this never plateaus. The sweep
+    /// engine's "wait for K new readings" tracking uses this instead of
+    /// power_history.len() for exactly that reason -- using len() was a
+    /// real bug (see calibration.rs's SampleWait doc comment).
+    pub reading_seq: u64,
     /// Selected power meter kind -- set immediately when the user picks
     /// it in the left panel's dropdown (even before connecting), so the
     /// calibration page's update-rate dropdown can clamp its options to
@@ -63,6 +71,7 @@ impl Default for SharedState {
             pa_table: Vec::new(),
             last_dbm: None,
             power_history: VecDeque::new(),
+            reading_seq: 0,
             meter_kind: PowerMeterKind::default(),
             update_hz: 1.0, // conservative default; ImmersionRC V1's own max is now 5Hz, so this leaves headroom below it and stays valid for any future slower-max meter too
             pre_sweep_update_hz: None,
@@ -332,10 +341,13 @@ pub fn spawn(
 
             // Advance the sweep by one step, if active.
             if let Some(link) = vtx.as_mut() {
-                let history_snapshot = state.lock().unwrap().power_history.clone();
+                let (history_snapshot, reading_seq) = {
+                    let s = state.lock().unwrap();
+                    (s.power_history.clone(), s.reading_seq)
+                };
                 let mut sweep_guard = sweep.lock().unwrap();
                 if let Some(engine) = sweep_guard.as_mut() {
-                    if let Err(e) = engine.poll(link, &history_snapshot, pa_calibration_reading) {
+                    if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading) {
                         error!(target: "vtx", "sweep step failed: {e}");
                     }
                     if let Some(result) = engine.pending_result.take() {
@@ -387,6 +399,7 @@ pub fn spawn(
                             let mut s = state.lock().unwrap();
                             s.last_dbm = Some(dbm);
                             s.power_history.push_back((elapsed, mw));
+                            s.reading_seq += 1;
                             while let Some(&(t, _)) = s.power_history.front() {
                                 if elapsed - t > HISTORY_WINDOW_SECS {
                                     s.power_history.pop_front();
