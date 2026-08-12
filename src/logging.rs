@@ -3,6 +3,15 @@
 //! calls to route them into the corresponding port's panel; anything
 //! else goes to a general bucket.
 //!
+//! ALSO forwards every record to a wrapped `env_logger::Logger`, so
+//! everything additionally prints to the console gated by the RUST_LOG
+//! environment variable, independent of the UI panels' own threshold.
+//! Both live in the one logger installed via `log::set_logger()` --
+//! that can only happen once process-wide, so this can't just run
+//! `env_logger::init()` next to a separate custom logger; env_logger's
+//! `Logger` type is used directly (built, not `.init()`-installed) and
+//! delegated to from here instead.
+//!
 //! Usage: call `logging::init()` once at startup (before spawning the
 //! worker thread), then use `log::error!(target: "vtx", "...")` /
 //! `log::debug!(target: "meter", "...")` etc. throughout.
@@ -56,41 +65,74 @@ impl SharedLogs {
 
 struct BufferLogger {
     logs: &'static SharedLogs,
+    /// Threshold for the UI panels specifically (from --log-level),
+    /// independent of env_logger's own RUST_LOG-driven threshold below.
+    ui_max_level: LevelFilter,
+    /// Not installed globally itself (that's `set_logger()` below, once,
+    /// on this outer BufferLogger) -- just built and delegated to, so it
+    /// applies its own RUST_LOG filtering and console formatting/writing
+    /// exactly as it would standalone.
+    console: env_logger::Logger,
 }
 
 impl Log for BufferLogger {
     fn enabled(&self, _metadata: &Metadata) -> bool {
+        // Permissive here -- see log() below, where the UI-panel and
+        // console sinks are gated independently against their own
+        // (different) thresholds.
         true
     }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
+        // Console, gated by RUST_LOG via the wrapped env_logger::Logger.
+        // `Log::log()`'s contract expects the caller to check `enabled()`
+        // first (env_logger doesn't re-check internally), so that's done
+        // explicitly here rather than assumed.
+        if self.console.enabled(record.metadata()) {
+            self.console.log(record);
         }
-        let entry = LogEntry {
-            level: record.level(),
-            text: format!("{}", record.args()),
-            at: Instant::now(),
-        };
-        let bucket = match record.target() {
-            "vtx" => &self.logs.vtx,
-            "meter" => &self.logs.meter,
-            _ => &self.logs.general,
-        };
-        bucket.lock().unwrap().push(entry);
+
+        // UI panel buffers, gated by ui_max_level (--log-level).
+        if record.level() <= self.ui_max_level {
+            let entry = LogEntry {
+                level: record.level(),
+                text: format!("{}", record.args()),
+                at: Instant::now(),
+            };
+            let bucket = match record.target() {
+                "vtx" => &self.logs.vtx,
+                "meter" => &self.logs.meter,
+                _ => &self.logs.general,
+            };
+            bucket.lock().unwrap().push(entry);
+        }
     }
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        self.console.flush();
+    }
 }
 
 /// Installs the global logger and returns a handle to the shared log
 /// buffers for the UI to read from. Call once, before spawning any
-/// threads that log.
-pub fn init(max_level: LevelFilter) -> &'static SharedLogs {
+/// threads that log. `ui_max_level` controls the UI panels only --
+/// console output is controlled independently by the RUST_LOG
+/// environment variable (standard env_logger behavior: nothing prints
+/// if RUST_LOG isn't set at all).
+pub fn init(ui_max_level: LevelFilter) -> &'static SharedLogs {
     let logs: &'static SharedLogs = Box::leak(Box::new(SharedLogs::new()));
-    let logger: &'static BufferLogger = Box::leak(Box::new(BufferLogger { logs }));
+    let console = env_logger::Builder::from_env(env_logger::Env::default()).build();
+    let logger: &'static BufferLogger = Box::leak(Box::new(BufferLogger {
+        logs,
+        ui_max_level,
+        console,
+    }));
     log::set_logger(logger).expect("logger already initialized");
-    log::set_max_level(max_level);
+    // Trace globally -- deliberately permissive so records reach both
+    // sinks above, which each apply their own (different) threshold
+    // rather than one shared cutoff filtering records before either
+    // sink sees them.
+    log::set_max_level(LevelFilter::Trace);
     logs
 }
 
