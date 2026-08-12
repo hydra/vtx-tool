@@ -27,6 +27,7 @@
 
 use crate::msp::{self, function, MspLink};
 use crate::vtxtable::VtxTableConfig;
+use log::debug;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -68,26 +69,38 @@ pub enum LevelStatus {
     Aborted,
 }
 
-/// Tracks "wait for `needed` new power_history samples since this was
-/// created", then hands back their average.
+/// Tracks "wait for `needed` new power readings since this was created".
+///
+/// BUG FIX: this used to compare `power_history.len()` before/after --
+/// which works only until the rolling HISTORY_WINDOW_SECS window fills
+/// up. Once it's full, every push evicts an old entry, so len() stops
+/// growing and just hovers at a roughly constant size -- `ready()` would
+/// then never return true again, which is exactly what produced the
+/// "stuck at mv=950" symptom (the sweep was genuinely waiting forever
+/// for a length increase that could never happen once the plot had been
+/// running past the 60s window). Now tracked against SharedState's
+/// reading_seq instead -- a plain counter incremented on every reading,
+/// which never plateaus.
 struct SampleWait {
-    start_len: usize,
+    start_seq: u64,
     needed: usize,
     skip_first: usize, // for the bracket phase: skip this many, average the rest
 }
 
 impl SampleWait {
-    fn new(current_len: usize, needed: usize, skip_first: usize) -> Self {
-        Self { start_len: current_len, needed, skip_first }
+    fn new(current_seq: u64, needed: usize, skip_first: usize) -> Self {
+        Self { start_seq: current_seq, needed, skip_first }
     }
 
-    fn ready(&self, current_len: usize) -> bool {
-        current_len >= self.start_len + self.needed
+    fn ready(&self, current_seq: u64) -> bool {
+        current_seq >= self.start_seq + self.needed as u64
     }
 
-    /// Average of the `needed - skip_first` newest samples collected
-    /// since this wait started (the oldest `skip_first` of the window
-    /// are discarded as settling time).
+    /// Average of the `needed - skip_first` newest samples in `history`
+    /// (the oldest `skip_first` of the window are discarded as settling
+    /// time). Still correct against the rolling window -- taking the N
+    /// most recent entries by recency was never the broken part, only
+    /// the "how many new ones arrived" tracking above was.
     fn average(&self, history: &VecDeque<(f64, f32)>) -> f32 {
         let take = self.needed - self.skip_first;
         let sum: f32 = history.iter().rev().take(take).map(|&(_, mw)| mw).sum();
@@ -208,12 +221,15 @@ impl SweepEngine {
     /// starts in AwaitingFreqConfirm rather than Running.
     pub fn start(&mut self, requires_manual_frequency: bool) {
         if self.levels.is_empty() || self.frequencies.is_empty() {
+            debug!(target: "vtx", "[sweep] start() called with no levels/frequencies -- not starting");
             self.state = EngineState::Idle;
             return;
         }
         self.freq_idx = 0;
         self.level_idx = 0;
         self.step = None;
+        debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, manual_freq={requires_manual_frequency}",
+            self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz);
         if requires_manual_frequency {
             self.state = EngineState::AwaitingFreqConfirm { freq_mhz: self.frequencies[0] };
         } else {
@@ -224,6 +240,7 @@ impl SweepEngine {
     /// UI calls this after the user confirms they've retuned the meter.
     pub fn confirm_frequency(&mut self) {
         if matches!(self.state, EngineState::AwaitingFreqConfirm { .. }) {
+            debug!(target: "vtx", "[sweep] frequency confirmed, resuming");
             self.state = EngineState::Running;
         }
     }
@@ -232,6 +249,8 @@ impl SweepEngine {
     /// have already sent a pitmode-forced VTX_CONFIG; this just marks
     /// remaining levels as Aborted and stops the engine.
     pub fn abort(&mut self) {
+        debug!(target: "vtx", "[sweep] aborted at level={:?} freq_idx={} ({}/{} steps completed)",
+            self.levels.get(self.level_idx), self.freq_idx, self.completed_steps, self.total_steps);
         for status in self.per_level_status.values_mut() {
             if !matches!(status, LevelStatus::Done) {
                 *status = LevelStatus::Aborted;
@@ -247,13 +266,18 @@ impl SweepEngine {
 
     /// Advances the sweep by whatever's possible this tick. `link` is
     /// used to send SET_PACALIBRATION; `history` is the live power
-    /// reading buffer; `latest_reading` is the most recent decoded
-    /// MSP_PACALIBRATION response, if one arrived this tick (worker.rs
-    /// is responsible for routing that frame here).
+    /// reading buffer (for averaging); `reading_seq` is
+    /// SharedState::reading_seq, a monotonic counter used for "has a new
+    /// reading arrived" instead of history.len() (see SampleWait's doc
+    /// comment for why that distinction matters); `latest_reading` is
+    /// the most recent decoded MSP_PACALIBRATION response, if one
+    /// arrived this tick (worker.rs is responsible for routing that
+    /// frame here).
     pub fn poll(
         &mut self,
         link: &mut MspLink,
         history: &VecDeque<(f64, f32)>,
+        reading_seq: u64,
         latest_reading: Option<msp::PaCalibrationReading>,
     ) -> anyhow::Result<()> {
         if !matches!(self.state, EngineState::Running) {
@@ -267,8 +291,11 @@ impl SweepEngine {
             self.step = None;
             if self.freq_idx >= self.frequencies.len() {
                 self.state = EngineState::Idle; // whole sweep done
+                debug!(target: "vtx", "[sweep] all frequencies complete");
                 return Ok(());
             }
+            debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {}MHz",
+                self.freq_idx, self.frequencies.len(), self.frequencies[self.freq_idx]);
             self.state = EngineState::AwaitingFreqConfirm { freq_mhz: self.frequencies[self.freq_idx] };
             return Ok(());
         }
@@ -285,13 +312,14 @@ impl SweepEngine {
                 mv: start_mv,
                 wait: None,
             }));
+            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from mv={start_mv}");
             self.per_level_status.insert(
                 level,
                 LevelStatus::InProgress(format!("{} / coarse ramp @ {freq_mhz}MHz", SweepOp::ScanPa.label())),
             );
         }
 
-        let now_len = history.len();
+        let now_seq = reading_seq;
         let throttled = self.last_send.elapsed() < SEND_INTERVAL;
 
         match self.step.take().unwrap() {
@@ -304,14 +332,14 @@ impl SweepEngine {
                             ScanPaPhase::Fine | ScanPaPhase::CoarseRamp => (4, 0),
                             ScanPaPhase::Backoff => (1, 0),
                         };
-                        st.wait = Some(SampleWait::new(now_len, needed, skip));
+                        st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
                     self.step = Some(StepState::Pa(st));
                     return Ok(());
                 }
 
                 let wait = st.wait.as_ref().unwrap();
-                if !wait.ready(now_len) {
+                if !wait.ready(now_seq) {
                     if !throttled {
                         self.send_calibration(link, level, st.mv)?;
                         self.last_send = Instant::now();
@@ -322,14 +350,17 @@ impl SweepEngine {
 
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
+                debug!(target: "vtx", "[sweep] ScanPa level={level} freq={freq_mhz}MHz mv={} avg={avg_mw:.4}mW target={target_mw}mW", st.mv);
 
                 match st.phase {
                     ScanPaPhase::CoarseRamp => {
                         if avg_mw >= target_mw * 0.80 {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp reached 80% ({avg_mw:.4}mW >= {:.4}mW) at mv={}, entering backoff", target_mw * 0.80, st.mv);
                             st.phase = ScanPaPhase::Backoff;
                             st.wait = None;
                         } else if !(0..=3300).contains(&(st.mv + up * 50)) {
                             // Ran off the end of the DAC range without reaching 80% -- bail this (level, freq) as best-effort.
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit DAC bound at mv={} without reaching 80% target -- bailing this (level,freq) as best-effort", st.mv);
                             self.finish_scan_pa(level, st.mv);
                             return Ok(());
                         } else {
@@ -339,6 +370,7 @@ impl SweepEngine {
                     }
                     ScanPaPhase::Backoff => {
                         if avg_mw < target_mw {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: backoff crossed below target at mv={}, entering fine creep", st.mv);
                             st.phase = ScanPaPhase::Fine;
                             st.wait = None;
                         } else {
@@ -348,6 +380,7 @@ impl SweepEngine {
                     }
                     ScanPaPhase::Fine => {
                         if avg_mw >= target_mw || !(0..=3300).contains(&(st.mv + up)) {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at mv={} ({avg_mw:.4}mW)", st.mv);
                             self.finish_scan_pa(level, st.mv);
                             return Ok(());
                         } else {
@@ -382,14 +415,14 @@ impl SweepEngine {
                             ScanDetectorPhase::Backoff => (1, 0),
                             ScanDetectorPhase::Bracket => (20, 10),
                         };
-                        st.wait = Some(SampleWait::new(now_len, needed, skip));
+                        st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
                     self.step = Some(StepState::Detector(st));
                     return Ok(());
                 }
 
                 let wait = st.wait.as_ref().unwrap();
-                if !wait.ready(now_len) {
+                if !wait.ready(now_seq) {
                     if !throttled {
                         self.send_calibration(link, level, st.mv)?;
                         self.last_send = Instant::now();
@@ -401,10 +434,12 @@ impl SweepEngine {
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
                 let detector_now = latest_reading.map(|r| r.detector_mv).unwrap_or(0);
+                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={detector_now}", st.mv);
 
                 match st.phase {
                     ScanDetectorPhase::Backoff => {
                         if avg_mw < target_mw {
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at mv={}, entering bracket search", st.mv);
                             st.phase = ScanDetectorPhase::Bracket;
                             st.wait = None;
                         } else {
@@ -419,9 +454,11 @@ impl SweepEngine {
                         } else if avg_mw > target_mw + dev {
                             st.mv -= up * 2;
                         } else if avg_mw < target_mw {
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.below = Some((avg_mw, detector_now));
                             st.mv += up;
                         } else {
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured mv={} avg={avg_mw:.4}mW detector={detector_now}", st.mv);
                             st.above = Some((avg_mw, detector_now));
                             st.mv -= up;
                         }
@@ -429,6 +466,7 @@ impl SweepEngine {
 
                         if let (Some(below), Some(above)) = (st.below, st.above) {
                             let detector = interpolate(target_mw, below, above);
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
                             self.finish_scan_detector(level, detector);
                             return Ok(());
                         }
@@ -452,6 +490,34 @@ impl SweepEngine {
         }
 
         Ok(())
+    }
+
+    /// Progress within the CURRENT (level, freq, op) step only -- coarse,
+    /// phase-block-based (not fine-grained, since these are open-ended
+    /// searches with no fixed step count to measure against). Returns
+    /// (0.0, "") when nothing is in progress.
+    pub fn sub_progress(&self) -> (f32, &'static str) {
+        match &self.step {
+            None => (0.0, ""),
+            Some(StepState::Pa(st)) => match st.phase {
+                ScanPaPhase::CoarseRamp => (0.15, "ScanPa: coarse ramp"),
+                ScanPaPhase::Backoff => (0.55, "ScanPa: backoff"),
+                ScanPaPhase::Fine => (0.85, "ScanPa: fine creep"),
+            },
+            Some(StepState::Detector(st)) => match st.phase {
+                ScanDetectorPhase::Backoff => (0.20, "ScanDetector: backoff"),
+                ScanDetectorPhase::Bracket => {
+                    // A little extra resolution within Bracket: having
+                    // captured one of the two brackets already is
+                    // meaningfully further along than having neither.
+                    let extra = match (st.below.is_some(), st.above.is_some()) {
+                        (false, false) => 0.0,
+                        _ => 0.35,
+                    };
+                    (0.45 + extra, "ScanDetector: bracket search")
+                }
+            },
+        }
     }
 
     fn send_calibration(&self, link: &mut MspLink, level: u8, mv: i32) -> anyhow::Result<()> {
