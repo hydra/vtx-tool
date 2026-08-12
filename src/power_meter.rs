@@ -6,55 +6,64 @@
 //! ("F<n>\r\n") and async push updates. Nothing here assumes the V1
 //! meter supports frequency setting; if you need it, confirm the V1's
 //! command set first rather than assuming parity with V2.
+//!
+//! Reads a full line via a BufReader rather than one byte at a time --
+//! the original byte-by-byte read_exact() loop issued a raw OS read
+//! call per byte with a very short (50ms) timeout, which is a known
+//! source of spurious "semaphore timeout" errors (os error 121) on
+//! Windows COM ports under rapid polling. It also clears any stale
+//! input before writing each command: a single interrupted read used to
+//! leave partial bytes in the buffer, which could misalign the next
+//! command/response pair -- plausibly why the meter was sometimes seen
+//! replying with its own "Syntax" error to what it received as a
+//! corrupted command.
 
 use anyhow::{bail, Result};
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use serialport::ClearBuffer;
+use std::io::{BufRead, BufReader, Write};
+use std::time::Duration;
 
 pub struct PowerMeter {
-    port: Box<dyn serialport::SerialPort>,
+    reader: BufReader<Box<dyn serialport::SerialPort>>,
 }
 
 impl PowerMeter {
     pub fn open(path: &str, baud: u32) -> Result<Self> {
         let port = serialport::new(path, baud)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(300))
             .open()?;
-        Ok(Self { port })
+        Ok(Self {
+            reader: BufReader::new(port),
+        })
     }
 
     /// Sends "D\r\n" and blocks for a line back, parsed as dBm.
     pub fn read_dbm(&mut self, timeout: Duration) -> Result<f32> {
-        self.port.write_all(b"D\r\n")?;
+        // Discard anything left over from a previous, possibly
+        // interrupted exchange before issuing a fresh command.
+        let _ = self.reader.get_mut().clear(ClearBuffer::Input);
 
-        let deadline = Instant::now() + timeout;
-        let mut line = Vec::new();
-        let mut byte = [0u8; 1];
+        self.reader.get_mut().set_timeout(timeout)?;
+        self.reader.get_mut().write_all(b"D\r\n")?;
 
+        // Loop past a stray leading CR/LF; bail on the underlying read
+        // timing out (propagates as an io::Error from read_line, e.g.
+        // TimedOut) or the port closing (0 bytes read).
+        let mut line = String::new();
         loop {
-            if Instant::now() >= deadline {
-                bail!("power meter did not respond within {:?}", timeout);
+            line.clear();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 {
+                bail!("power meter closed the connection");
             }
-            match self.port.read_exact(&mut byte) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-                Err(e) => return Err(e.into()),
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            match byte[0] {
-                b'\r' | b'\n' => {
-                    if line.is_empty() {
-                        continue; // tolerate a leading CR/LF before the real reply
-                    }
-                    break;
-                }
-                b => line.push(b),
-            }
+            return trimmed.parse::<f32>().map_err(|e| {
+                anyhow::anyhow!("meter replied '{trimmed}' (not a number): {e}")
+            });
         }
-
-        let text = String::from_utf8_lossy(&line);
-        text.trim()
-            .parse::<f32>()
-            .map_err(|e| anyhow::anyhow!("could not parse power meter reply '{}': {}", text, e))
     }
 
     /// Convenience: dBm -> mW.

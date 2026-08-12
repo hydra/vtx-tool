@@ -93,3 +93,40 @@ pub fn init(max_level: LevelFilter) -> &'static SharedLogs {
     log::set_max_level(max_level);
     logs
 }
+
+fn level_color(ui: &eframe::egui::Ui, level: Level) -> eframe::egui::Color32 {
+    use eframe::egui::Color32;
+    match level {
+        Level::Error => Color32::from_rgb(220, 80, 80),
+        Level::Warn => Color32::from_rgb(220, 180, 60),
+        Level::Debug | Level::Trace => Color32::GRAY,
+        Level::Info => ui.visuals().text_color(),
+    }
+}
+
+/// Renders one port's scrollable log panel. `title` must be unique
+/// across panels shown in the same frame (used as the egui id source for
+/// the scroll area/grid).
+pub fn show_panel(ui: &mut eframe::egui::Ui, title: &str, port_log: &PortLog) {
+    use eframe::egui;
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong(title);
+            ui.label(format!("{} message(s)", port_log.messages.len()));
+        });
+        egui::ScrollArea::vertical()
+            .id_salt(title)
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                egui::Grid::new(title).num_columns(1).striped(true).show(ui, |ui| {
+                    for entry in port_log.messages.iter() {
+                        let color = level_color(ui, entry.level);
+                        ui.colored_label(color, format!("[{:>5}] {}", entry.level, entry.text));
+                        ui.end_row();
+                    }
+                });
+            });
+    });
+}

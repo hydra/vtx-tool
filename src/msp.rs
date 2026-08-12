@@ -41,6 +41,149 @@ pub struct PaCalibration {
     pub detector: [u16; 7],
 }
 
+/// Decoded MSP_VTX_CONFIG response, matching vtx_msp.c's
+/// vtx_msp_push_vtx_config() payload layout exactly (15 bytes).
+#[derive(Debug, Clone, Default)]
+pub struct VtxConfig {
+    pub vtx_type: u8, // 5 = VTXDEV_MSP
+    pub band: u8,
+    pub channel: u8,
+    pub power: u8,
+    pub pitmode: bool,
+    pub frequency_mhz: u16,
+    pub device_ready: bool,
+    pub low_power_disarm: u8,
+    pub pit_mode_freq: u16,
+    pub vtx_table_available: bool,
+    pub band_count: u8,
+    pub channel_count: u8,
+    pub power_level_count: u8,
+}
+
+pub fn decode_vtx_config(payload: &[u8]) -> Result<VtxConfig> {
+    if payload.len() < 15 {
+        bail!("MSP_VTX_CONFIG payload too short: {} bytes", payload.len());
+    }
+    Ok(VtxConfig {
+        vtx_type: payload[0],
+        band: payload[1],
+        channel: payload[2],
+        power: payload[3],
+        pitmode: payload[4] != 0,
+        frequency_mhz: (payload[5] as u16) | ((payload[6] as u16) << 8),
+        device_ready: payload[7] != 0,
+        low_power_disarm: payload[8],
+        pit_mode_freq: (payload[9] as u16) | ((payload[10] as u16) << 8),
+        vtx_table_available: payload[11] != 0,
+        band_count: payload[12],
+        channel_count: payload[13],
+        power_level_count: payload[14],
+    })
+}
+
+/// Decoded VTX band entry, matching vtx_msp_push_band_table()'s
+/// SET_VTXTABLE_BAND payload layout (29 bytes): index, 8-byte name,
+/// letter, factory flag, channel count, 8x u16 LE frequencies (MHz).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VtxBand {
+    pub index: u8,
+    pub name: String, // up to 8 chars
+    pub letter: char,
+    pub is_factory: bool,
+    pub channel_count: u8,
+    pub freqs_mhz: [u16; 8],
+}
+
+impl Default for VtxBand {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            name: String::new(),
+            letter: '?',
+            is_factory: false,
+            channel_count: 8,
+            freqs_mhz: [0; 8],
+        }
+    }
+}
+
+pub fn decode_vtx_band(payload: &[u8]) -> Result<VtxBand> {
+    if payload.len() < 29 {
+        bail!("SET_VTXTABLE_BAND payload too short: {} bytes", payload.len());
+    }
+    let name_len = (payload[1] as usize).min(8);
+    let name = String::from_utf8_lossy(&payload[2..2 + name_len])
+        .trim_end()
+        .to_string();
+    let mut freqs_mhz = [0u16; 8];
+    for (i, f) in freqs_mhz.iter_mut().enumerate() {
+        *f = (payload[13 + i * 2] as u16) | ((payload[14 + i * 2] as u16) << 8);
+    }
+    Ok(VtxBand {
+        index: payload[0],
+        name,
+        letter: payload[10] as char,
+        is_factory: payload[11] != 0,
+        channel_count: payload[12],
+        freqs_mhz,
+    })
+}
+
+/// Encodes a VtxBand into a SET_VTXTABLE_BAND payload (29 bytes) --
+/// symmetric with decode_vtx_band, matches vtx_msp_push_band_table()'s
+/// layout so the VTX-side handler (once it accepts incoming SETs -- see
+/// the note in vtx_msp.c) can parse it the same way.
+pub fn encode_vtx_band(band: &VtxBand) -> Vec<u8> {
+    let mut p = vec![0u8; 29];
+    p[0] = band.index;
+    p[1] = 8; // name field is a fixed 8 bytes on the wire
+    let name_bytes = band.name.as_bytes();
+    for i in 0..8 {
+        p[2 + i] = *name_bytes.get(i).unwrap_or(&b' ');
+    }
+    p[10] = band.letter as u8;
+    p[11] = if band.is_factory { 1 } else { 0 };
+    p[12] = band.channel_count;
+    for (i, f) in band.freqs_mhz.iter().enumerate() {
+        p[13 + i * 2] = (f & 0xff) as u8;
+        p[14 + i * 2] = (f >> 8) as u8;
+    }
+    p
+}
+
+/// Decoded VTX power level entry, matching vtx_msp_push_power_table()'s
+/// SET_VTXTABLE_POWERLEVEL payload layout: index, mW (u16 LE), label_len,
+/// ASCII label.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VtxPowerLevel {
+    pub index: u8,
+    pub m_w: u16,
+    pub label: String,
+}
+
+pub fn decode_vtx_power_level(payload: &[u8]) -> Result<VtxPowerLevel> {
+    if payload.len() < 4 {
+        bail!("SET_VTXTABLE_POWERLEVEL payload too short: {} bytes", payload.len());
+    }
+    let label_len = (payload[3] as usize).min(payload.len().saturating_sub(4));
+    let label = String::from_utf8_lossy(&payload[4..4 + label_len]).to_string();
+    Ok(VtxPowerLevel {
+        index: payload[0],
+        m_w: (payload[1] as u16) | ((payload[2] as u16) << 8),
+        label,
+    })
+}
+
+/// Encodes a VtxPowerLevel into a SET_VTXTABLE_POWERLEVEL payload --
+/// symmetric with decode_vtx_power_level.
+pub fn encode_vtx_power_level(pl: &VtxPowerLevel) -> Vec<u8> {
+    let label_bytes = pl.label.as_bytes();
+    let label_len = label_bytes.len().min(255) as u8;
+    let mut p = vec![pl.index, (pl.m_w & 0xff) as u8, (pl.m_w >> 8) as u8, label_len];
+    p.extend_from_slice(&label_bytes[..label_len as usize]);
+    p
+}
+
 /// A fully decoded, checksum-verified MSP frame.
 #[derive(Debug, Clone)]
 pub struct MspFrame {
