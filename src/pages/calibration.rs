@@ -8,6 +8,7 @@ use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -60,34 +61,30 @@ impl Default for CalibrationPageState {
     }
 }
 
-/// Group-header band colors -- deliberately muted/desaturated to sit
-/// quietly in a dark theme rather than compete with the per-cell status
-/// colors below, which are the ones actually meant to draw the eye.
-const GROUP_CAL_COLOR: egui::Color32 = egui::Color32::from_rgb(45, 55, 70);
-const GROUP_DET_COLOR: egui::Color32 = egui::Color32::from_rgb(55, 48, 66);
-
+/// All four status colors share the same muted character (similar
+/// darkness/saturation, only the hue changes) so none of them stand out
+/// as harsher or harder to read than the others against default (light)
+/// cell text -- the earlier bright orange was the main offender.
 fn cell_color(status: CellStatus) -> Option<egui::Color32> {
     match status {
         CellStatus::Default => None,
-        CellStatus::Calibrated => Some(egui::Color32::from_rgb(50, 120, 65)), // green
-        CellStatus::Current => Some(egui::Color32::from_rgb(50, 100, 170)),   // blue
-        CellStatus::LimitHit => Some(egui::Color32::from_rgb(165, 55, 55)),   // red
-        CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(185, 125, 40)), // orange
+        CellStatus::Calibrated => Some(egui::Color32::from_rgb(45, 85, 55)),    // muted green
+        CellStatus::Current => Some(egui::Color32::from_rgb(45, 70, 100)),      // muted blue
+        CellStatus::LimitHit => Some(egui::Color32::from_rgb(100, 45, 45)),     // muted red
+        CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
     }
 }
 
-/// Renders one calibration/detector value cell, background-tinted per
-/// its CellStatus (or left as a plain label, letting the Grid's own
-/// striping show through, when Default).
+/// Renders one calibration/detector value cell inside a TableBuilder
+/// column, filling the ENTIRE cell rect with its status color (painted
+/// first, full width/height) rather than just tinting behind the text --
+/// RichText::background_color only covers the glyphs' own bounding box,
+/// which is what this replaces.
 fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
-    match cell_color(status) {
-        Some(color) => {
-            ui.label(egui::RichText::new(text).background_color(color));
-        }
-        None => {
-            ui.label(text);
-        }
+    if let Some(color) = cell_color(status) {
+        ui.painter().rect_filled(ui.max_rect(), 0.0, color);
     }
+    ui.centered_and_justified(|ui| ui.label(text));
 }
 
 fn status_text(status: Option<&LevelStatus>) -> String {
@@ -235,85 +232,146 @@ pub fn show(
     // ---- Table -----------------------------------------------------------
     let pa_table = shared.lock().unwrap().pa_table.clone();
     let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
+    let filtered: Vec<_> = pa_table.iter().filter(|e| e.idx > 0).collect();
 
-    egui::Grid::new("pa_table").striped(true).show(ui, |ui| {
-        // Group-header band: every cell in a span gets the same tinted
-        // background (via RichText::background_color), with the label only
-        // in the middle cell -- egui::Grid has no native merged/spanning
-        // cell, so a shared-color band across the span is the closest
-        // equivalent without pulling in a heavier table widget. This has
-        // to be a row WITHIN this same Grid (not a separate one) so its
-        // column widths are computed together with the label/data rows
-        // below and everything actually lines up.
-        for _ in 0..3 {
-            ui.label(""); // checkbox / idx / mW -- not part of either group
-        }
-        for i in 0..7 {
-            let text = if i == 3 { "Calibration (mV)" } else { "" };
-            ui.label(egui::RichText::new(text).background_color(GROUP_CAL_COLOR));
-        }
-        for i in 0..7 {
-            let text = if i == 3 { "Detector (mV)" } else { "" };
-            ui.label(egui::RichText::new(text).background_color(GROUP_DET_COLOR));
-        }
-        for _ in 0..4 {
-            ui.label(""); // Boost / RTC6705 / Limit / Status -- not part of either group
-        }
-        ui.end_row();
-
-        ui.strong("");
-        ui.strong("idx");
-        ui.strong("mW");
-        for f in frequencies {
-            ui.strong(format!("{f}"));
-        }
-        for f in frequencies {
-            ui.strong(format!("{f}"));
-        }
-        ui.strong("Boost");
-        ui.strong("RTC6705");
-        ui.strong("Limit (mV)");
-        ui.strong("Status");
-        ui.end_row();
-
-        for entry in pa_table.iter().filter(|e| e.idx > 0) {
-            // Default-checked: levels that engage the boost stage (ext_pa_enable) --
-            // those are what scanPa/scanDetector's detector-based closed loop is
-            // meant for; the RTC6705-alone levels are simple/structural and were
-            // never really candidates for this procedure (see the target power
-            // table's own comments). Only applies the FIRST time a given idx is
-            // seen -- a user's manual (un)check is never overwritten by this,
-            // including across table Refreshes.
-            let checked = page.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
-            ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
-            ui.label(entry.idx.to_string());
-            ui.label(entry.m_w.to_string());
-
-            let (cal_status, det_status, level_status, limit) = {
-                let g = sweep.lock().unwrap();
-                let cal_status: [CellStatus; 7] =
-                    std::array::from_fn(|i| g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default));
-                let det_status: [CellStatus; 7] =
-                    std::array::from_fn(|i| g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default));
-                let level_status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
-                let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
-                (cal_status, det_status, level_status, limit)
-            };
-
-            for i in 0..7 {
-                colored_cell(ui, entry.value[i].to_string(), cal_status[i]);
+    TableBuilder::new(ui)
+        .striped(true)
+        .column(Column::exact(24.0)) // checkbox
+        .column(Column::exact(28.0)) // idx
+        .column(Column::exact(40.0)) // mW
+        .columns(Column::exact(55.0), 7) // calibration, one per frequency
+        .columns(Column::exact(55.0), 7) // detector, one per frequency
+        .column(Column::exact(45.0)) // Boost
+        .column(Column::exact(65.0)) // RTC6705
+        .column(Column::exact(70.0)) // Limit
+        .column(Column::remainder()) // Status
+        .header(18.0, |mut header| {
+            header.col(|ui| {
+                ui.strong("");
+            });
+            header.col(|ui| {
+                ui.strong("idx");
+            });
+            header.col(|ui| {
+                ui.strong("mW");
+            });
+            for f in frequencies {
+                header.col(|ui| {
+                    ui.strong(format!("{f}"));
+                });
             }
-            for i in 0..7 {
-                colored_cell(ui, entry.detector[i].to_string(), det_status[i]);
+            for f in frequencies {
+                header.col(|ui| {
+                    ui.strong(format!("{f}"));
+                });
             }
+            header.col(|ui| {
+                ui.strong("Boost");
+            });
+            header.col(|ui| {
+                ui.strong("RTC6705");
+            });
+            header.col(|ui| {
+                ui.strong("Limit (mV)");
+            });
+            header.col(|ui| {
+                ui.strong("Status");
+            });
+        })
+        .body(|mut body| {
+            // Group-band row: label left-aligned over just the FIRST column
+            // of each group, no background fill (spec: group headers
+            // shouldn't have a non-default background) -- fixed-width
+            // columns mean a longer label just clips rather than forcing
+            // anything to expand, so the text is kept short on purpose.
+            body.row(16.0, |mut row| {
+                row.col(|ui| {
+                    ui.label("");
+                });
+                row.col(|ui| {
+                    ui.label("");
+                });
+                row.col(|ui| {
+                    ui.label("");
+                });
+                for i in 0..7 {
+                    row.col(|ui| {
+                        if i == 0 {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.weak("Cal (mV)");
+                            });
+                        }
+                    });
+                }
+                for i in 0..7 {
+                    row.col(|ui| {
+                        if i == 0 {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.weak("Det (mV)");
+                            });
+                        }
+                    });
+                }
+                row.col(|_ui| {});
+                row.col(|_ui| {});
+                row.col(|_ui| {});
+                row.col(|_ui| {});
+            });
 
-            ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
-            ui.label(entry.rtc6705_level.to_string());
-            ui.label(limit.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
-            ui.label(status_text(level_status.as_ref()));
-            ui.end_row();
-        }
-    });
+            for entry in filtered.iter() {
+                // Default-checked: levels that engage the boost stage (ext_pa_enable) --
+                // those are what scanPa/scanDetector's detector-based closed loop is
+                // meant for; the RTC6705-alone levels are simple/structural and were
+                // never really candidates for this procedure (see the target power
+                // table's own comments). Only applies the FIRST time a given idx is
+                // seen -- a user's manual (un)check is never overwritten by this,
+                // including across table Refreshes.
+                let checked = page.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
+
+                let (cal_status, det_status, level_status, limit) = {
+                    let g = sweep.lock().unwrap();
+                    let cal_status: [CellStatus; 7] = std::array::from_fn(|i| {
+                        g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
+                    });
+                    let det_status: [CellStatus; 7] = std::array::from_fn(|i| {
+                        g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
+                    });
+                    let level_status = g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned());
+                    let limit = g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied());
+                    (cal_status, det_status, level_status, limit)
+                };
+
+                body.row(20.0, |mut row| {
+                    row.col(|ui| {
+                        ui.add_enabled(!sweep_active, egui::Checkbox::new(checked, ""));
+                    });
+                    row.col(|ui| {
+                        ui.label(entry.idx.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(entry.m_w.to_string());
+                    });
+                    for i in 0..7 {
+                        row.col(|ui| colored_cell(ui, entry.value[i].to_string(), cal_status[i]));
+                    }
+                    for i in 0..7 {
+                        row.col(|ui| colored_cell(ui, entry.detector[i].to_string(), det_status[i]));
+                    }
+                    row.col(|ui| {
+                        ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
+                    });
+                    row.col(|ui| {
+                        ui.label(entry.rtc6705_level.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(limit.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+                    });
+                    row.col(|ui| {
+                        ui.label(status_text(level_status.as_ref()));
+                    });
+                });
+            }
+        });
 
     // ---- Progress bars -------------------------------------------------
     {
