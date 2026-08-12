@@ -237,15 +237,31 @@ fn read_pa_table(link: &mut MspLink) -> Result<Vec<msp::PaCalibration>> {
     link.send_v2(function::PACALTABLE, None)?;
     debug!(target: "vtx", "sent PACALTABLE request");
     let mut entries = Vec::new();
+    let quiet_period = Duration::from_millis(300);
+    // Deadline is only ever pushed out by a MATCHING frame, not by any
+    // traffic at all -- the VTX firmware sends its own MSP_STATUS/MSP_RC
+    // requests every 100ms regardless of what's listening, so a naive
+    // "reset on any frame" timeout would never fire and this loop would
+    // block the whole worker thread indefinitely (this is what was
+    // actually happening: "unknown command 0x0065/0x0069" in the log is
+    // exactly MSP_STATUS/MSP_RC arriving here and getting ignored, but
+    // still (previously) resetting the clock).
+    let mut deadline = Instant::now() + quiet_period;
     loop {
-        match link.read_frame(Duration::from_millis(300))? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match link.read_frame(remaining)? {
             Some(frame) if frame.function == function::SET_PACALTABLE => {
                 let entry = msp::decode_pa_calibration(&frame.payload)?;
                 debug!(target: "vtx", "received level {} ({} mW)", entry.idx, entry.m_w);
                 entries.push(entry);
+                deadline = Instant::now() + quiet_period; // still hearing PACALTABLE entries -- extend the window
             }
             Some(frame) => {
-                debug!(target: "vtx", "ignored frame, function=0x{:04x}", frame.function);
+                // Unrelated traffic -- ignored, deadline NOT extended.
+                debug!(target: "vtx", "ignored frame while collecting PACALTABLE, function=0x{:04x}", frame.function);
             }
             None => break,
         }
@@ -256,8 +272,13 @@ fn read_pa_table(link: &mut MspLink) -> Result<Vec<msp::PaCalibration>> {
 fn read_vtx_config(link: &mut MspLink) -> Result<msp::VtxConfig> {
     link.send_v1(function::VTX_CONFIG as u8, &[])?;
     debug!(target: "vtx", "sent VTX_CONFIG query");
+    let deadline = Instant::now() + Duration::from_millis(300); // fixed -- unrelated traffic must not extend this, same reasoning as read_pa_table
     loop {
-        match link.read_frame(Duration::from_millis(300))? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("no VTX_CONFIG response within timeout");
+        }
+        match link.read_frame(remaining)? {
             Some(frame) if frame.function == function::VTX_CONFIG && !frame.payload.is_empty() => {
                 return msp::decode_vtx_config(&frame.payload);
             }
