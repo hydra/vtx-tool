@@ -419,6 +419,29 @@ pub fn spawn(
                         }
                     }
                     Command::SkipCurrent => {
+                        // Mirrors AbortSweep's own safe-state push, and for the same
+                        // reason: skip_current() itself only updates internal
+                        // bookkeeping (see its doc comment) and was never sending
+                        // anything to the VTX at all. The engine's own frequency-
+                        // advance logic WILL push a fresh retune shortly after this
+                        // (even when the manual-frequency prompt itself gets
+                        // consolidated/skipped for being the same band as before),
+                        // but that's an ordinary retune, not a safety reset -- it
+                        // doesn't force pitmode, and under repeated rapid skips (real
+                        // symptom seen: the VTX stopped responding to
+                        // SET_PACALIBRATION at all after several skip-then-retune
+                        // cycles in quick succession, recoverable only via a full
+                        // reconnect+power-cycle) that leaves the VTX cycling through
+                        // several override-then-retune transitions back to back with
+                        // no defined safe/settled point in between. Pushing pitmode
+                        // here gives it one.
+                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                        if let Some(link) = vtx.as_mut() {
+                            match link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                Ok(()) => debug!(target: "vtx", "skip: pitmode-safe state sent before advancing"),
+                                Err(e) => error!(target: "vtx", "skip: failed to send safe state: {e}"),
+                            }
+                        }
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
                             engine.skip_current();
                         }
