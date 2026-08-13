@@ -183,34 +183,61 @@ impl eframe::App for App {
                 ui.separator();
                 ui.heading("Connection");
 
-                let (connected, vtx_ready, meter_ready) = {
+                let (vtx_state, meter_state) = {
                     let s = self.state.lock().unwrap();
-                    (s.connected, s.vtx_ready, s.meter_ready)
+                    (s.vtx_port_state, s.meter_port_state)
                 };
 
                 ui.horizontal(|ui| {
                     ui.label("VTX");
-                    if connected {
-                        conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(vtx_ready)));
+                    conn_status::show_port(ui, vtx_state);
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        vtx_state.is_idle(),
+                        egui::TextEdit::singleline(&mut self.vtx_port_input).hint_text("VTX port"),
+                    );
+                    let label = if vtx_state.is_ready() { "Disconnect" } else { "Connect" };
+                    if ui.small_button(label).clicked() {
+                        if vtx_state.is_ready() {
+                            let _ = self.cmd_tx.send(Command::DisconnectVtx);
+                        } else if vtx_state.is_idle() {
+                            let mut settings = AppSettings::load();
+                            settings.vtx_port = self.vtx_port_input.clone();
+                            let _ = settings.save(); // best-effort -- remembers the port for next launch regardless of whether the connect itself succeeds
+                            let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
+                        }
+                        // Connecting/Disconnecting: button click ignored -- an
+                        // operation's already in flight for this port.
                     }
                 });
-                ui.add_enabled(
-                    !connected,
-                    egui::TextEdit::singleline(&mut self.vtx_port_input).hint_text("VTX port"),
-                );
 
                 ui.horizontal(|ui| {
                     ui.label("Power Meter");
-                    if connected {
-                        conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(meter_ready)));
+                    conn_status::show_port(ui, meter_state);
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        meter_state.is_idle(),
+                        egui::TextEdit::singleline(&mut self.meter_port_input).hint_text("Power meter port"),
+                    );
+                    let label = if meter_state.is_ready() { "Disconnect" } else { "Connect" };
+                    if ui.small_button(label).clicked() {
+                        if meter_state.is_ready() {
+                            let _ = self.cmd_tx.send(Command::DisconnectMeter);
+                        } else if meter_state.is_idle() {
+                            let mut settings = AppSettings::load();
+                            settings.meter_port = self.meter_port_input.clone();
+                            let _ = settings.save();
+                            let _ = self.cmd_tx.send(Command::ConnectMeter {
+                                port: self.meter_port_input.clone(),
+                                meter_kind: self.meter_kind,
+                            });
+                        }
                     }
                 });
-                ui.add_enabled(
-                    !connected,
-                    egui::TextEdit::singleline(&mut self.meter_port_input).hint_text("Power meter port"),
-                );
 
-                ui.add_enabled_ui(!connected, |ui| {
+                ui.add_enabled_ui(meter_state.is_idle(), |ui| {
                     egui::ComboBox::from_id_salt("meter_kind")
                         .selected_text(self.meter_kind.name())
                         .show_ui(ui, |ui| {
@@ -230,21 +257,39 @@ impl eframe::App for App {
                         });
                 });
 
-                if connected {
-                    if ui.button("Disconnect").clicked() {
-                        let _ = self.cmd_tx.send(Command::Disconnect);
+                ui.separator();
+                let overall = conn_status::OverallState::from_ports(vtx_state, meter_state);
+                ui.horizontal(|ui| {
+                    ui.label("Overall:");
+                    conn_status::show_overall(ui, overall);
+                });
+
+                let all_label = if overall == conn_status::OverallState::Ready { "Disconnect-all" } else { "Connect-all" };
+                if ui.button(all_label).clicked() {
+                    if overall == conn_status::OverallState::Ready {
+                        let _ = self.cmd_tx.send(Command::DisconnectVtx);
+                        let _ = self.cmd_tx.send(Command::DisconnectMeter);
+                    } else {
+                        // Per-port ConnectVtx/ConnectMeter handlers already no-op
+                        // if that specific port is already open (see worker.rs),
+                        // so it's safe to just request both unconditionally here
+                        // rather than working out which ones actually need it.
+                        if vtx_state.is_idle() {
+                            let mut settings = AppSettings::load();
+                            settings.vtx_port = self.vtx_port_input.clone();
+                            let _ = settings.save();
+                            let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
+                        }
+                        if meter_state.is_idle() {
+                            let mut settings = AppSettings::load();
+                            settings.meter_port = self.meter_port_input.clone();
+                            let _ = settings.save();
+                            let _ = self.cmd_tx.send(Command::ConnectMeter {
+                                port: self.meter_port_input.clone(),
+                                meter_kind: self.meter_kind,
+                            });
+                        }
                     }
-                } else if ui.button("Connect").clicked() {
-                    let settings = AppSettings {
-                        vtx_port: self.vtx_port_input.clone(),
-                        meter_port: self.meter_port_input.clone(),
-                    };
-                    let _ = settings.save(); // best-effort -- remembers ports for next launch regardless of whether the connect itself succeeds
-                    let _ = self.cmd_tx.send(Command::Connect {
-                        vtx_port: self.vtx_port_input.clone(),
-                        meter_port: self.meter_port_input.clone(),
-                        meter_kind: self.meter_kind,
-                    });
                 }
             });
 
