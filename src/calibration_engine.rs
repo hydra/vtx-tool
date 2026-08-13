@@ -139,7 +139,7 @@ impl SampleWait {
 /// sub_progress() needs the same value to compute how far the ramp has
 /// traveled toward the DAC boundary.
 const COARSE_RAMP_START_MV: i32 = 3200;
-const COARSE_RAMP_STEP_MV: i32 = 50;
+const COARSE_RAMP_STEP_MV: i32 = 25;
 
 enum ScanPaPhase {
     CoarseRamp,
@@ -150,7 +150,7 @@ struct ScanPaState {
     phase: ScanPaPhase,
     mv: i32,
     wait: Option<SampleWait>,
-    coarse_steps_taken: u32, // how many 50mV coarse-ramp steps so far -- drives sub_progress()
+    coarse_steps_taken: u32, // how many coarse-ramp steps so far -- drives sub_progress()
     /// Last CoarseRamp mv confirmed to read below target, remembered so
     /// that the moment CoarseRamp overshoots, Fine creep can start from
     /// there directly -- see the CoarseRamp match arm's doc comment for
@@ -636,7 +636,7 @@ impl SweepEngine {
                             // phase), jump straight to the last coarse point we
                             // KNOW read below target and creep up from there in
                             // fine 1mV steps. A real run showed why the old
-                            // approach could fail outright: CoarseRamp's 50mV
+                            // approach could fail outright: a CoarseRamp 50mV
                             // step landed at 152% of target in one jump (steep
                             // local RF response), and Backoff's OWN 5mV steps
                             // then skipped clean past the target region too
@@ -819,7 +819,7 @@ impl SweepEngine {
     /// Progress within the CURRENT (level, freq, op) step only -- coarse,
     /// phase-block-based (not fine-grained, since these are open-ended
     /// searches with no fixed step count to measure against), EXCEPT for
-    /// CoarseRamp: since it steps in known, fixed 50mV increments toward
+    /// CoarseRamp: since it steps in known, fixed increments toward
     /// a known boundary, the fraction of that distance already covered
     /// gives a real (if approximate -- we don't know in advance how many
     /// steps it'll actually take to reach 80% target) sense of movement,
