@@ -167,11 +167,16 @@ enum ScanDetectorPhase {
 
 struct ScanDetectorState {
     phase: ScanDetectorPhase,
-    mv: i32,
+    mv: i32, // DAC/calibration mV currently being tried -- NOT the detector reading itself
     wait: Option<SampleWait>,
     below: Option<(f32, u16)>, // (power_mw, detector_mv)
     above: Option<(f32, u16)>,
     pinned_count: u32, // consecutive steps clamped at a bound without progress -- see PINNED_LIMIT
+    /// Most recent detector ADC reading (VDET) seen from the VTX for
+    /// this step -- distinct from `mv` above. current_step_mv() reports
+    /// THIS for the UI's live Detector-column cell, since that column is
+    /// about detector readings, not DAC values.
+    last_detector_mv: u16,
 }
 
 enum StepState {
@@ -713,6 +718,9 @@ impl SweepEngine {
                 let up = power_up_step(self.sign_inverted);
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
                 let detector_now = latest_reading.map(|r| r.detector_mv).unwrap_or(0);
+                if let Some(reading) = latest_reading {
+                    st.last_detector_mv = reading.detector_mv;
+                }
                 debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={detector_now}", st.mv);
 
                 match st.phase {
@@ -840,18 +848,25 @@ impl SweepEngine {
     }
 
     /// (level, freq_idx, is_detector, mv) for whatever step is currently
-    /// in progress, if any -- used by the UI to show the LIVE mV value
-    /// in the "Current" (blue) cell, rather than the table's last-saved
+    /// in progress, if any -- used by the UI to show the LIVE value in
+    /// the "Current" (blue) cell, rather than the table's last-saved
     /// value for that cell (which stays stale/default until the step
     /// actually finishes and pending_result is drained). Not gated on
     /// EngineState::Running specifically -- self.step being Some is the
     /// right signal on its own, and stays meaningfully "current" while
     /// paused mid-step during ConnectionLost too.
+    ///
+    /// The returned value means different things depending on which
+    /// column it's for: for a ScanPa (calibration) step it's the DAC mV
+    /// being tried, matching the Calibration column. For a ScanDetector
+    /// step it's the detector's own ADC reading (VDET), matching the
+    /// Detector column -- NOT the DAC mV ScanDetector happens to be
+    /// driving to get there, which is a different number entirely.
     pub fn current_step_mv(&self) -> Option<(u8, usize, bool, i32)> {
         let level = self.levels.get(self.level_idx).copied()?;
         match &self.step {
             Some(StepState::Pa(st)) => Some((level, self.freq_idx, false, st.mv)),
-            Some(StepState::Detector(st)) => Some((level, self.freq_idx, true, st.mv)),
+            Some(StepState::Detector(st)) => Some((level, self.freq_idx, true, st.last_detector_mv as i32)),
             None => None,
         }
     }
@@ -1014,6 +1029,7 @@ impl SweepEngine {
             below: None,
             above: None,
             pinned_count: 0,
+            last_detector_mv: 0,
         }));
     }
 
