@@ -122,6 +122,12 @@ struct PaTableDelegate<'a> {
     det_status: Vec<[CellStatus; 7]>,
     level_status: Vec<Option<LevelStatus>>,
     limits: Vec<Option<i32>>,
+    /// (level, freq_idx, is_detector, mv) of whatever's actively being
+    /// tested right now, if anything -- see calibration_engine.rs's
+    /// current_step_mv(). Used so the Current (blue) cell shows the LIVE
+    /// value being tried, not the table's last-saved value for that
+    /// cell, which stays stale/default until the step actually finishes.
+    current: Option<(u8, usize, bool, i32)>,
     row_height: f32,
 }
 
@@ -211,11 +217,19 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
             }
             3..=9 => {
                 let i = col_nr - 3;
-                colored_cell(ui, entry.value[i].to_string(), self.cal_status[row_nr][i]);
+                let text = match self.current {
+                    Some((level, freq_idx, false, mv)) if level == entry.idx && freq_idx == i => mv.to_string(),
+                    _ => entry.value[i].to_string(),
+                };
+                colored_cell(ui, text, self.cal_status[row_nr][i]);
             }
             10..=16 => {
                 let i = col_nr - 10;
-                colored_cell(ui, entry.detector[i].to_string(), self.det_status[row_nr][i]);
+                let text = match self.current {
+                    Some((level, freq_idx, true, mv)) if level == entry.idx && freq_idx == i => mv.to_string(),
+                    _ => entry.detector[i].to_string(),
+                };
+                colored_cell(ui, text, self.det_status[row_nr][i]);
             }
             17 => {
                 ui.label(if entry.ext_pa_enable { "Yes" } else { "No" });
@@ -414,8 +428,10 @@ pub fn show(
     let mut det_status = Vec::with_capacity(entries.len());
     let mut level_status = Vec::with_capacity(entries.len());
     let mut limits = Vec::with_capacity(entries.len());
+    let mut current = None;
     {
         let g = sweep.lock().unwrap();
+        current = g.as_ref().and_then(|e| e.current_step_mv());
         for entry in &entries {
             let cal: [CellStatus; 7] = std::array::from_fn(|i| {
                 g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
@@ -439,6 +455,7 @@ pub fn show(
         det_status,
         level_status,
         limits,
+        current,
         row_height: DATA_ROW_HEIGHT,
     };
 
@@ -554,7 +571,8 @@ pub fn show(
         }
         if confirmed {
             page.show_confirm_dialog = false;
-            let levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+            levels.sort_unstable(); // HashMap iteration order is arbitrary -- without this, the sweep ran the selected rows in a random order instead of top-to-bottom
             let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
         }
     }

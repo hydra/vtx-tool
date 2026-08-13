@@ -143,7 +143,6 @@ const COARSE_RAMP_STEP_MV: i32 = 50;
 
 enum ScanPaPhase {
     CoarseRamp,
-    Backoff,
     Fine,
 }
 
@@ -152,7 +151,13 @@ struct ScanPaState {
     mv: i32,
     wait: Option<SampleWait>,
     coarse_steps_taken: u32, // how many 50mV coarse-ramp steps so far -- drives sub_progress()
-    pinned_count: u32, // consecutive steps clamped at a bound without progress -- see PINNED_LIMIT
+    /// Last CoarseRamp mv confirmed to read below target, remembered so
+    /// that the moment CoarseRamp overshoots, Fine creep can start from
+    /// there directly -- see the CoarseRamp match arm's doc comment for
+    /// why (replaced a separate Backoff phase that stepped AWAY from an
+    /// overshoot in fixed 5mV chunks, which a real run showed skipping
+    /// clean past the target region when the RF response is steep).
+    last_below_target_mv: Option<i32>,
 }
 
 enum ScanDetectorPhase {
@@ -563,7 +568,7 @@ impl SweepEngine {
                 mv: COARSE_RAMP_START_MV,
                 wait: None,
                 coarse_steps_taken: 0,
-                pinned_count: 0,
+                last_below_target_mv: None,
             }));
             debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from mv={COARSE_RAMP_START_MV}");
             self.per_level_status.insert(
@@ -584,7 +589,6 @@ impl SweepEngine {
                         self.last_send = Instant::now();
                         let (needed, skip) = match st.phase {
                             ScanPaPhase::Fine | ScanPaPhase::CoarseRamp => (4, 0),
-                            ScanPaPhase::Backoff => (1, 0),
                         };
                         st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
@@ -610,8 +614,30 @@ impl SweepEngine {
                 match st.phase {
                     ScanPaPhase::CoarseRamp => {
                         if avg_mw >= target_mw * 0.80 {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp reached 80% ({avg_mw:.4}mW >= {:.4}mW) at mv={}, entering backoff", target_mw * 0.80, st.mv);
-                            st.phase = ScanPaPhase::Backoff;
+                            // Overshot (or reached) 80% of target -- rather than
+                            // accept this point and step AWAY from it in fixed
+                            // chunks hoping to cross back below (the old Backoff
+                            // phase), jump straight to the last coarse point we
+                            // KNOW read below target and creep up from there in
+                            // fine 1mV steps. A real run showed why the old
+                            // approach could fail outright: CoarseRamp's 50mV
+                            // step landed at 152% of target in one jump (steep
+                            // local RF response), and Backoff's OWN 5mV steps
+                            // then skipped clean past the target region too
+                            // (57mW -> 46mW in a single step), leaving Fine creep
+                            // to close an 11mW gap in one more step. Starting
+                            // from a point already confirmed below target removes
+                            // that failure mode -- the approach to target is
+                            // always a monotonic climb from a safe point, never a
+                            // step away from an overshoot, which is also the
+                            // safer direction for the VTX (approaching from below
+                            // rather than risking a large excursion above target
+                            // while hunting for where to reverse).
+                            let revert_mv = st.last_below_target_mv.unwrap_or(st.mv);
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp reached 80% ({avg_mw:.4}mW >= {:.4}mW) at mv={} -- reverting to last below-target point mv={revert_mv} and entering fine creep",
+                                target_mw * 0.80, st.mv);
+                            st.mv = revert_mv;
+                            st.phase = ScanPaPhase::Fine;
                             st.wait = None;
                         } else if !(bound_lo..=bound_hi).contains(&(st.mv + up * COARSE_RAMP_STEP_MV)) {
                             // Ran off the end of the allowed range (DAC bound, or a hard limit from
@@ -621,28 +647,10 @@ impl SweepEngine {
                             self.finish_scan_pa(level, st.mv, false);
                             return Ok(());
                         } else {
+                            st.last_below_target_mv = Some(st.mv);
                             st.mv += up * COARSE_RAMP_STEP_MV;
                             st.coarse_steps_taken += 1;
                             st.wait = None;
-                        }
-                    }
-                    ScanPaPhase::Backoff => {
-                        if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: backoff crossed below target at mv={}, entering fine creep", st.mv);
-                            st.phase = ScanPaPhase::Fine;
-                            st.wait = None;
-                            st.pinned_count = 0;
-                        } else {
-                            let desired = st.mv - up * 5;
-                            let clamped = desired.clamp(bound_lo, bound_hi);
-                            st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
-                            st.mv = clamped;
-                            st.wait = None;
-                            if st.pinned_count >= PINNED_LIMIT {
-                                debug!(target: "vtx", "[sweep] ScanPa level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_pa(level, st.mv, false);
-                                return Ok(());
-                            }
                         }
                     }
                     ScanPaPhase::Fine => {
@@ -668,7 +676,6 @@ impl SweepEngine {
                         SweepOp::ScanPa.label(),
                         match st.phase {
                             ScanPaPhase::CoarseRamp => "coarse ramp",
-                            ScanPaPhase::Backoff => "backoff",
                             ScanPaPhase::Fine => "fine",
                         },
                         st.mv
@@ -812,10 +819,9 @@ impl SweepEngine {
                         .abs()
                         .max(1.0);
                     let frac = (st.coarse_steps_taken as f32 / total_possible).clamp(0.0, 1.0);
-                    (0.4 * frac, "ScanPa: coarse ramp")
+                    (0.6 * frac, "ScanPa: coarse ramp")
                 }
-                ScanPaPhase::Backoff => (0.55, "ScanPa: backoff"),
-                ScanPaPhase::Fine => (0.85, "ScanPa: fine creep"),
+                ScanPaPhase::Fine => (0.8, "ScanPa: fine creep"),
             },
             Some(StepState::Detector(st)) => match st.phase {
                 ScanDetectorPhase::Backoff => (0.20, "ScanDetector: backoff"),
@@ -830,6 +836,23 @@ impl SweepEngine {
                     (0.45 + extra, "ScanDetector: bracket search")
                 }
             },
+        }
+    }
+
+    /// (level, freq_idx, is_detector, mv) for whatever step is currently
+    /// in progress, if any -- used by the UI to show the LIVE mV value
+    /// in the "Current" (blue) cell, rather than the table's last-saved
+    /// value for that cell (which stays stale/default until the step
+    /// actually finishes and pending_result is drained). Not gated on
+    /// EngineState::Running specifically -- self.step being Some is the
+    /// right signal on its own, and stays meaningfully "current" while
+    /// paused mid-step during ConnectionLost too.
+    pub fn current_step_mv(&self) -> Option<(u8, usize, bool, i32)> {
+        let level = self.levels.get(self.level_idx).copied()?;
+        match &self.step {
+            Some(StepState::Pa(st)) => Some((level, self.freq_idx, false, st.mv)),
+            Some(StepState::Detector(st)) => Some((level, self.freq_idx, true, st.mv)),
+            None => None,
         }
     }
 
