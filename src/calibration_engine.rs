@@ -460,6 +460,17 @@ impl SweepEngine {
         self.step = None;
     }
 
+    pub fn skip_frequency(&mut self) {
+        if !matches!(self.state, EngineState::Running) {
+            return;
+        }
+
+        debug!(target: "vtx", "[sweep] skipped frequency at level={:?} freq_idx={} ({}/{} steps completed)",
+                self.levels.get(self.level_idx), self.freq_idx, self.completed_steps, self.total_steps);
+        self.freq_idx += 1;
+        self.step = None;
+    }
+
     pub fn is_active(&self) -> bool {
         !matches!(self.state, EngineState::Idle)
     }

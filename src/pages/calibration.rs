@@ -525,6 +525,9 @@ pub fn show(
             if ui.button("Stop").clicked() {
                 let _ = cmd_tx.send(Command::AbortSweep);
             }
+            if ui.button("Skip >").clicked() {
+                let _ = cmd_tx.send(Command::SkipFrequency);
+            }
         } else {
             let any_checked = page.checked.values().any(|&v| v);
             let overall_ready = {
