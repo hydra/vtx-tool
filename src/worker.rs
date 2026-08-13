@@ -16,6 +16,7 @@
 //! take several minutes.
 
 use crate::calibration_engine::{self, SweepEngine};
+use crate::conn_status::PortState;
 use crate::msp::{self, function, MspLink};
 use crate::power_meter::{PowerMeter, PowerMeterKind};
 use crate::vtxtable::VtxTableConfig;
@@ -62,21 +63,26 @@ pub struct SharedState {
     /// Last thing the VTX itself reported when WE queried it -- a
     /// debug/confirmation aid, unrelated to the passive auto-responder.
     pub vtx_config: Option<msp::VtxConfig>,
-    pub connected: bool,
+    /// Each port's own connection lifecycle -- see conn_status.rs's
+    /// module doc for why this is tracked per-port rather than as one
+    /// combined "connected" flag (which conflated "both ports opened"
+    /// with "at least one succeeded", losing exactly the distinction
+    /// needed to show accurate per-port status or gate the Connect
+    /// button correctly).
+    pub vtx_port_state: PortState,
+    pub meter_port_state: PortState,
     /// True if ANY frame (not just ones a specific command was waiting
     /// for) has been seen from the VTX within the last READY_WINDOW.
-    /// Used by the sweep engine to detect a current-limited supply
-    /// power-cycling the VTX mid-sweep, and shown live in the resulting
-    /// "VTX not responding" dialog's status line.
+    /// NOT the same thing as vtx_port_state -- this is a narrower
+    /// heartbeat used only by the calibration sweep to detect a
+    /// current-limited supply power-cycling the VTX mid-sweep (see
+    /// conn_status.rs's module doc for the full distinction).
     pub vtx_ready: bool,
-    /// Same idea as vtx_ready, for the power meter -- true if its last
-    /// "V" presence-check succeeded recently. See PowerMeter::check_alive
-    /// and the dedicated poll loop in spawn().
-    pub meter_ready: bool,
 }
 
 /// How recently the VTX (or power meter) must have said ANYTHING for
-/// vtx_ready/meter_ready to be true. The VTX's own firmware chatters
+/// vtx_ready to be true / for the meter's alive-check to reconfirm
+/// meter_port_state::Ready. The VTX's own firmware chatters
 /// (MSP_STATUS/MSP_RC) roughly every 100ms on its own, and the meter's
 /// alive-check runs every 100ms too, so this has real margin without
 /// being slow to notice a genuine loss.
@@ -93,20 +99,23 @@ impl Default for SharedState {
             update_hz: 1.0, // conservative default; ImmersionRC V1's own max is now 5Hz, so this leaves headroom below it and stays valid for any future slower-max meter too
             pre_sweep_update_hz: None,
             vtx_config: None,
-            connected: false,
+            vtx_port_state: PortState::Disconnected,
+            meter_port_state: PortState::Disconnected,
             vtx_ready: false,
-            meter_ready: false,
         }
     }
 }
 
 pub enum Command {
-    Connect {
-        vtx_port: String,
-        meter_port: String,
-        meter_kind: PowerMeterKind,
-    },
-    Disconnect,
+    /// No-op (logged) if the VTX port is already open -- see
+    /// PortState::is_idle's doc comment.
+    ConnectVtx { port: String },
+    /// No-op (logged) if the VTX port is already closed.
+    DisconnectVtx,
+    /// No-op (logged) if the meter port is already open.
+    ConnectMeter { port: String, meter_kind: PowerMeterKind },
+    /// No-op (logged) if the meter port is already closed.
+    DisconnectMeter,
     RefreshCalTable,
     RefreshVtxConfig,
     /// Actively sends the current VtxTableConfig selection (band/channel/
@@ -121,7 +130,10 @@ pub enum Command {
     /// Starts a calibration sweep over `levels` (1-based indices into the
     /// PA table, from the checked rows) at the given detector tolerance.
     /// Frequencies and per-level mW targets come from the already-loaded
-    /// pa_table -- refresh it first if it's empty/stale.
+    /// pa_table -- refresh it first if it's empty/stale. The UI is
+    /// expected to have already gated this on
+    /// conn_status::OverallState::Ready, but the handler re-checks both
+    /// ports defensively regardless.
     StartSweep { levels: Vec<u8>, tolerance_pct: f32 },
     /// UI confirms the user has retuned a manual-frequency meter.
     ConfirmFrequency,
@@ -161,75 +173,105 @@ pub fn spawn(
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
-                    Command::Connect { vtx_port, meter_port, meter_kind } => {
-                        vtx = match MspLink::open(&vtx_port, 115200) {
-                            Ok(l) => {
-                                debug!(target: "vtx", "opened {vtx_port}");
-                                Some(l)
-                            }
-                            Err(e) => {
-                                error!(target: "vtx", "open failed: {e}");
-                                None
-                            }
-                        };
-                        meter = match PowerMeter::open(meter_kind, &meter_port) {
-                            Ok(m) => {
-                                debug!(target: "meter", "opened {meter_port} ({})", meter_kind.name());
-                                Some(m)
-                            }
-                            Err(e) => {
-                                error!(target: "meter", "open failed: {e}");
-                                None
-                            }
-                        };
-                        vtx_last_seen = None;
-                        meter_last_seen = None;
-                        let mut s = state.lock().unwrap();
-                        s.connected = vtx.is_some() && meter.is_some();
-                        s.vtx_ready = false;
-                        s.meter_ready = false;
-                        s.meter_kind = meter_kind;
-                        s.update_hz = s.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
-                        s.power_history.clear();
-                        drop(s);
-                        last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
-                        last_meter_alive_check = Instant::now() - Duration::from_secs(1); // force an immediate first alive-check
+                    Command::ConnectVtx { port } => {
+                        if vtx.is_some() {
+                            debug!(target: "vtx", "ConnectVtx requested but already connected -- ignoring");
+                        } else {
+                            state.lock().unwrap().vtx_port_state = PortState::Connecting;
+                            ctx.request_repaint();
+                            match MspLink::open(&port, 115200) {
+                                Ok(l) => {
+                                    debug!(target: "vtx", "opened {port}");
+                                    vtx = Some(l);
+                                    vtx_last_seen = None;
+                                    state.lock().unwrap().vtx_port_state = PortState::Ready;
 
-                        // Push a pitmode-safe VTX_CONFIG immediately on connect,
-                        // regardless of what the VTX was doing before. This isn't
-                        // specific to the VTX_CONFIG payload itself -- what actually
-                        // matters is that vtx_apply_hw() runs at all, which
-                        // unconditionally calls rf_pa_apply_level(NULL) as its very
-                        // first step, and THAT clears g_calibration_override
-                        // regardless of pitmode. A prior session's sweep can leave
-                        // that flag set (it suspends the closed loop so a manual mV
-                        // override holds still -- see rf_pa_set_calibration() in the
-                        // firmware), and if left set across a reconnect, a fresh
-                        // session inherits a VTX that's not running its normal
-                        // closed loop. This guarantees a known-clean starting point
-                        // every time, independent of how the previous session ended.
-                        if let Some(link) = vtx.as_mut() {
-                            let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
-                            match link.send_v1(function::VTX_CONFIG as u8, &payload) {
-                                Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
-                                Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
+                                    // Push a pitmode-safe VTX_CONFIG immediately on connect,
+                                    // regardless of what the VTX was doing before. This isn't
+                                    // specific to the VTX_CONFIG payload itself -- what actually
+                                    // matters is that vtx_apply_hw() runs at all, which
+                                    // unconditionally calls rf_pa_apply_level(NULL) as its very
+                                    // first step, and THAT clears g_calibration_override
+                                    // regardless of pitmode. A prior session's sweep can leave
+                                    // that flag set (it suspends the closed loop so a manual mV
+                                    // override holds still -- see rf_pa_set_calibration() in the
+                                    // firmware), and if left set across a reconnect, a fresh
+                                    // session inherits a VTX that's not running its normal
+                                    // closed loop. This guarantees a known-clean starting point
+                                    // every time, independent of how the previous session ended.
+                                    if let Some(link) = vtx.as_mut() {
+                                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                                        match link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                            Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
+                                            Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(target: "vtx", "open failed: {e}");
+                                    state.lock().unwrap().vtx_port_state = PortState::Disconnected;
+                                }
                             }
                         }
                     }
 
-                    Command::Disconnect => {
-                        vtx = None;
-                        meter = None;
-                        vtx_last_seen = None;
-                        meter_last_seen = None;
-                        debug!(target: "vtx", "disconnected");
-                        debug!(target: "meter", "disconnected");
-                        let mut s = state.lock().unwrap();
-                        s.connected = false;
-                        s.vtx_ready = false;
-                        s.meter_ready = false;
-                        drop(s);
-                        *sweep.lock().unwrap() = None;
+                    Command::DisconnectVtx => {
+                        if vtx.is_none() {
+                            debug!(target: "vtx", "DisconnectVtx requested but not connected -- ignoring");
+                        } else {
+                            state.lock().unwrap().vtx_port_state = PortState::Disconnecting;
+                            ctx.request_repaint();
+                            vtx = None;
+                            vtx_last_seen = None;
+                            debug!(target: "vtx", "disconnected");
+                            let mut s = state.lock().unwrap();
+                            s.vtx_port_state = PortState::Disconnected;
+                            s.vtx_ready = false;
+                            drop(s);
+                            *sweep.lock().unwrap() = None;
+                        }
+                    }
+
+                    Command::ConnectMeter { port, meter_kind } => {
+                        if meter.is_some() {
+                            debug!(target: "meter", "ConnectMeter requested but already connected -- ignoring");
+                        } else {
+                            {
+                                let mut s = state.lock().unwrap();
+                                s.meter_port_state = PortState::Connecting;
+                                s.meter_kind = meter_kind;
+                                s.update_hz = s.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
+                                s.power_history.clear();
+                            }
+                            ctx.request_repaint();
+                            match PowerMeter::open(meter_kind, &port) {
+                                Ok(m) => {
+                                    debug!(target: "meter", "opened {port} ({})", meter_kind.name());
+                                    meter = Some(m);
+                                    meter_last_seen = None;
+                                    state.lock().unwrap().meter_port_state = PortState::Ready;
+                                    last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
+                                    last_meter_alive_check = Instant::now() - Duration::from_secs(1); // force an immediate first alive-check
+                                }
+                                Err(e) => {
+                                    error!(target: "meter", "open failed: {e}");
+                                    state.lock().unwrap().meter_port_state = PortState::Disconnected;
+                                }
+                            }
+                        }
+                    }
+
+                    Command::DisconnectMeter => {
+                        if meter.is_none() {
+                            debug!(target: "meter", "DisconnectMeter requested but not connected -- ignoring");
+                        } else {
+                            state.lock().unwrap().meter_port_state = PortState::Disconnecting;
+                            ctx.request_repaint();
+                            meter = None;
+                            meter_last_seen = None;
+                            debug!(target: "meter", "disconnected");
+                            state.lock().unwrap().meter_port_state = PortState::Disconnected;
+                        }
                     }
 
                     Command::RefreshCalTable => {
@@ -278,8 +320,9 @@ pub fn spawn(
                     }
 
                     Command::StartSweep { levels, tolerance_pct } => {
-                        if vtx.is_none() {
-                            error!(target: "vtx", "StartSweep requested while disconnected");
+                        if vtx.is_none() || meter.is_none() {
+                            error!(target: "vtx", "StartSweep requested while not fully connected (vtx={} meter={})",
+                                vtx.is_some(), meter.is_some());
                         } else {
                             let (pa_table, meter_kind, prev_update_hz) = {
                                 let s = state.lock().unwrap();
@@ -427,7 +470,7 @@ pub fn spawn(
                 vtx = None;
                 vtx_last_seen = None;
                 let mut s = state.lock().unwrap();
-                s.connected = false;
+                s.vtx_port_state = PortState::Disconnected;
                 s.vtx_ready = false;
                 drop(s);
                 *sweep.lock().unwrap() = None;
@@ -493,7 +536,7 @@ pub fn spawn(
             }
 
             // Power meter reading, rate-limited to the configured Hz
-            // (clamped to the connected meter's max -- see Command::Connect
+            // (clamped to the connected meter's max -- see Command::ConnectMeter
             // and pages/calibration.rs's dropdown). Outer loop tick is
             // 10ms so higher Hz settings (e.g. 20Hz = 50ms interval) are
             // actually achievable, not just theoretically requested. This
@@ -562,10 +605,18 @@ pub fn spawn(
             if meter_link_lost {
                 meter = None;
                 meter_last_seen = None;
-            }
-            let meter_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
-            if meter.is_some() || meter_link_lost {
-                state.lock().unwrap().meter_ready = meter_ready;
+                state.lock().unwrap().meter_port_state = PortState::Disconnected;
+            } else if meter.is_some() {
+                let is_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
+                let mut s = state.lock().unwrap();
+                if is_ready && s.meter_port_state != PortState::Ready {
+                    s.meter_port_state = PortState::Ready;
+                }
+                // Deliberately NOT downgrading meter_port_state on a
+                // stale heartbeat here -- see conn_status.rs's module doc
+                // for why PortState shouldn't flicker on an ordinary gap;
+                // only a hard I/O error (meter_link_lost above) should
+                // move it back to Disconnected.
             }
 
             std::thread::sleep(Duration::from_millis(10));

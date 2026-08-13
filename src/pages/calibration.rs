@@ -488,11 +488,22 @@ pub fn show(
             }
         } else {
             let any_checked = page.checked.values().any(|&v| v);
-            ui.add_enabled_ui(any_checked, |ui| {
+            let overall_ready = {
+                let s = shared.lock().unwrap();
+                conn_status::OverallState::from_ports(s.vtx_port_state, s.meter_port_state) == conn_status::OverallState::Ready
+            };
+            ui.add_enabled_ui(any_checked && overall_ready, |ui| {
                 if ui.button("Re-calibrate").clicked() {
                     page.show_confirm_dialog = true;
                 }
             });
+            if any_checked && !overall_ready {
+                ui.label(
+                    egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
+                        .weak()
+                        .italics(),
+                );
+            }
         }
     });
 

@@ -89,9 +89,9 @@ fn main() -> eframe::Result<()> {
             worker::spawn(state.clone(), vtx_table.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
 
             if auto_connect {
-                let _ = cmd_tx.send(worker::Command::Connect {
-                    vtx_port: initial_settings.vtx_port.clone(),
-                    meter_port: initial_settings.meter_port.clone(),
+                let _ = cmd_tx.send(worker::Command::ConnectVtx { port: initial_settings.vtx_port.clone() });
+                let _ = cmd_tx.send(worker::Command::ConnectMeter {
+                    port: initial_settings.meter_port.clone(),
                     meter_kind: initial_meter_kind,
                 });
             }
