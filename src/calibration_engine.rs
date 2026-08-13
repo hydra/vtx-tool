@@ -68,6 +68,7 @@ pub enum LevelStatus {
     InProgress(String), // pre-formatted "ScanPa/coarse @5800MHz vbias_mv=2900"
     Done,
     Aborted,
+    Skipped,
 }
 
 /// Status of one (level, frequency) cell in the calibration/detector
@@ -94,6 +95,10 @@ pub enum CellStatus {
     /// (or the physical DAC range) made the target unreachable, or a
     /// search got pinned without ever reaching the tolerance band.
     Uncalibrated,
+    /// User deliberately skipped this point (see SweepEngine::skip_current)
+    /// -- distinct from Uncalibrated, which means a search actually ran
+    /// and failed to converge; this means no search ran at all.
+    Skipped,
 }
 
 /// Tracks "wait for `needed` new power readings since this was created".
@@ -491,15 +496,60 @@ impl SweepEngine {
         self.step = None;
     }
 
-    pub fn skip_frequency(&mut self) {
+    /// Skips whatever (level, freq) point is currently in progress and
+    /// advances to wherever normal progression would go next -- the next
+    /// level at this same frequency, or the next frequency if this was
+    /// the last selected level, exactly as if this point had finished
+    /// normally (just marked Skipped instead of Calibrated/Uncalibrated).
+    ///
+    /// Named (and previously behaved) as "skip_frequency", but it never
+    /// actually skipped just a frequency: it unconditionally incremented
+    /// freq_idx regardless of whether other selected levels still had
+    /// work left at the CURRENT frequency (silently skipping all of
+    /// those too, not just the one point asked for), with no bounds
+    /// check against frequencies.len() -- which panicked outright on an
+    /// out-of-bounds index the next time poll() indexed
+    /// self.frequencies[self.freq_idx], if already on the last
+    /// frequency. Fixed here by only ever touching level_idx (mirroring
+    /// exactly what finish_scan_detector does on normal completion) and
+    /// letting poll()'s own "if level_idx >= levels.len()" check --
+    /// which already correctly advances freq_idx with proper bounds
+    /// checking, transitioning to Idle rather than panicking when the
+    /// sweep is genuinely done -- handle the rollover, rather than
+    /// duplicating (and getting wrong) that logic here.
+    pub fn skip_current(&mut self) {
         if !matches!(self.state, EngineState::Running) {
             return;
         }
+        let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
+        debug!(target: "vtx", "[sweep] skipped level={level} freq_idx={} ({}/{} steps completed)",
+            self.freq_idx, self.completed_steps, self.total_steps);
 
-        debug!(target: "vtx", "[sweep] skipped frequency at level={:?} freq_idx={} ({}/{} steps completed)",
-                self.levels.get(self.level_idx), self.freq_idx, self.completed_steps, self.total_steps);
-        self.freq_idx += 1;
+        // Mark whichever cell(s) were still outstanding for this point.
+        // Mid-ScanPa: neither op for this point ever ran, so both the
+        // VBIAS cell (never converged) and the Detector cell (never even
+        // started) get marked, and both count toward completed_steps
+        // below. Mid-ScanDetector: ScanPa already finished normally
+        // (finish_scan_pa already counted its own completed_steps and
+        // set the VBIAS cell's real outcome) -- only the Detector cell
+        // and its one remaining op need accounting for here.
+        let skipped_ops = match &self.step {
+            Some(StepState::Pa(_)) => {
+                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                2
+            }
+            Some(StepState::Detector(_)) => {
+                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                1
+            }
+            None => 0,
+        };
+        self.completed_steps += skipped_ops;
+
         self.step = None;
+        self.level_idx += 1;
+        self.per_level_status.insert(level, LevelStatus::Skipped);
     }
 
     pub fn is_active(&self) -> bool {

@@ -75,6 +75,7 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
         CellStatus::Current => Some(egui::Color32::from_rgb(45, 70, 100)),      // muted blue
         CellStatus::LimitHit => Some(egui::Color32::from_rgb(100, 45, 45)),     // muted red
         CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
+        CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),       // neutral grey -- deliberate, not a failure
     }
 }
 
@@ -266,6 +267,7 @@ fn status_text(status: Option<&LevelStatus>) -> String {
         Some(LevelStatus::InProgress(s)) => s.clone(),
         Some(LevelStatus::Done) => "Done".to_string(),
         Some(LevelStatus::Aborted) => "Aborted".to_string(),
+        Some(LevelStatus::Skipped) => "Skipped".to_string(),
     }
 }
 
@@ -548,7 +550,7 @@ pub fn show(
                 let _ = cmd_tx.send(Command::AbortSweep);
             }
             if ui.button("Skip >").clicked() {
-                let _ = cmd_tx.send(Command::SkipFrequency);
+                let _ = cmd_tx.send(Command::SkipCurrent);
             }
         } else {
             let any_checked = page.checked.values().any(|&v| v);

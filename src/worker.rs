@@ -153,8 +153,10 @@ pub enum Command {
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
     /// state (see calibration_engine::safe_state_payload).
     AbortSweep,
-    /// Skip the current frequency and move on to the next one, if any.
-    SkipFrequency,
+    /// Skip whatever (level, freq) point is currently in progress and
+    /// move on to whatever's next in normal progression order (see
+    /// SweepEngine::skip_current).
+    SkipCurrent,
     /// Pushes the working pa_table's calibration[]/detector[] for every
     /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
     /// of SaveEeprom -- this only updates the VTX's RAM copy.
@@ -416,9 +418,9 @@ pub fn spawn(
                             s.update_hz = prev;
                         }
                     }
-                    Command::SkipFrequency => {
+                    Command::SkipCurrent => {
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
-                            engine.skip_frequency();
+                            engine.skip_current();
                         }
                     }
 
