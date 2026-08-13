@@ -54,6 +54,15 @@ struct Args {
     #[arg(long, value_parser = power_meter::parse_cli)]
     meter_kind: Option<PowerMeterKind>,
 
+    /// Power meter attenuation correction in dB, added to every reading
+    /// received from the meter (e.g. if you've fitted an external 30dB
+    /// attenuator ahead of the meter, its display already accounts for
+    /// that, but the raw serial readings the meter reports don't -- this
+    /// corrects for the difference). If omitted, uses whatever's saved
+    /// in settings.json (default 30dB if that's never been set either).
+    #[arg(long)]
+    attenuation: Option<f32>,
+
     /// Minimum log level to record (error, warn, info, debug, trace)
     #[arg(long, default_value = "debug")]
     log_level: LevelFilter,
@@ -71,10 +80,17 @@ fn main() -> eframe::Result<()> {
     if let Some(p) = &args.meter_port {
         initial_settings.meter_port = p.clone();
     }
-    let initial_meter_kind = args.meter_kind.unwrap_or_default();
+    if let Some(k) = args.meter_kind {
+        initial_settings.meter_kind = k;
+    }
+    if let Some(a) = args.attenuation {
+        initial_settings.attenuation_db = a;
+    }
+    let initial_meter_kind = initial_settings.meter_kind;
 
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
     state.lock().unwrap().meter_kind = initial_meter_kind;
+    state.lock().unwrap().attenuation_db = initial_settings.attenuation_db;
     let vtx_table = Arc::new(Mutex::new(VtxTableConfig::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();

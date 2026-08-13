@@ -174,19 +174,40 @@ enum StepState {
     Detector(ScanDetectorState),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLossReason {
+    /// The VTX itself went quiet -- most likely explanation is a
+    /// current-limited supply tripping and power-cycling it. This is
+    /// the only case where resuming sets a hard mV limit (see
+    /// try_auto_resume): mv_at_loss is only meaningful evidence of a
+    /// dangerous DAC value when the VTX itself is what stopped
+    /// responding, not when it's the meter that dropped out.
+    Vtx,
+    /// The power meter's connection was lost or disconnected -- the VTX
+    /// itself may be fine.
+    Meter,
+    Both,
+}
+
 #[derive(Clone, Copy)]
 pub enum EngineState {
     Idle,
     AwaitingFreqConfirm { freq_mhz: u16 },
     Running,
-    /// No traffic at all from the VTX for longer than a sweep in
-    /// progress should ever go quiet -- most likely explanation is a
-    /// current-limited supply tripping and power-cycling the VTX.
-    /// Paused here (not aborted) so the user can power it back on and
-    /// continue; captures where things were when it happened so
-    /// resume_after_recovery() can back off to a safe point and set a
-    /// hard ceiling on `level` for the rest of the sweep.
-    VtxUnresponsive { level: u8, freq_mhz: u16, mv_at_loss: i32 },
+    /// No traffic from the VTX, or the power meter's connection lost/
+    /// disconnected, for longer than a sweep in progress should ever go
+    /// quiet. Paused here (not aborted) -- auto-resumes on its own once
+    /// both are responsive again (see try_auto_resume in poll()), no
+    /// user action needed beyond an optional Abort. Captures where
+    /// things were when it happened so a genuine VTX trip (reason
+    /// includes Vtx) can back off to a safe point and set a hard
+    /// ceiling on `level` for the rest of the sweep.
+    ConnectionLost {
+        level: u8,
+        freq_mhz: u16,
+        mv_at_loss: i32,
+        reason: ConnectionLossReason,
+    },
 }
 
 /// One (level, frequency) result as it's produced -- applied to the
@@ -248,26 +269,26 @@ pub struct SweepEngine {
     pub pending_meter_frequency: Option<u32>,
 
     /// Per-level mV ceiling discovered when the VTX went unresponsive
-    /// mid-scan (see EngineState::VtxUnresponsive / resume_after_recovery).
+    /// mid-scan (see EngineState::ConnectionLost / auto_resume).
     /// pub so the UI can show it in a table column; cleared by
     /// clear_hard_limits() when the PA table is Refreshed.
     pub hard_limits: HashMap<u8, i32>,
-    /// First time this poll() saw the VTX go quiet while Running, or
-    /// None if it's currently responsive. A SUSTAINED silence (not a
-    /// single missed tick) is what actually triggers VtxUnresponsive --
-    /// see HEARTBEAT_TIMEOUT.
+    /// First time this poll() saw the VTX and/or meter go quiet while
+    /// Running, or None if both are currently responsive. A SUSTAINED
+    /// silence (not a single missed tick) is what actually triggers
+    /// ConnectionLost -- see HEARTBEAT_TIMEOUT.
     unresponsive_since: Option<Instant>,
 }
 
-/// How long the VTX can go completely silent while a sweep is Running
-/// before it's treated as having lost power.
+/// How long the VTX (or meter) can go completely silent while a sweep is
+/// Running before it's treated as a lost connection.
 ///
 /// TUNED DOWN from an initial 2s: the actual failure mode observed was
 /// that during the detection window, the sweep kept stepping mV further
 /// in the "more power" direction, because once the VTX dies the RF
 /// signal disappears and the power meter reads near-zero -- which the
 /// algorithm reads as "need more power, keep pushing" rather than "the
-/// device is gone". By the time VtxUnresponsive fired, mv_at_loss could
+/// device is gone". By the time ConnectionLost fired, mv_at_loss could
 /// already be well past the actual trip point, so backing off a small
 /// margin from THAT point wasn't actually safe -- the reported "sets a
 /// limit, trips again, sets a new limit" cycle is exactly what that
@@ -440,10 +461,12 @@ impl SweepEngine {
     /// reading arrived" instead of history.len() (see SampleWait's doc
     /// comment for why that distinction matters); `latest_reading` is
     /// the most recent decoded MSP_PACALIBRATION response, if one
-    /// arrived this tick; `vtx_ready` is SharedState::vtx_ready -- true
-    /// if ANY frame (not just ones addressed to the sweep) has been seen
-    /// from the VTX recently, used to detect a current-limited supply
-    /// power-cycling it mid-sweep.
+    /// arrived this tick; `vtx_ready`/`meter_ready` are
+    /// SharedState::vtx_ready and the equivalent fast heartbeat for the
+    /// meter -- true if either has been heard from recently. Losing
+    /// EITHER pauses the sweep in ConnectionLost, which this function
+    /// also auto-resumes from once both recover, without any external
+    /// "Continue" command.
     pub fn poll(
         &mut self,
         link: &mut MspLink,
@@ -451,12 +474,20 @@ impl SweepEngine {
         reading_seq: u64,
         latest_reading: Option<msp::PaCalibrationReading>,
         vtx_ready: bool,
+        meter_ready: bool,
     ) -> anyhow::Result<()> {
+        if let EngineState::ConnectionLost { level, freq_mhz, mv_at_loss, reason } = self.state {
+            if vtx_ready && meter_ready {
+                self.auto_resume(level, freq_mhz, mv_at_loss, reason);
+            }
+            return Ok(());
+        }
+
         if !matches!(self.state, EngineState::Running) {
             return Ok(());
         }
 
-        if vtx_ready {
+        if vtx_ready && meter_ready {
             self.unresponsive_since = None;
         } else {
             let since = *self.unresponsive_since.get_or_insert_with(Instant::now);
@@ -468,18 +499,30 @@ impl SweepEngine {
                 };
                 let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
                 let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
-                debug!(target: "vtx", "[sweep] no response from VTX for {:?} -- pausing (level={level} freq={freq_mhz}MHz mv={mv_at_loss}), likely a power-limited supply tripping",
+                let reason = match (vtx_ready, meter_ready) {
+                    (false, false) => ConnectionLossReason::Both,
+                    (false, true) => ConnectionLossReason::Vtx,
+                    (true, false) => ConnectionLossReason::Meter,
+                    (true, true) => unreachable!("loop body only reached when at least one is false"),
+                };
+                debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz mv={mv_at_loss})",
                     since.elapsed());
-                match &self.step {
-                    Some(StepState::Pa(_)) => {
-                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                // Only mark the cell as the trip point (red, sticky) when
+                // the VTX itself was actually involved -- a pure meter
+                // dropout says nothing about whether this mV value was
+                // dangerous, so marking it here would be misleading.
+                if !matches!(reason, ConnectionLossReason::Meter) {
+                    match &self.step {
+                        Some(StepState::Pa(_)) => {
+                            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                        }
+                        Some(StepState::Detector(_)) => {
+                            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                        }
+                        None => {}
                     }
-                    Some(StepState::Detector(_)) => {
-                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
-                    }
-                    None => {}
                 }
-                self.state = EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss };
+                self.state = EngineState::ConnectionLost { level, freq_mhz, mv_at_loss, reason };
                 return Ok(());
             }
         }
@@ -792,8 +835,7 @@ impl SweepEngine {
 
     /// (min_mv, max_mv) for `level` -- the full 0..=3300 DAC range,
     /// narrowed on whichever side is "more power" if a hard limit was
-    /// set for this level (see EngineState::VtxUnresponsive /
-    /// resume_after_recovery).
+    /// set for this level (see EngineState::ConnectionLost / auto_resume).
     fn effective_bounds(&self, level: u8) -> (i32, i32) {
         let up = power_up_step(self.sign_inverted);
         let (mut lo, mut hi) = (0i32, 3300i32);
@@ -807,20 +849,24 @@ impl SweepEngine {
         (lo, hi)
     }
 
-    /// Called after the user confirms the VTX is back (SharedState::vtx_ready
-    /// true) and clicks Continue. Sets a hard limit for the level that was
-    /// active when the VTX went quiet -- backed off HEARTBEAT_BACKOFF_MV
-    /// from the trip point, in the safe (less power) direction -- backs
-    /// the in-progress step off to that same safe point (continuing right
-    /// at the trip point would just trip it again), and re-pushes the
-    /// current frequency, since the VTX's own reboot means it needs
-    /// retuning and level reselection from scratch.
-    pub fn resume_after_recovery(&mut self) {
-        if let EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } = self.state {
+    /// Called by poll() once both vtx_ready and meter_ready are true
+    /// again while in ConnectionLost -- no external "Continue" command
+    /// needed. Only when the VTX itself was actually involved (reason is
+    /// Vtx or Both) does this set a hard limit and back the in-progress
+    /// step's mV off to a safe point (backed off HEARTBEAT_BACKOFF_MV
+    /// from the trip point, in the safe/less-power direction) -- a pure
+    /// meter dropout says nothing about whether the mV value itself was
+    /// dangerous, so that case just resumes as-is. Either way, re-pushes
+    /// the frequency: harmless if the VTX never actually lost power, and
+    /// necessary if it did (a reboot needs retuning and level reselection
+    /// from scratch).
+    fn auto_resume(&mut self, level: u8, freq_mhz: u16, mv_at_loss: i32, reason: ConnectionLossReason) {
+        debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz");
+        if matches!(reason, ConnectionLossReason::Vtx | ConnectionLossReason::Both) {
             let up = power_up_step(self.sign_inverted);
             let safe_mv = (mv_at_loss - up * HEARTBEAT_BACKOFF_MV).clamp(0, 3300);
             self.hard_limits.insert(level, safe_mv);
-            debug!(target: "vtx", "[sweep] resuming after VTX recovery: level={level} freq={freq_mhz}MHz, hard limit set to {safe_mv}mV (backed off {HEARTBEAT_BACKOFF_MV}mV from trip point {mv_at_loss}mV)");
+            debug!(target: "vtx", "[sweep] hard limit set to {safe_mv}mV (backed off {HEARTBEAT_BACKOFF_MV}mV from trip point {mv_at_loss}mV)");
             match &mut self.step {
                 Some(StepState::Pa(st)) => {
                     st.mv = safe_mv;
@@ -832,10 +878,48 @@ impl SweepEngine {
                 }
                 None => {}
             }
-            self.unresponsive_since = None;
-            self.state = EngineState::Running;
-            self.pending_frequency_push = Some(freq_mhz);
+        } else {
+            debug!(target: "vtx", "[sweep] meter-only dropout -- resuming without changing mV or setting a hard limit");
         }
+        self.unresponsive_since = None;
+        self.state = EngineState::Running;
+        self.pending_frequency_push = Some(freq_mhz);
+    }
+
+    /// For the one case poll()'s own heartbeat-based detection can't
+    /// reach: a hard I/O error on the VTX link drops it to None in
+    /// worker.rs, and poll() is only ever called with a live
+    /// `&mut MspLink` -- so without this, the engine's state would just
+    /// freeze at Running forever (poll() never called again to notice
+    /// anything), never surfacing the "Connection error" dialog for a
+    /// scenario that's just as real as the heartbeat-timeout one poll()
+    /// does catch. Only meaningful while actively Running (silently a
+    /// no-op otherwise -- e.g. already paused, or not sweeping at all).
+    pub fn force_connection_lost(&mut self, reason: ConnectionLossReason) {
+        if !matches!(self.state, EngineState::Running) {
+            return;
+        }
+        let mv_at_loss = match &self.step {
+            Some(StepState::Pa(st)) => st.mv,
+            Some(StepState::Detector(st)) => st.mv,
+            None => 0,
+        };
+        let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
+        let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
+        debug!(target: "vtx", "[sweep] connection forcibly lost ({reason:?}): level={level} freq={freq_mhz}MHz mv={mv_at_loss}");
+        if !matches!(reason, ConnectionLossReason::Meter) {
+            match &self.step {
+                Some(StepState::Pa(_)) => {
+                    Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                }
+                Some(StepState::Detector(_)) => {
+                    Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                }
+                None => {}
+            }
+        }
+        self.unresponsive_since = None;
+        self.state = EngineState::ConnectionLost { level, freq_mhz, mv_at_loss, reason };
     }
 
     /// Discards any hard limits discovered so far -- called when the PA

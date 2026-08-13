@@ -252,6 +252,10 @@ impl eframe::App for App {
                                     let mut s = self.state.lock().unwrap();
                                     s.meter_kind = kind;
                                     s.update_hz = s.update_hz.min(kind.max_update_hz() as f64);
+                                    drop(s);
+                                    let mut settings = AppSettings::load();
+                                    settings.meter_kind = kind;
+                                    let _ = settings.save(); // best-effort -- same pattern as the port fields
                                 }
                             }
                         });

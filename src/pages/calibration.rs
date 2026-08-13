@@ -8,6 +8,7 @@ use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::msp;
 use crate::power_meter::{nearest_band, FrequencyCapability};
+use crate::settings::AppSettings;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -304,6 +305,22 @@ pub fn show(
                 }
             });
         shared.lock().unwrap().update_hz = hz;
+
+        ui.separator();
+        ui.label("Attenuation:");
+        let mut atten_db = shared.lock().unwrap().attenuation_db;
+        // Added to every raw reading from the meter (see worker.rs) --
+        // e.g. an external attenuator fitted ahead of the meter that its
+        // own display already accounts for but the raw serial readings
+        // don't. Range allows negative too, for the inverse case (a
+        // pre-amp ahead of the meter rather than an attenuator).
+        let response = ui.add(egui::DragValue::new(&mut atten_db).suffix(" dB").range(-50.0..=100.0).speed(0.1));
+        if response.changed() {
+            shared.lock().unwrap().attenuation_db = atten_db;
+            let mut settings = AppSettings::load();
+            settings.attenuation_db = atten_db;
+            let _ = settings.save(); // best-effort -- same pattern as the port fields
+        }
     });
 
     ui.separator();
@@ -344,42 +361,47 @@ pub fn show(
             });
     }
 
-    // ---- VTX-unresponsive gate (current-limited supply power-cycled it) --
-    let unresponsive = {
+    // ---- Connection error gate (VTX and/or meter lost communication) ----
+    let connection_lost = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match e.state {
-            calibration_engine::EngineState::VtxUnresponsive { level, freq_mhz, mv_at_loss } => {
-                Some((level, freq_mhz, mv_at_loss))
+            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, mv_at_loss, reason } => {
+                Some((level, freq_mhz, mv_at_loss, reason))
             }
             _ => None,
         })
     };
-    if let Some((level, freq_mhz, mv_at_loss)) = unresponsive {
-        let vtx_ready = shared.lock().unwrap().vtx_ready;
-        egui::Window::new("VTX not responding")
+    if let Some((level, freq_mhz, mv_at_loss, reason)) = connection_lost {
+        let (vtx_state, meter_state) = {
+            let s = shared.lock().unwrap();
+            (s.vtx_port_state, s.meter_port_state)
+        };
+        egui::Window::new("Connection error")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
+                let cause = match reason {
+                    calibration_engine::ConnectionLossReason::Vtx => "the VTX",
+                    calibration_engine::ConnectionLossReason::Meter => "the power meter",
+                    calibration_engine::ConnectionLossReason::Both => "the VTX and the power meter",
+                };
                 ui.label(format!(
-                    "No response from the VTX while calibrating level {level} at {freq_mhz}MHz (mv={mv_at_loss}). \
-                     If it's on a current-limited supply, it may have powered off."
+                    "Lost communication with {cause} while calibrating level {level} at {freq_mhz}MHz (mv={mv_at_loss}). \
+                     If the VTX is on a current-limited supply, it may have powered off."
                 ));
-                ui.label("Please power the VTX back on.");
+                ui.label("Reconnecting automatically -- resumes on its own once both are Ready again.");
                 ui.horizontal(|ui| {
-                    ui.label("Connection status:");
-                    conn_status::show(ui, Some(conn_status::ConnStatus::from_ready(vtx_ready)));
+                    ui.label("VTX:");
+                    conn_status::show_port(ui, vtx_state);
                 });
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(vtx_ready, |ui| {
-                        if ui.button("Continue").clicked() {
-                            let _ = cmd_tx.send(Command::ResumeAfterVtxRecovery);
-                        }
-                    });
-                    if ui.button("Abort").clicked() {
-                        let _ = cmd_tx.send(Command::AbortSweep);
-                    }
+                    ui.label("Power Meter:");
+                    conn_status::show_port(ui, meter_state);
                 });
+                if ui.button("Abort").clicked() {
+                    let _ = cmd_tx.send(Command::AbortSweep);
+                }
             });
     }
 

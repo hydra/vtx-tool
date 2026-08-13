@@ -52,6 +52,13 @@ pub struct SharedState {
     /// calibration page's update-rate dropdown can clamp its options to
     /// this kind's max_update_hz() right away.
     pub meter_kind: PowerMeterKind,
+    /// Correction applied (added) to every raw dBm reading before it's
+    /// stored or converted to mW -- e.g. an external attenuator fitted
+    /// ahead of the meter that its own display already accounts for but
+    /// the raw serial readings don't. Set via the calibration page's
+    /// slider; defaults from AppSettings::attenuation_db (see main.rs)
+    /// and is persisted back there whenever the user changes it.
+    pub attenuation_db: f32,
     /// User-configured polling rate, clamped to meter_kind.max_update_hz()
     /// wherever it's set (see pages/calibration.rs). f64 rather than an
     /// integer Hz -- the dropdown includes fractional rates (0.5Hz).
@@ -87,6 +94,11 @@ pub struct SharedState {
 /// alive-check runs every 100ms too, so this has real margin without
 /// being slow to notice a genuine loss.
 const READY_WINDOW: Duration = Duration::from_millis(500);
+/// How often to retry reopening a port whose handle was dropped after a
+/// hard I/O error while in PortState::LostCommunication (e.g. the device
+/// was unplugged) -- frequent enough to reconnect promptly once it's
+/// plugged back in, without hammering the OS.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Default for SharedState {
     fn default() -> Self {
@@ -96,6 +108,7 @@ impl Default for SharedState {
             power_history: VecDeque::new(),
             reading_seq: 0,
             meter_kind: PowerMeterKind::default(),
+            attenuation_db: 30.0, // matches settings.rs's default_attenuation_db(); main.rs overwrites this from AppSettings right after construction
             update_hz: 1.0, // conservative default; ImmersionRC V1's own max is now 5Hz, so this leaves headroom below it and stays valid for any future slower-max meter too
             pre_sweep_update_hz: None,
             vtx_config: None,
@@ -140,11 +153,6 @@ pub enum Command {
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
     /// state (see calibration_engine::safe_state_payload).
     AbortSweep,
-    /// User clicked Continue on the "VTX not responding" dialog after
-    /// SharedState::vtx_ready came back true -- resumes the sweep,
-    /// setting a hard limit on the level that was active when it
-    /// happened (see calibration_engine::SweepEngine::resume_after_recovery).
-    ResumeAfterVtxRecovery,
     /// Pushes the working pa_table's calibration[]/detector[] for every
     /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
     /// of SaveEeprom -- this only updates the VTX's RAM copy.
@@ -169,6 +177,14 @@ pub fn spawn(
         let mut vtx_last_seen: Option<Instant> = None;
         let mut meter_last_seen: Option<Instant> = None; // updated on any successful reply (V check or D read)
         let mut last_meter_alive_check = Instant::now(); // when the "V" presence-check last ran, for its own 100ms retry cadence
+        // Remembered only across a successful connect -> cleared on an
+        // explicit Disconnect, so LostCommunication's periodic reopen
+        // (below) only ever fires for a port that was actually working
+        // and lost it, never for one the user deliberately closed.
+        let mut vtx_port_path: Option<String> = None;
+        let mut meter_port_path: Option<String> = None;
+        let mut vtx_last_reconnect_attempt = Instant::now();
+        let mut meter_last_reconnect_attempt = Instant::now();
 
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -184,6 +200,7 @@ pub fn spawn(
                                     debug!(target: "vtx", "opened {port}");
                                     vtx = Some(l);
                                     vtx_last_seen = None;
+                                    vtx_port_path = Some(port.clone());
                                     state.lock().unwrap().vtx_port_state = PortState::Ready;
 
                                     // Push a pitmode-safe VTX_CONFIG immediately on connect,
@@ -223,6 +240,7 @@ pub fn spawn(
                             ctx.request_repaint();
                             vtx = None;
                             vtx_last_seen = None;
+                            vtx_port_path = None;
                             debug!(target: "vtx", "disconnected");
                             let mut s = state.lock().unwrap();
                             s.vtx_port_state = PortState::Disconnected;
@@ -249,6 +267,7 @@ pub fn spawn(
                                     debug!(target: "meter", "opened {port} ({})", meter_kind.name());
                                     meter = Some(m);
                                     meter_last_seen = None;
+                                    meter_port_path = Some(port.clone());
                                     state.lock().unwrap().meter_port_state = PortState::Ready;
                                     last_meter_read = Instant::now() - Duration::from_secs(1); // force an immediate first read
                                     last_meter_alive_check = Instant::now() - Duration::from_secs(1); // force an immediate first alive-check
@@ -269,6 +288,7 @@ pub fn spawn(
                             ctx.request_repaint();
                             meter = None;
                             meter_last_seen = None;
+                            meter_port_path = None;
                             debug!(target: "meter", "disconnected");
                             state.lock().unwrap().meter_port_state = PortState::Disconnected;
                         }
@@ -320,9 +340,13 @@ pub fn spawn(
                     }
 
                     Command::StartSweep { levels, tolerance_pct } => {
-                        if vtx.is_none() || meter.is_none() {
-                            error!(target: "vtx", "StartSweep requested while not fully connected (vtx={} meter={})",
-                                vtx.is_some(), meter.is_some());
+                        let (vtx_state_now, meter_state_now) = {
+                            let s = state.lock().unwrap();
+                            (s.vtx_port_state, s.meter_port_state)
+                        };
+                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready {
+                            error!(target: "vtx", "StartSweep requested while not fully connected (vtx={:?} meter={:?})",
+                                vtx_state_now, meter_state_now);
                         } else {
                             let (pa_table, meter_kind, prev_update_hz) = {
                                 let s = state.lock().unwrap();
@@ -388,12 +412,6 @@ pub fn spawn(
                         let mut s = state.lock().unwrap();
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
                             s.update_hz = prev;
-                        }
-                    }
-
-                    Command::ResumeAfterVtxRecovery => {
-                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
-                            engine.resume_after_recovery();
                         }
                     }
 
@@ -470,17 +488,68 @@ pub fn spawn(
                 vtx = None;
                 vtx_last_seen = None;
                 let mut s = state.lock().unwrap();
-                s.vtx_port_state = PortState::Disconnected;
+                s.vtx_port_state = PortState::LostCommunication;
                 s.vtx_ready = false;
                 drop(s);
-                *sweep.lock().unwrap() = None;
+                if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                    engine.force_connection_lost(calibration_engine::ConnectionLossReason::Vtx);
+                }
             }
             let vtx_ready = vtx_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
             if vtx.is_some() {
-                state.lock().unwrap().vtx_ready = vtx_ready;
+                let mut s = state.lock().unwrap();
+                s.vtx_ready = vtx_ready;
+                if vtx_ready {
+                    if s.vtx_port_state != PortState::Ready {
+                        s.vtx_port_state = PortState::Ready;
+                    }
+                } else if s.vtx_port_state == PortState::Ready {
+                    // Handle still open, but no traffic in a while -- general
+                    // "lost communication" display. The sweep (if any) notices
+                    // this same staleness via vtx_ready in its own poll() and
+                    // pauses itself; this just keeps the left panel honest
+                    // outside of a sweep too. Auto-recovers to Ready above the
+                    // moment fresh traffic arrives, no reopen needed since the
+                    // handle was never actually broken.
+                    s.vtx_port_state = PortState::LostCommunication;
+                }
             }
 
-            // Advance the sweep by one step, if active.
+            // Periodic reopen while LostCommunication with the handle actually
+            // dropped (the hard-I/O-error case, e.g. device unplugged) --
+            // vtx_port_path is only ever Some after a successful connect and is
+            // cleared on an explicit Disconnect, so this never fires for a port
+            // that was never connected or was deliberately closed.
+            if vtx.is_none() {
+                if let Some(path) = vtx_port_path.clone() {
+                    let is_lost = state.lock().unwrap().vtx_port_state == PortState::LostCommunication;
+                    if is_lost && vtx_last_reconnect_attempt.elapsed() >= RECONNECT_INTERVAL {
+                        vtx_last_reconnect_attempt = Instant::now();
+                        match MspLink::open(&path, 115200) {
+                            Ok(l) => {
+                                debug!(target: "vtx", "reopened {path} after lost communication");
+                                vtx = Some(l);
+                                vtx_last_seen = None;
+                                state.lock().unwrap().vtx_port_state = PortState::Ready;
+                                if let Some(link) = vtx.as_mut() {
+                                    let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                                    if let Err(e) = link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                        error!(target: "vtx", "failed to push safe-state VTX_CONFIG after reconnect: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => debug!(target: "vtx", "reconnect attempt for {path} failed: {e}"),
+                        }
+                    }
+                }
+            }
+
+            // Advance the sweep by one step, if active. meter_ready here
+            // reflects meter_last_seen as of the meter section's last run
+            // (one tick stale at most, same as vtx_ready above) -- fine
+            // for this purpose, same as how vtx_ready is used immediately
+            // after being freshly computed earlier this same tick.
+            let meter_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
             if let Some(link) = vtx.as_mut() {
                 let (history_snapshot, reading_seq) = {
                     let s = state.lock().unwrap();
@@ -489,7 +558,7 @@ pub fn spawn(
                 let mut sweep_guard = sweep.lock().unwrap();
                 if let Some(engine) = sweep_guard.as_mut() {
                     let was_active = engine.is_active();
-                    if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready) {
+                    if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready, meter_ready) {
                         error!(target: "vtx", "sweep step failed: {e}");
                     }
                     if let Some(freq) = engine.pending_meter_frequency.take() {
@@ -551,9 +620,11 @@ pub fn spawn(
                 if last_meter_read.elapsed() >= interval {
                     last_meter_read = Instant::now();
                     match m.read_dbm(Duration::from_millis(300)) {
-                        Ok(dbm) => {
+                        Ok(raw_dbm) => {
+                            let attenuation_db = state.lock().unwrap().attenuation_db;
+                            let dbm = raw_dbm + attenuation_db;
                             let mw = 10f32.powf(dbm / 10.0);
-                            debug!(target: "meter", "{dbm:.2} dBm ({mw:.6} mW)");
+                            debug!(target: "meter", "{raw_dbm:.2} dBm raw, {dbm:.2} dBm corrected (+{attenuation_db:.1}dB) ({mw:.6} mW)");
                             let elapsed = start.elapsed().as_secs_f64();
                             let mut s = state.lock().unwrap();
                             s.last_dbm = Some(dbm);
@@ -605,18 +676,49 @@ pub fn spawn(
             if meter_link_lost {
                 meter = None;
                 meter_last_seen = None;
-                state.lock().unwrap().meter_port_state = PortState::Disconnected;
+                state.lock().unwrap().meter_port_state = PortState::LostCommunication;
+                if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                    engine.force_connection_lost(calibration_engine::ConnectionLossReason::Meter);
+                }
             } else if meter.is_some() {
                 let is_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
                 let mut s = state.lock().unwrap();
-                if is_ready && s.meter_port_state != PortState::Ready {
-                    s.meter_port_state = PortState::Ready;
+                if is_ready {
+                    if s.meter_port_state != PortState::Ready {
+                        s.meter_port_state = PortState::Ready;
+                    }
+                } else if s.meter_port_state == PortState::Ready {
+                    // Same reasoning as the VTX side above: handle still open,
+                    // just no traffic in a while -- shows as lost communication
+                    // and auto-recovers to Ready the moment traffic resumes, no
+                    // reopen needed since the handle itself was never broken.
+                    s.meter_port_state = PortState::LostCommunication;
                 }
-                // Deliberately NOT downgrading meter_port_state on a
-                // stale heartbeat here -- see conn_status.rs's module doc
-                // for why PortState shouldn't flicker on an ordinary gap;
-                // only a hard I/O error (meter_link_lost above) should
-                // move it back to Disconnected.
+            }
+
+            // Periodic reopen while LostCommunication with the handle actually
+            // dropped -- same reasoning as the VTX side above.
+            if meter.is_none() {
+                if let Some(path) = meter_port_path.clone() {
+                    let (is_lost, kind) = {
+                        let s = state.lock().unwrap();
+                        (s.meter_port_state == PortState::LostCommunication, s.meter_kind)
+                    };
+                    if is_lost && meter_last_reconnect_attempt.elapsed() >= RECONNECT_INTERVAL {
+                        meter_last_reconnect_attempt = Instant::now();
+                        match PowerMeter::open(kind, &path) {
+                            Ok(m) => {
+                                debug!(target: "meter", "reopened {path} after lost communication");
+                                meter = Some(m);
+                                meter_last_seen = None;
+                                state.lock().unwrap().meter_port_state = PortState::Ready;
+                                last_meter_read = Instant::now() - Duration::from_secs(1);
+                                last_meter_alive_check = Instant::now() - Duration::from_secs(1);
+                            }
+                            Err(e) => debug!(target: "meter", "reconnect attempt for {path} failed: {e}"),
+                        }
+                    }
+                }
             }
 
             std::thread::sleep(Duration::from_millis(10));
