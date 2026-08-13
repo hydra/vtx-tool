@@ -15,6 +15,7 @@ use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use egui_table::AutoSizeMode;
 
 /// Candidate update rates, always shown -- entries exceeding the
 /// connected meter's max_update_hz() are disabled (not hidden), so the
@@ -465,7 +466,21 @@ pub fn show(
     // truncating despite 7*55=385px of nominal span width) instead of
     // the table scrolling horizontally when content exceeds the viewport.
     let columns: Vec<egui_table::Column> =
-        COL_WIDTHS.iter().map(|&w| egui_table::Column::new(w).range(w..=w).resizable(false)).collect();
+        COL_WIDTHS.iter().enumerate().map(|(index, &w)| {
+
+            let last = index == COL_WIDTHS.len() - 1;
+
+            let range = if last {
+                w..=(w * 4.0)
+            } else {
+                w..=w
+            };
+
+            egui_table::Column::new(w)
+                .resizable(false)
+                .range(range)
+        })
+            .collect();
     let num_rows = delegate.entries.len() as f32;
     // egui_table::Table is built for virtualized scrolling of potentially
     // huge datasets, so its scroll region defaults to filling whatever
@@ -478,6 +493,7 @@ pub fn show(
     ui.allocate_ui(egui::vec2(ui.available_width(), table_height), |ui| {
         egui_table::Table::new()
             .id_salt("pa_table")
+            .auto_size_mode(AutoSizeMode::Always)
             .num_rows(delegate.entries.len() as u64)
             .columns(columns)
             .num_sticky_cols(0)
