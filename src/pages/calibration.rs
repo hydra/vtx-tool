@@ -7,6 +7,7 @@
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::msp;
+use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -322,12 +323,16 @@ pub fn show(
         })
     };
     if let Some(freq_mhz) = awaiting_freq_mhz {
+        let prompt_mhz = match shared.lock().unwrap().meter_kind.capability() {
+            FrequencyCapability::ManualBand { bands_mhz } => nearest_band(&bands_mhz, freq_mhz as u32),
+            _ => freq_mhz as u32,
+        };
         egui::Window::new("Set power meter frequency")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("Set your power meter to {freq_mhz} MHz, then continue."));
+                ui.label(format!("Set your power meter to {prompt_mhz} MHz, then continue."));
                 ui.horizontal(|ui| {
                     if ui.button("Confirm").clicked() {
                         let _ = cmd_tx.send(Command::ConfirmFrequency);
@@ -415,7 +420,13 @@ pub fn show(
         row_height: DATA_ROW_HEIGHT,
     };
 
-    let columns: Vec<egui_table::Column> = COL_WIDTHS.iter().map(|&w| egui_table::Column::new(w).resizable(true)).collect();
+    // range(w..=w) is the actual fix here, not resizable(false) alone --
+    // without an explicit range, columns were auto-shrinking to fit
+    // whatever width was available (confirmed by the group header text
+    // truncating despite 7*55=385px of nominal span width) instead of
+    // the table scrolling horizontally when content exceeds the viewport.
+    let columns: Vec<egui_table::Column> =
+        COL_WIDTHS.iter().map(|&w| egui_table::Column::new(w).range(w..=w).resizable(false)).collect();
     let num_rows = delegate.entries.len() as f32;
     // egui_table::Table is built for virtualized scrolling of potentially
     // huge datasets, so its scroll region defaults to filling whatever
