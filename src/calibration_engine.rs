@@ -26,6 +26,7 @@
 //! rather than a hardcoded `+=`.
 
 use crate::msp::{self, function, MspLink};
+use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::vtxtable::VtxTableConfig;
 use log::debug;
 use std::collections::{HashMap, VecDeque};
@@ -225,7 +226,11 @@ pub struct SweepEngine {
 
     pub pending_result: Option<SweepResult>, // set when a (level, freq) finishes; caller drains it into the working table
 
-    requires_manual_frequency: bool, // cached from start()'s argument, so poll()'s own frequency-advance logic can honor it too, not just the first frequency
+    meter_capability: FrequencyCapability, // cached from start()'s argument, so poll()'s own frequency-advance logic can honor it too, not just the first frequency
+    /// For ManualBand: the last band value actually prompted for --
+    /// consecutive VTX frequencies mapping to the same nearest band
+    /// don't get a repeat prompt. Reset to None in start().
+    last_prompted_band: Option<u32>,
     /// Set whenever the sweep needs to push a new frequency to the VTX
     /// (entering the first frequency in start(), or after confirm_frequency()).
     /// poll() sends this via MSP_VTX_CONFIG at the top of its next call,
@@ -234,6 +239,13 @@ pub struct SweepEngine {
     /// a power level + DAC mv), never actually retuned the VTX, so it
     /// stayed on whatever frequency it was last configured to.
     pending_frequency_push: Option<u16>,
+    /// Set whenever a ProgrammableBand/FullyProgrammable meter needs its
+    /// own frequency changed too -- worker.rs drains this and calls
+    /// PowerMeter::set_frequency(), then clears it. Unlike
+    /// pending_frequency_push (which the engine can act on directly via
+    /// its own MspLink), the engine has no handle to the PowerMeter
+    /// itself, so this is a request rather than an action.
+    pub pending_meter_frequency: Option<u32>,
 
     /// Per-level mV ceiling discovered when the VTX went unresponsive
     /// mid-scan (see EngineState::VtxUnresponsive / resume_after_recovery).
@@ -311,8 +323,10 @@ impl SweepEngine {
             total_steps,
             completed_steps: 0,
             pending_result: None,
-            requires_manual_frequency: false, // set for real in start()
+            meter_capability: FrequencyCapability::Manual { min_mhz: 0, max_mhz: 0 }, // set for real in start()
+            last_prompted_band: None,
             pending_frequency_push: None,
+            pending_meter_frequency: None,
             hard_limits: HashMap::new(),
             unresponsive_since: None,
         }
@@ -325,9 +339,10 @@ impl SweepEngine {
         self.completed_steps as f32 / self.total_steps as f32
     }
 
-    /// Call once to begin. If the meter needs manual frequency changes,
-    /// starts in AwaitingFreqConfirm rather than Running.
-    pub fn start(&mut self, requires_manual_frequency: bool) {
+    /// Call once to begin. See begin_frequency() for how `capability`
+    /// determines whether this starts Running immediately or pauses on
+    /// AwaitingFreqConfirm.
+    pub fn start(&mut self, capability: FrequencyCapability) {
         if self.levels.is_empty() || self.frequencies.is_empty() {
             debug!(target: "vtx", "[sweep] start() called with no levels/frequencies -- not starting");
             self.state = EngineState::Idle;
@@ -336,14 +351,57 @@ impl SweepEngine {
         self.freq_idx = 0;
         self.level_idx = 0;
         self.step = None;
-        self.requires_manual_frequency = requires_manual_frequency;
-        debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, manual_freq={requires_manual_frequency}",
-            self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz);
-        if requires_manual_frequency {
-            self.state = EngineState::AwaitingFreqConfirm { freq_mhz: self.frequencies[0] };
-        } else {
-            self.state = EngineState::Running;
-            self.pending_frequency_push = Some(self.frequencies[0]);
+        self.last_prompted_band = None;
+        self.meter_capability = capability;
+        debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
+            self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
+        let first_freq = self.frequencies[0];
+        self.begin_frequency(first_freq);
+    }
+
+    /// Decides what happens when the sweep is about to start working on
+    /// `freq_mhz`, based on the meter's capability -- shared by start()
+    /// (the first frequency) and poll()'s own advance-to-next-frequency
+    /// logic (every frequency after that), so both honor the same rules:
+    ///   Manual: always prompt (no concept of "band" to consolidate by).
+    ///   ManualBand: prompt with the nearest band, UNLESS it's the same
+    ///     band as the last prompt (consecutive VTX frequencies that map
+    ///     to the same band don't re-prompt).
+    ///   ProgrammableBand: no prompt -- request the meter retune to the
+    ///     nearest band via pending_meter_frequency.
+    ///   FullyProgrammable: no prompt -- request the exact frequency via
+    ///     pending_meter_frequency.
+    /// Either way, pending_frequency_push is always set, since the VTX
+    /// itself needs retuning regardless of what the meter needs.
+    fn begin_frequency(&mut self, freq_mhz: u16) {
+        match self.meter_capability.clone() {
+            FrequencyCapability::Manual { .. } => {
+                self.state = EngineState::AwaitingFreqConfirm { freq_mhz };
+            }
+            FrequencyCapability::ManualBand { bands_mhz } => {
+                let band = nearest_band(&bands_mhz, freq_mhz as u32);
+                if Some(band) == self.last_prompted_band {
+                    debug!(target: "vtx", "[sweep] {freq_mhz}MHz maps to the same band ({band}MHz) as the last prompt -- skipping prompt");
+                    self.state = EngineState::Running;
+                    self.pending_frequency_push = Some(freq_mhz);
+                } else {
+                    self.last_prompted_band = Some(band);
+                    self.state = EngineState::AwaitingFreqConfirm { freq_mhz };
+                }
+            }
+            FrequencyCapability::ProgrammableBand { bands_mhz } => {
+                let band = nearest_band(&bands_mhz, freq_mhz as u32);
+                debug!(target: "vtx", "[sweep] requesting meter retune to nearest band {band}MHz (for VTX freq {freq_mhz}MHz)");
+                self.pending_meter_frequency = Some(band);
+                self.state = EngineState::Running;
+                self.pending_frequency_push = Some(freq_mhz);
+            }
+            FrequencyCapability::FullyProgrammable { .. } => {
+                debug!(target: "vtx", "[sweep] requesting meter retune to {freq_mhz}MHz");
+                self.pending_meter_frequency = Some(freq_mhz as u32);
+                self.state = EngineState::Running;
+                self.pending_frequency_push = Some(freq_mhz);
+            }
         }
     }
 
@@ -439,12 +497,7 @@ impl SweepEngine {
             let next_freq = self.frequencies[self.freq_idx];
             debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {next_freq}MHz",
                 self.freq_idx, self.frequencies.len());
-            if self.requires_manual_frequency {
-                self.state = EngineState::AwaitingFreqConfirm { freq_mhz: next_freq };
-            } else {
-                self.state = EngineState::Running;
-                self.pending_frequency_push = Some(next_freq);
-            }
+            self.begin_frequency(next_freq);
             return Ok(());
         }
 

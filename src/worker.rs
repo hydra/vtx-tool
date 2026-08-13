@@ -310,7 +310,7 @@ pub fn spawn(
                                     target_mw_by_level,
                                     meter_kind.max_update_hz(),
                                 );
-                                engine.start(meter_kind.requires_manual_frequency());
+                                engine.start(meter_kind.capability());
                                 let sweep_hz = engine.sweep_hz;
                                 debug!(target: "vtx", "sweep started: {} levels, {} frequencies, tolerance {tolerance_pct}%",
                                     engine.levels.len(), engine.frequencies.len());
@@ -448,6 +448,16 @@ pub fn spawn(
                     let was_active = engine.is_active();
                     if let Err(e) = engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready) {
                         error!(target: "vtx", "sweep step failed: {e}");
+                    }
+                    if let Some(freq) = engine.pending_meter_frequency.take() {
+                        if let Some(m) = meter.as_mut() {
+                            match m.set_frequency(freq) {
+                                Ok(()) => debug!(target: "meter", "set_frequency({freq}) requested"),
+                                Err(e) => error!(target: "meter", "set_frequency failed: {e}"),
+                            }
+                        } else {
+                            error!(target: "meter", "sweep requested set_frequency({freq}) but the power meter isn't connected");
+                        }
                     }
                     if let Some(result) = engine.pending_result.take() {
                         let mut s = state.lock().unwrap();
