@@ -579,21 +579,23 @@ pub fn spawn(
                         }
                     }
                     if let Some(result) = engine.pending_result.take() {
-                        let mut s = state.lock().unwrap();
-                        if let Some(entry) = s.pa_table.iter_mut().find(|e| e.idx == result.level) {
-                            if let Some(mv) = result.calibration_mv {
-                                if let Some(slot) = entry.value.get_mut(result.freq_idx) {
-                                    *slot = mv;
+                        if result.success {
+                            let mut s = state.lock().unwrap();
+                            if let Some(entry) = s.pa_table.iter_mut().find(|e| e.idx == result.level) {
+                                if let Some(vbias_mv) = result.vbias_mv {
+                                    if let Some(slot) = entry.value.get_mut(result.freq_idx) {
+                                        *slot = vbias_mv;
+                                    }
                                 }
-                            }
-                            if let Some(det) = result.detector_mv {
-                                if let Some(slot) = entry.detector.get_mut(result.freq_idx) {
-                                    *slot = det;
+                                if let Some(det) = result.detector_mv {
+                                    if let Some(slot) = entry.detector.get_mut(result.freq_idx) {
+                                        *slot = det;
+                                    }
                                 }
                             }
                         }
-                        debug!(target: "vtx", "sweep result: level={} freq_idx={} cal={:?} det={:?}",
-                            result.level, result.freq_idx, result.calibration_mv, result.detector_mv);
+                        debug!(target: "vtx", "sweep result: level={} freq_idx={} vbias={:?} det={:?} success={}",
+                            result.level, result.freq_idx, result.vbias_mv, result.detector_mv, result.success);
                     }
                     if was_active && !engine.is_active() {
                         // Just transitioned to finished this tick (not aborted --

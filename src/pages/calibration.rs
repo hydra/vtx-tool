@@ -123,12 +123,12 @@ struct PaTableDelegate<'a> {
     det_status: Vec<[CellStatus; 7]>,
     level_status: Vec<Option<LevelStatus>>,
     limits: Vec<Option<i32>>,
-    /// (level, freq_idx, is_detector, mv) of whatever's actively being
-    /// tested right now, if anything -- see calibration_engine.rs's
-    /// current_step_mv(). Used so the Current (blue) cell shows the LIVE
-    /// value being tried, not the table's last-saved value for that
-    /// cell, which stays stale/default until the step actually finishes.
-    current: Option<(u8, usize, bool, i32)>,
+    /// Whatever's actively being tested right now, if anything -- see
+    /// calibration_engine.rs's SweepEngine::current_step(). Used so the
+    /// Current (blue) cell shows the LIVE value being tried, not the
+    /// table's last-saved value for that cell, which stays stale/default
+    /// until the step actually finishes.
+    current: Option<calibration_engine::CurrentStep>,
     row_height: f32,
 }
 
@@ -165,7 +165,7 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
                 // a column index. Groups 1/2 are Calibration/Detector;
                 // 0 and 3 are the unlabeled surrounding columns.
                 let text = match group_index {
-                    1 => "Calibration (mV)",
+                    1 => "VBIAS (mV)",
                     2 => "Detector (mV)",
                     _ => "",
                 };
@@ -218,18 +218,24 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
             }
             3..=9 => {
                 let i = col_nr - 3;
-                let text = match self.current {
-                    Some((level, freq_idx, false, mv)) if level == entry.idx && freq_idx == i => mv.to_string(),
-                    _ => entry.value[i].to_string(),
-                };
+                let text = self
+                    .current
+                    .as_ref()
+                    .filter(|cs| cs.level == entry.idx && cs.freq_idx == i)
+                    .and_then(|cs| cs.vbias_mv)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| entry.value[i].to_string());
                 colored_cell(ui, text, self.cal_status[row_nr][i]);
             }
             10..=16 => {
                 let i = col_nr - 10;
-                let text = match self.current {
-                    Some((level, freq_idx, true, mv)) if level == entry.idx && freq_idx == i => mv.to_string(),
-                    _ => entry.detector[i].to_string(),
-                };
+                let text = self
+                    .current
+                    .as_ref()
+                    .filter(|cs| cs.level == entry.idx && cs.freq_idx == i)
+                    .and_then(|cs| cs.detector_mv)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| entry.detector[i].to_string());
                 colored_cell(ui, text, self.det_status[row_nr][i]);
             }
             17 => {
@@ -380,13 +386,13 @@ pub fn show(
     let connection_lost = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match e.state {
-            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, mv_at_loss, reason } => {
-                Some((level, freq_mhz, mv_at_loss, reason))
+            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason } => {
+                Some((level, freq_mhz, vbias_mv_at_loss, reason))
             }
             _ => None,
         })
     };
-    if let Some((level, freq_mhz, mv_at_loss, reason)) = connection_lost {
+    if let Some((level, freq_mhz, vbias_mv_at_loss, reason)) = connection_lost {
         let (vtx_state, meter_state) = {
             let s = shared.lock().unwrap();
             (s.vtx_port_state, s.meter_port_state)
@@ -402,7 +408,7 @@ pub fn show(
                     calibration_engine::ConnectionLossReason::Both => "the VTX and the power meter",
                 };
                 ui.label(format!(
-                    "Lost communication with {cause} while calibrating level {level} at {freq_mhz}MHz (mv={mv_at_loss}). \
+                    "Lost communication with {cause} while calibrating level {level} at {freq_mhz}MHz (vbias_mv={vbias_mv_at_loss}). \
                      If the VTX is on a current-limited supply, it may have powered off."
                 ));
                 ui.label("Reconnecting automatically -- resumes on its own once both are Ready again.");
@@ -432,7 +438,7 @@ pub fn show(
     let mut current = None;
     {
         let g = sweep.lock().unwrap();
-        current = g.as_ref().and_then(|e| e.current_step_mv());
+        current = g.as_ref().and_then(|e| e.current_step());
         for entry in &entries {
             let cal: [CellStatus; 7] = std::array::from_fn(|i| {
                 g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
