@@ -2,7 +2,7 @@
 //! Ported from cMsp.py's wire protocol -- function IDs, payload byte
 //! layouts, and checksum algorithms match that reference exactly.
 //!
-//! The calibration sweep itself lives in calibration.rs, built on the
+//! The calibration sweep itself lives in calibration_engine.rs, built on the
 //! types here (PaCalibration, PaCalibrationReading, and the
 //! encode/decode functions for SET_PACALIBRATION and MSP_PACALIBRATION).
 
@@ -38,16 +38,38 @@ pub struct PaCalibrationReading {
     pub power_level: u8,
     pub vref_mv: u16,
     pub detector_mv: u16,
+    /// Only present when the VTX firmware sends the extended (10-byte)
+    /// payload -- an older firmware's original 5-byte reply still
+    /// decodes the three fields above fine, with these left None rather
+    /// than defaulted to something that would look like real data.
+    pub boost_on: Option<bool>,
+    pub rtc6705_level: Option<u8>,
+    pub pid_active: Option<bool>,
+    pub frequency_mhz: Option<u16>,
 }
 
 pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationReading> {
     if payload.len() < 5 {
         bail!("PACALIBRATION payload too short: {} bytes", payload.len());
     }
+    let (boost_on, rtc6705_level, pid_active, frequency_mhz) = if payload.len() >= 10 {
+        (
+            Some(payload[5] != 0),
+            Some(payload[6]),
+            Some(payload[7] != 0),
+            Some((payload[8] as u16) | ((payload[9] as u16) << 8)),
+        )
+    } else {
+        (None, None, None, None)
+    };
     Ok(PaCalibrationReading {
         power_level: payload[0],
         vref_mv: (payload[1] as u16) | ((payload[2] as u16) << 8),
         detector_mv: (payload[3] as u16) | ((payload[4] as u16) << 8),
+        boost_on,
+        rtc6705_level,
+        pid_active,
+        frequency_mhz,
     })
 }
 

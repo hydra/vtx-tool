@@ -295,6 +295,76 @@ impl eframe::App for App {
                         }
                     }
                 }
+
+                ui.separator();
+                ui.heading("VTX Status");
+                // Every value below is either read directly off the VTX's
+                // own MSP_PACALIBRATION reply, or (Power) derived from two
+                // VTX-reported facts (the reported level, looked up against
+                // the mW column of the calibration table also read from the
+                // VTX) -- see worker::VtxStatus's own doc comment. "—" means
+                // no reading has arrived yet (or the connected firmware
+                // doesn't send that particular field), never a guessed or
+                // defaulted value that could be mistaken for real data.
+                let vtx_status = self.state.lock().unwrap().vtx_status.clone();
+                match vtx_status {
+                    Some(status) => {
+                        egui::Grid::new("vtx_status_grid").num_columns(2).show(ui, |ui| {
+                            ui.label("Level:");
+                            ui.label(status.level.to_string());
+                            ui.end_row();
+
+                            ui.label("Power:");
+                            ui.label(status.power_mw.map(|mw| format!("{mw} mW")).unwrap_or_else(|| "—".to_string()));
+                            ui.end_row();
+
+                            ui.label("PA:");
+                            ui.label(match status.boost_on {
+                                Some(true) => "ON",
+                                Some(false) => "OFF",
+                                None => "—",
+                            });
+                            ui.end_row();
+
+                            ui.label("RTC6705 level:");
+                            ui.label(match status.rtc6705_level {
+                                // Fixed, known mapping (rtc6705.h's own
+                                // rtc6705_power_t enum) -- not a guess, just a
+                                // more readable form of the same raw value.
+                                Some(0) => "3 dBm".to_string(),
+                                Some(1) => "7 dBm".to_string(),
+                                Some(2) => "11 dBm".to_string(),
+                                Some(3) => "13 dBm".to_string(),
+                                Some(other) => format!("? ({other})"),
+                                None => "—".to_string(),
+                            });
+                            ui.end_row();
+
+                            ui.label("Frequency:");
+                            ui.label(status.frequency_mhz.map(|f| format!("{f} MHz")).unwrap_or_else(|| "—".to_string()));
+                            ui.end_row();
+
+                            ui.label("Vbias:");
+                            ui.label(format!("{} mV", status.vbias_mv));
+                            ui.end_row();
+
+                            ui.label("Vdetector:");
+                            ui.label(format!("{} mV", status.detector_mv));
+                            ui.end_row();
+
+                            ui.label("PID loop:");
+                            ui.label(match status.pid_active {
+                                Some(true) => "Active",
+                                Some(false) => "Inactive",
+                                None => "—",
+                            });
+                            ui.end_row();
+                        });
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No status received yet.").weak().italics());
+                    }
+                }
             });
 
         // Center: whichever pages are open, as dock tabs.
