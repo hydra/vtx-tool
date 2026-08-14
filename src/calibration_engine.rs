@@ -319,6 +319,21 @@ pub struct SweepEngine {
     /// pub so the UI can show it in a table column; cleared by
     /// clear_hard_limits() when the PA table is Refreshed.
     pub hard_limits: HashMap<u8, i32>,
+    /// General settle gate: no MSP send (from anywhere -- poll()'s own
+    /// retune/calibration sends, or an external caller like worker.rs
+    /// via note_external_send()) should happen before this instant.
+    /// Replaces an earlier one-off skip_settle_until, which only gated
+    /// the skip code path specifically -- but the actual constraint
+    /// (retuning blocks the VTX's whole main loop for a while --
+    /// confirmed against the firmware: rtc6705_set_frequency() waits on
+    /// rtc6705_wait_state_stable(), and the delay hook it's built on
+    /// currently resolves to millisecond- not microsecond-granularity,
+    /// so a real retune can block on the order of hundreds of ms to
+    /// several seconds) applies to ANY code path that sends a retune,
+    /// not just the skip button. See MspCommandKind::settle_duration()
+    /// for the per-command-type durations and note_sent()/
+    /// note_external_send() for how callers report a send.
+    next_send_allowed: Instant,
     /// First time this poll() saw the VTX and/or meter go quiet while
     /// Running, or None if both are currently responsive. A SUSTAINED
     /// silence (not a single missed tick) is what actually triggers
@@ -355,6 +370,55 @@ const HEARTBEAT_BACKOFF_MV: i32 = 50;
 /// minutes, since the target was never getting anywhere close) spins
 /// forever with no exit condition.
 const PINNED_LIMIT: u32 = 5;
+
+/// Classifies an MSP send by what it requires the CALLER to wait for
+/// before sending anything else -- see settle_duration(). The point of
+/// having this as a type (rather than each call site inventing its own
+/// duration) is that every sender, inside this engine or external (e.g.
+/// worker.rs's skip-safety push, via note_external_send()), reports the
+/// same small set of kinds and gets the same duration back, rather than
+/// one-off delays scattered and re-derived per call site.
+#[derive(Debug, Clone, Copy)]
+pub enum MspCommandKind {
+    /// A VTX_CONFIG push where frequency, power, or pitmode actually
+    /// changes -- triggers a synth retune on the VTX
+    /// (rtc6705_set_frequency()), which per the firmware blocks the
+    /// VTX's entire main loop until rtc6705_wait_state_stable() returns.
+    /// That function's own intended worst case is
+    /// RTC6705_LOCK_WAIT_TIMEOUT_US (5ms) -- but the delay hook it's
+    /// built on (rtc6705_hook_delay_us) currently resolves to
+    /// millisecond- rather than microsecond-granularity in every
+    /// firmware file available to check this against, meaning the REAL
+    /// worst case is closer to 5 SECONDS until that's fixed. Any command
+    /// sent during that window is simply not received until it ends --
+    /// this is exactly what defeated the first fix attempt here (a
+    /// message with no wait attached did nothing, since the very next
+    /// command landed inside the same blocked window). Deliberately
+    /// generous rather than tuned to the intended 5ms for that reason;
+    /// tighten this once the firmware-side delay bug is actually fixed
+    /// and the real settle time is known, rather than assumed.
+    Retune,
+    /// SET_PACALIBRATION -- a direct DAC write (dac_ch2_write_mv()) with
+    /// no synth reprogramming involved, so no comparable blocking is
+    /// expected. The sweep's own SampleWait mechanism already waits for
+    /// fresh readings before acting on any result, which provides
+    /// whatever settle time the DAC/detector themselves need -- this
+    /// isn't a substitute for that, just confirms no ADDITIONAL
+    /// command-level wait is required on top of it.
+    Calibration,
+    /// Anything else (queries, table pushes, EEPROM writes) -- no known
+    /// settle requirement.
+    Other,
+}
+
+impl MspCommandKind {
+    pub fn settle_duration(self) -> Duration {
+        match self {
+            MspCommandKind::Retune => Duration::from_millis(500),
+            MspCommandKind::Calibration | MspCommandKind::Other => Duration::ZERO,
+        }
+    }
+}
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
 
@@ -395,6 +459,7 @@ impl SweepEngine {
             pending_frequency_push: None,
             pending_meter_frequency: None,
             hard_limits: HashMap::new(),
+            next_send_allowed: Instant::now(),
             unresponsive_since: None,
         }
     }
@@ -589,6 +654,16 @@ impl SweepEngine {
             return Ok(());
         }
 
+        if Instant::now() < self.next_send_allowed {
+            // Waiting out a settle period from whatever was last sent
+            // (this engine's own retune, or an external caller via
+            // note_external_send() -- e.g. worker.rs's skip-safety
+            // push). Do nothing this tick, including the heartbeat check
+            // below (the VTX being quiet during a deliberate settle
+            // pause is expected, not a sign of lost communication).
+            return Ok(());
+        }
+
         if vtx_ready && meter_ready {
             self.unresponsive_since = None;
         } else {
@@ -650,8 +725,9 @@ impl SweepEngine {
             let level = self.levels.first().copied().unwrap_or(1);
             let payload = build_vtx_config_frequency_payload(freq_mhz, level);
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
+            self.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
-            return Ok(()); // let the retune land before the next tick starts sending SET_PACALIBRATION
+            return Ok(()); // next tick will wait out the settle gate before sending anything else
         }
 
         let level = self.levels[self.level_idx];
@@ -1063,6 +1139,25 @@ impl SweepEngine {
         self.det_cell_status.clear();
     }
 
+    /// Records that an MSP command of `kind` was just sent, from inside
+    /// this engine's own poll() -- see next_send_allowed's doc comment.
+    fn note_sent(&mut self, kind: MspCommandKind) {
+        self.next_send_allowed = Instant::now() + kind.settle_duration();
+    }
+
+    /// Same as note_sent(), for a command sent from OUTSIDE this engine
+    /// -- e.g. worker.rs's skip-safety push, which has to be sent
+    /// directly (it needs `link`/`vtx_table`, neither of which
+    /// skip_current() has access to) rather than through poll(). Lets an
+    /// external sender participate in the same settle gate poll() itself
+    /// respects, instead of needing its own separate, disconnected delay
+    /// mechanism -- which is exactly the shape the bug being fixed here
+    /// had: a message sent with no way to make the NEXT sender (poll(),
+    /// on the very next tick) actually wait for it.
+    pub fn note_external_send(&mut self, kind: MspCommandKind) {
+        self.note_sent(kind);
+    }
+
     /// Sets `map[key] = status`, except LimitHit is sticky -- once a
     /// cell is marked as the point where a trip happened, a later
     /// Calibrated/Uncalibrated/Current outcome for that same cell
@@ -1075,10 +1170,12 @@ impl SweepEngine {
         map.insert(key, status);
     }
 
-    fn send_calibration(&self, link: &mut MspLink, level: u8, vbias_mv: i32) -> anyhow::Result<()> {
+    fn send_calibration(&mut self, link: &mut MspLink, level: u8, vbias_mv: i32) -> anyhow::Result<()> {
         let (lo, hi) = self.effective_bounds(level);
         let vbias_mv = vbias_mv.clamp(lo, hi) as u16;
-        link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))
+        link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))?;
+        self.note_sent(MspCommandKind::Calibration);
+        Ok(())
     }
 
     fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, success: bool) {

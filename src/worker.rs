@@ -419,30 +419,47 @@ pub fn spawn(
                         }
                     }
                     Command::SkipCurrent => {
-                        // Mirrors AbortSweep's own safe-state push, and for the same
-                        // reason: skip_current() itself only updates internal
-                        // bookkeeping (see its doc comment) and was never sending
-                        // anything to the VTX at all. The engine's own frequency-
-                        // advance logic WILL push a fresh retune shortly after this
-                        // (even when the manual-frequency prompt itself gets
-                        // consolidated/skipped for being the same band as before),
-                        // but that's an ordinary retune, not a safety reset -- it
-                        // doesn't force pitmode, and under repeated rapid skips (real
-                        // symptom seen: the VTX stopped responding to
-                        // SET_PACALIBRATION at all after several skip-then-retune
-                        // cycles in quick succession, recoverable only via a full
-                        // reconnect+power-cycle) that leaves the VTX cycling through
-                        // several override-then-retune transitions back to back with
-                        // no defined safe/settled point in between. Pushing pitmode
-                        // here gives it one.
+                        // skip_current() itself only updates internal bookkeeping
+                        // (see its doc comment) and never sent anything to the VTX
+                        // on its own. The engine's own frequency-advance logic WILL
+                        // push a fresh retune shortly after this (even when the
+                        // manual-frequency prompt itself gets consolidated/skipped
+                        // for being the same band as before) -- but that's an
+                        // ordinary retune, not a safety reset, so this pushes
+                        // pitmode first to give the VTX a defined safe point between
+                        // the skipped point and whatever comes next, mirroring
+                        // AbortSweep's own safe-state push.
+                        //
+                        // Sending the message alone isn't sufficient on its own,
+                        // though (confirmed by a real run: the VTX stopped
+                        // responding to SET_PACALIBRATION after repeated rapid
+                        // skip-then-retune cycles even with this push already in
+                        // place, recoverable only via a full reconnect+power-cycle)
+                        // -- a retune blocks the VTX's whole main loop for a while
+                        // (see calibration_engine::MspCommandKind::Retune's doc
+                        // comment), and a command sent during that window is simply
+                        // never received. note_external_send() below reports this
+                        // send to the engine's own settle gate (the same one
+                        // poll() itself waits on before its own retunes), so the
+                        // NEXT thing sent -- the engine's own retune to whatever
+                        // frequency comes after the skip -- actually waits for this
+                        // one to land first, instead of arriving back-to-back with
+                        // no gap.
                         let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                        let mut sent_ok = false;
                         if let Some(link) = vtx.as_mut() {
                             match link.send_v1(function::VTX_CONFIG as u8, &payload) {
-                                Ok(()) => debug!(target: "vtx", "skip: pitmode-safe state sent before advancing"),
+                                Ok(()) => {
+                                    debug!(target: "vtx", "skip: pitmode-safe state sent before advancing");
+                                    sent_ok = true;
+                                }
                                 Err(e) => error!(target: "vtx", "skip: failed to send safe state: {e}"),
                             }
                         }
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            if sent_ok {
+                                engine.note_external_send(calibration_engine::MspCommandKind::Retune);
+                            }
                             engine.skip_current();
                         }
                     }
