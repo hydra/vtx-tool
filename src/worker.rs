@@ -697,8 +697,8 @@ pub fn spawn(
                                 }
                             }
                         }
-                        debug!(target: "vtx", "sweep result: level={} freq_idx={} vbias={:?} det={:?} success={}",
-                            result.level, result.freq_idx, result.vbias_mv, result.detector_mv, result.success);
+                        debug!(target: "vtx", "sweep result: level={} freq_idx={} vbias={:?} det={:?} success={} pa_failure={}",
+                            result.level, result.freq_idx, result.vbias_mv, result.detector_mv, result.success, result.pa_failure);
                     }
                     if was_active && !engine.is_active() {
                         // Just transitioned to finished this tick (not aborted --

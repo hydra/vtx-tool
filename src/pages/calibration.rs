@@ -76,6 +76,7 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
         CellStatus::LimitHit => Some(egui::Color32::from_rgb(100, 45, 45)),     // muted red
         CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
         CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),       // neutral grey -- deliberate, not a failure
+        CellStatus::PaFailure => Some(egui::Color32::from_rgb(165, 80, 15)),    // distinct burnt orange -- hardware condition, not just a non-convergent search
     }
 }
 
@@ -268,6 +269,7 @@ fn status_text(status: Option<&LevelStatus>) -> String {
         Some(LevelStatus::Done) => "Done".to_string(),
         Some(LevelStatus::Aborted) => "Aborted".to_string(),
         Some(LevelStatus::Skipped) => "Skipped".to_string(),
+        Some(LevelStatus::PaFailure) => "PA Failure".to_string(),
     }
 }
 
