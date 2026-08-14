@@ -30,6 +30,32 @@ use std::time::{Duration, Instant};
 /// How long the power-meter plot's rolling history window covers.
 pub const HISTORY_WINDOW_SECS: f64 = 60.0;
 
+/// How often to send an unprompted MSP_PACALIBRATION status query,
+/// independent of whether a sweep is active -- see VtxStatus.
+pub const VTX_STATUS_QUERY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Live VTX status for the left panel's "VTX Status" section, built from
+/// an MSP_PACALIBRATION reply -- polled continuously (see
+/// VTX_STATUS_QUERY_INTERVAL), not just during a sweep. Every field here
+/// is either read directly from the VTX's reply, or (power_mw) derived
+/// from two VTX-reported facts (the reported level index, looked up
+/// against the mW column of the calibration table also read from the
+/// VTX) -- never guessed or computed client-side from anything else.
+/// Optional fields are None (not defaulted to something that looks like
+/// real data) when the connected firmware doesn't send the extended
+/// payload these come from -- see msp::PaCalibrationReading.
+#[derive(Debug, Clone)]
+pub struct VtxStatus {
+    pub level: u8,
+    pub power_mw: Option<u16>,
+    pub boost_on: Option<bool>,
+    pub rtc6705_level: Option<u8>,
+    pub frequency_mhz: Option<u16>,
+    pub vbias_mv: u16,
+    pub detector_mv: u16,
+    pub pid_active: Option<bool>,
+}
+
 pub type SharedSweep = Arc<Mutex<Option<SweepEngine>>>;
 
 pub struct SharedState {
@@ -85,6 +111,9 @@ pub struct SharedState {
     /// current-limited supply power-cycling the VTX mid-sweep (see
     /// conn_status.rs's module doc for the full distinction).
     pub vtx_ready: bool,
+    /// See VtxStatus's own doc comment. None until the first
+    /// MSP_PACALIBRATION reply has actually arrived.
+    pub vtx_status: Option<VtxStatus>,
 }
 
 /// How recently the VTX (or power meter) must have said ANYTHING for
@@ -115,6 +144,7 @@ impl Default for SharedState {
             vtx_port_state: PortState::Disconnected,
             meter_port_state: PortState::Disconnected,
             vtx_ready: false,
+            vtx_status: None,
         }
     }
 }
@@ -189,6 +219,7 @@ pub fn spawn(
         let mut meter_port_path: Option<String> = None;
         let mut vtx_last_reconnect_attempt = Instant::now();
         let mut meter_last_reconnect_attempt = Instant::now();
+        let mut last_status_query = Instant::now();
 
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -249,6 +280,7 @@ pub fn spawn(
                             let mut s = state.lock().unwrap();
                             s.vtx_port_state = PortState::Disconnected;
                             s.vtx_ready = false;
+                            s.vtx_status = None;
                             drop(s);
                             *sweep.lock().unwrap() = None;
                         }
@@ -494,6 +526,21 @@ pub fn spawn(
                 ctx.request_repaint();
             }
 
+            // Unprompted periodic status query -- see VtxStatus/
+            // VTX_STATUS_QUERY_INTERVAL. Independent of any active sweep
+            // (which also uses MSP_PACALIBRATION, just as a reply to ITS
+            // OWN SET_PACALIBRATION commands) -- both are handled
+            // uniformly in the read-dispatch below regardless of which
+            // caller's request prompted a given reply.
+            if let Some(link) = vtx.as_mut() {
+                if last_status_query.elapsed() >= VTX_STATUS_QUERY_INTERVAL {
+                    last_status_query = Instant::now();
+                    if let Err(e) = link.send_v2(function::PACALIBRATION, None) {
+                        error!(target: "vtx", "failed to send status query: {e}");
+                    }
+                }
+            }
+
             // One read per tick, dispatched to whichever consumer wants
             // it: the passive VTX_CONFIG responder, or the sweep engine's
             // PACALIBRATION response listener. See module doc for why
@@ -519,6 +566,20 @@ pub fn spawn(
                             ctx.request_repaint();
                         } else if frame.function == function::PACALIBRATION {
                             if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload) {
+                                let mut s = state.lock().unwrap();
+                                let power_mw =
+                                    s.pa_table.iter().find(|e| e.idx == reading.power_level).map(|e| e.m_w);
+                                s.vtx_status = Some(VtxStatus {
+                                    level: reading.power_level,
+                                    power_mw,
+                                    boost_on: reading.boost_on,
+                                    rtc6705_level: reading.rtc6705_level,
+                                    frequency_mhz: reading.frequency_mhz,
+                                    vbias_mv: reading.vref_mv,
+                                    detector_mv: reading.detector_mv,
+                                    pid_active: reading.pid_active,
+                                });
+                                drop(s);
                                 pa_calibration_reading = Some(reading);
                             }
                         }
