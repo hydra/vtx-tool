@@ -46,6 +46,32 @@ fn power_up_step(sign_inverted: bool) -> i32 {
     }
 }
 
+/// Average of `history` readings that occurred both (a) at or after
+/// `since_secs` (the point this belongs to -- readings from a PREVIOUS
+/// frequency or level must never leak into this) and (b) within the
+/// last `window_secs` seconds, using history's own elapsed-seconds time
+/// base (not wall-clock) so this needs no separate clock reference.
+/// Returns None if there isn't yet a full window's worth of same-point
+/// history -- comparing a real peak against a partial/short window
+/// right as Fine creep begins would risk a false-positive trigger.
+fn rolling_average_since(history: &VecDeque<(f64, f32)>, since_secs: f64, window_secs: f64) -> Option<f32> {
+    let now = history.back()?.0;
+    let window_start = (now - window_secs).max(since_secs);
+    if now - window_start < window_secs - 0.01 {
+        return None; // not enough same-point history yet to fill the window
+    }
+    let (sum, count) = history
+        .iter()
+        .rev()
+        .take_while(|(t, _)| *t >= window_start)
+        .fold((0.0f32, 0u32), |(s, c), (_, mw)| (s + mw, c + 1));
+    if count == 0 {
+        None
+    } else {
+        Some(sum / count as f32)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOp {
     ScanPa,
@@ -69,6 +95,7 @@ pub enum LevelStatus {
     Done,
     Aborted,
     Skipped,
+    PaFailure,
 }
 
 /// Status of one (level, frequency) cell in the calibration/detector
@@ -99,6 +126,15 @@ pub enum CellStatus {
     /// -- distinct from Uncalibrated, which means a search actually ran
     /// and failed to converge; this means no search ran at all.
     Skipped,
+    /// Fine creep aborted because the rolling power-meter average
+    /// dropped below its own peak recorded during this creep -- the PA
+    /// is very likely thermally rolling off under sustained drive
+    /// rather than the target being genuinely unreachable. Distinct
+    /// from Uncalibrated (which covers "hit a bound" or "pinned"
+    /// failures) so the UI can flag this as a hardware condition worth
+    /// investigating, not just a calibration search that didn't
+    /// converge.
+    PaFailure,
 }
 
 /// Tracks "wait for `needed` new power readings since this was created".
@@ -145,6 +181,9 @@ impl SampleWait {
 /// traveled toward the DAC boundary.
 const COARSE_RAMP_START_MV: i32 = 3200;
 const COARSE_RAMP_STEP_MV: i32 = 25;
+/// Rolling window used by Fine creep's thermal-rolloff check -- see
+/// rolling_average_since() and the Fine match arm's doc comment.
+const PA_FAILURE_WINDOW_SECS: f64 = 3.0;
 
 enum ScanPaPhase {
     CoarseRamp,
@@ -163,6 +202,19 @@ struct ScanPaState {
     /// overshoot in fixed 5mV chunks, which a real run showed skipping
     /// clean past the target region when the RF response is steep).
     last_below_target_mv: Option<i32>,
+    /// Tight ceiling (toward more power) for Fine creep, computed once
+    /// when CoarseRamp hands off -- see the CoarseRamp match arm's doc
+    /// comment. None until that handoff happens; Fine always has one by
+    /// the time it starts stepping.
+    fine_bound_mv: Option<i32>,
+    /// history's own elapsed-seconds timestamp when Fine phase began --
+    /// readings from before this belong to a previous point (frequency
+    /// or level) and must never feed the thermal-rolloff check below.
+    fine_started_at_secs: Option<f64>,
+    /// Highest PA_FAILURE_WINDOW_SECS rolling average mW seen so far
+    /// during this Fine creep -- see the Fine match arm's doc comment
+    /// and rolling_average_since().
+    fine_highest_avg_mw: Option<f32>,
 }
 
 enum ScanDetectorPhase {
@@ -242,6 +294,13 @@ pub struct SweepResult {
     /// (pre-calibration) value in place rather than overwriting it with
     /// something that didn't actually meet target.
     pub success: bool,
+    /// True only for a ScanPa result that bailed specifically because
+    /// Fine creep's thermal-rolloff check tripped (see
+    /// CellStatus::PaFailure) -- always false when success is true.
+    /// worker.rs doesn't need to treat this specially for the pa_table
+    /// write (success already gates that correctly); it exists for
+    /// logging/diagnostics.
+    pub pa_failure: bool,
 }
 
 /// Describes whatever step is currently in progress, if any -- see
@@ -742,6 +801,9 @@ impl SweepEngine {
                 wait: None,
                 coarse_steps_taken: 0,
                 last_below_target_mv: None,
+                fine_bound_mv: None,
+                fine_started_at_secs: None,
+                fine_highest_avg_mw: None,
             }));
             debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from vbias_mv={COARSE_RAMP_START_MV}");
             self.per_level_status.insert(
@@ -756,6 +818,22 @@ impl SweepEngine {
 
         match self.step.take().unwrap() {
             StepState::Pa(mut st) => {
+                if matches!(st.phase, ScanPaPhase::Fine) {
+                    if let Some(started_at) = st.fine_started_at_secs {
+                        if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
+                            match st.fine_highest_avg_mw {
+                                Some(peak) if rolling < peak => {
+                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) dropped below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", st.vbias_mv);
+                                    self.finish_scan_pa(level, st.vbias_mv, false, true);
+                                    return Ok(());
+                                }
+                                Some(peak) => st.fine_highest_avg_mw = Some(peak.max(rolling)),
+                                None => st.fine_highest_avg_mw = Some(rolling),
+                            }
+                        }
+                    }
+                }
+
                 if st.wait.is_none() {
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
@@ -786,38 +864,47 @@ impl SweepEngine {
 
                 match st.phase {
                     ScanPaPhase::CoarseRamp => {
-                        if avg_mw >= target_mw * 0.80 {
-                            // Overshot (or reached) 80% of target -- rather than
-                            // accept this point and step AWAY from it in fixed
-                            // chunks hoping to cross back below (the old Backoff
-                            // phase), jump straight to the last coarse point we
-                            // KNOW read below target and creep up from there in
-                            // fine 1mV steps. A real run showed why the old
-                            // approach could fail outright: a CoarseRamp 50mV
-                            // step landed at 152% of target in one jump (steep
-                            // local RF response), and Backoff's OWN 5mV steps
-                            // then skipped clean past the target region too
-                            // (57mW -> 46mW in a single step), leaving Fine creep
-                            // to close an 11mW gap in one more step. Starting
-                            // from a point already confirmed below target removes
-                            // that failure mode -- the approach to target is
-                            // always a monotonic climb from a safe point, never a
-                            // step away from an overshoot, which is also the
-                            // safer direction for the VTX (approaching from below
-                            // rather than risking a large excursion above target
-                            // while hunting for where to reverse).
-                            let revert_vbias_mv = st.last_below_target_mv.unwrap_or(st.vbias_mv);
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp reached 80% ({avg_mw:.4}mW >= {:.4}mW) at vbias_mv={} -- reverting to last below-target point vbias_mv={revert_vbias_mv} and entering fine creep",
-                                target_mw * 0.80, st.vbias_mv);
-                            st.vbias_mv = revert_vbias_mv;
+                        // Always wait for a genuine overshoot (avg_mw >= target)
+                        // rather than stopping early at some fraction of it --
+                        // stopping early meant Fine creep's own starting point
+                        // was never actually confirmed to bracket the target,
+                        // just assumed to based on a percentage heuristic. Once
+                        // within 10% of target, though, don't keep taking full
+                        // 25mV steps toward an overshoot of unknown size: hand
+                        // off to Fine immediately with a TIGHT, half-step-sized
+                        // ceiling instead, computed rather than measured (no
+                        // need to spend a round-trip sampling a point that's
+                        // only ever used as a numeric bound) -- Fine's own 1mV
+                        // search then does the actual work of finding where the
+                        // real crossing is within that narrow bracket, and its
+                        // own bound check (below) still catches the case where
+                        // even that bracket isn't enough.
+                        if avg_mw >= target_mw {
+                            let fine_start = st.last_below_target_mv.unwrap_or(st.vbias_mv);
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}",
+                                st.vbias_mv);
+                            st.fine_bound_mv = Some(st.vbias_mv);
+                            st.vbias_mv = fine_start;
                             st.phase = ScanPaPhase::Fine;
                             st.wait = None;
+                            st.fine_started_at_secs = history.back().map(|e| e.0);
+                            st.fine_highest_avg_mw = None;
+                        } else if avg_mw >= target_mw * 0.90 {
+                            let half_step = (COARSE_RAMP_STEP_MV / 2).max(1);
+                            let bound = (st.vbias_mv + up * half_step).clamp(bound_lo, bound_hi);
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp within 10% of target ({avg_mw:.4}mW >= {:.4}mW) at vbias_mv={} -- entering fine creep, bounded at vbias_mv={bound}",
+                                target_mw * 0.90, st.vbias_mv);
+                            st.fine_bound_mv = Some(bound);
+                            st.phase = ScanPaPhase::Fine;
+                            st.wait = None;
+                            st.fine_started_at_secs = history.back().map(|e| e.0);
+                            st.fine_highest_avg_mw = None;
                         } else if !(bound_lo..=bound_hi).contains(&(st.vbias_mv + up * COARSE_RAMP_STEP_MV)) {
                             // Ran off the end of the allowed range (DAC bound, or a hard limit from
-                            // a previous VTX power-loss on this level) without reaching 80% -- bail
-                            // this (level, freq) as best-effort.
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching 80% target -- bailing this (level,freq) as best-effort", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, false);
+                            // a previous VTX power-loss on this level) without ever getting within
+                            // 10% of target -- bail this (level, freq) as best-effort.
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target -- bailing this (level,freq) as best-effort", st.vbias_mv);
+                            self.finish_scan_pa(level, st.vbias_mv, false, false);
                             return Ok(());
                         } else {
                             st.last_below_target_mv = Some(st.vbias_mv);
@@ -827,13 +914,23 @@ impl SweepEngine {
                         }
                     }
                     ScanPaPhase::Fine => {
+                        // Fine's own ceiling combines the tight bound handed off
+                        // from CoarseRamp with the global safety bound, taking
+                        // whichever is reached first -- fine_bound_mv should
+                        // always be the tighter of the two in normal operation,
+                        // but a concurrently-set hard limit is still respected.
+                        let (fine_lo, fine_hi) = match st.fine_bound_mv {
+                            Some(b) if up > 0 => (bound_lo, bound_hi.min(b)),
+                            Some(b) => (bound_lo.max(b), bound_hi),
+                            None => (bound_lo, bound_hi),
+                        };
                         if avg_mw >= target_mw {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at vbias_mv={} ({avg_mw:.4}mW)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, true);
+                            self.finish_scan_pa(level, st.vbias_mv, true, false);
                             return Ok(());
-                        } else if !(bound_lo..=bound_hi).contains(&(st.vbias_mv + up)) {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, false);
+                        } else if !(fine_lo..=fine_hi).contains(&(st.vbias_mv + up)) {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{fine_lo},{fine_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
+                            self.finish_scan_pa(level, st.vbias_mv, false, false);
                             return Ok(());
                         } else {
                             st.vbias_mv += up;
@@ -979,7 +1076,7 @@ impl SweepEngine {
     /// CoarseRamp: since it steps in known, fixed increments toward
     /// a known boundary, the fraction of that distance already covered
     /// gives a real (if approximate -- we don't know in advance how many
-    /// steps it'll actually take to reach 80% target) sense of movement,
+    /// steps it'll actually take to reach target) sense of movement,
     /// rather than a static placeholder. Returns (0.0, "") when nothing
     /// is in progress.
     pub fn sub_progress(&self) -> (f32, &'static str) {
@@ -1178,7 +1275,7 @@ impl SweepEngine {
         Ok(())
     }
 
-    fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, success: bool) {
+    fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, success: bool, pa_failure: bool) {
         self.completed_steps += 1;
         self.pending_result = Some(SweepResult {
             level,
@@ -1186,12 +1283,37 @@ impl SweepEngine {
             vbias_mv: Some(vbias_mv.clamp(0, 3300) as u16),
             detector_mv: None,
             success,
+            pa_failure,
         });
         Self::set_cell_status(
             &mut self.cal_cell_status,
             (level, self.freq_idx),
-            if success { CellStatus::Calibrated } else { CellStatus::Uncalibrated },
+            if pa_failure {
+                CellStatus::PaFailure
+            } else if success {
+                CellStatus::Calibrated
+            } else {
+                CellStatus::Uncalibrated
+            },
         );
+
+        if pa_failure {
+            // Skip ScanDetector entirely -- if the PA is thermally
+            // rolling off, driving it further for a detector search
+            // only makes that worse. Mark the detector cell the same
+            // way (no search ran there either) and account for BOTH
+            // steps (this ScanPa op plus the ScanDetector op that never
+            // ran) in completed_steps, same reasoning as
+            // skip_current() -- otherwise the progress bar would never
+            // reach 100%.
+            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::PaFailure);
+            self.completed_steps += 1;
+            self.step = None;
+            self.level_idx += 1;
+            self.per_level_status.insert(level, LevelStatus::PaFailure);
+            return;
+        }
+
         // ScanDetector runs immediately after ScanPa for the same (level, freq).
         // Starting point is a small step toward LESS power from the just-found
         // calibration value (matches the original script's intent: start
@@ -1226,6 +1348,7 @@ impl SweepEngine {
             vbias_mv: None,
             detector_mv: Some(detector_mv),
             success,
+            pa_failure: false, // only a ScanPa result can trigger PA Failure -- see finish_scan_pa
         });
         Self::set_cell_status(
             &mut self.det_cell_status,
