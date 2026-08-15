@@ -359,6 +359,14 @@ impl eframe::App for App {
                                 None => "—",
                             });
                             ui.end_row();
+
+                            ui.label("Calibration session:");
+                            ui.label(match status.session_active {
+                                Some(true) => "Open",
+                                Some(false) => "Closed",
+                                None => "—",
+                            });
+                            ui.end_row();
                         });
                     }
                     None => {
