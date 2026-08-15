@@ -54,6 +54,11 @@ pub struct VtxStatus {
     pub vbias_mv: u16,
     pub detector_mv: u16,
     pub pid_active: Option<bool>,
+    /// Whether a calibration session is currently open on the VTX -- see
+    /// calibration_engine.rs's session begin/end sends and
+    /// rf_pa_calibration_session_begin()'s doc comment in the firmware's
+    /// rf_pa.h for what that actually changes.
+    pub session_active: Option<bool>,
 }
 
 pub type SharedSweep = Arc<Mutex<Option<SweepEngine>>>;
@@ -423,6 +428,22 @@ pub fn spawn(
                                     s.update_hz = sweep_hz;
                                 }
                                 *sweep.lock().unwrap() = Some(engine);
+                                // Opens the session before anything else this sweep
+                                // does -- every retune from here on (including the
+                                // very first one) needs the firmware to already be
+                                // holding it open, or that first retune would still
+                                // hit the same default-target closed-loop window this
+                                // was added to prevent. The firmware's own reply
+                                // (vtx_msp_set_calibration_session() always pushes a
+                                // status snapshot) gets logged by the read-dispatch,
+                                // no separate follow-up query needed.
+                                if let Some(link) = vtx.as_mut() {
+                                    let payload = msp::encode_pa_calibration_session_request(true);
+                                    match link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&payload)) {
+                                        Ok(()) => debug!(target: "vtx", "calibration session: begin requested"),
+                                        Err(e) => error!(target: "vtx", "failed to begin calibration session: {e}"),
+                                    }
+                                }
                             }
                         }
                     }
@@ -440,6 +461,20 @@ pub fn spawn(
                             match link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                 Ok(()) => debug!(target: "vtx", "sweep aborted, pitmode-safe state sent"),
                                 Err(e) => error!(target: "vtx", "abort: failed to send safe state: {e}"),
+                            }
+                            request_status_snapshot(link);
+                            // Ends the session the sweep opened on start -- a
+                            // held-open session left dangling after an abort would
+                            // mean the NEXT retune (from whatever the person does
+                            // next, calibration-related or not) keeps skipping the
+                            // normal reset-to-defaults path this was never meant to
+                            // suppress outside an active sweep. The firmware's own
+                            // reply already carries a fresh status snapshot, logged
+                            // by the read-dispatch same as any other.
+                            let end_payload = msp::encode_pa_calibration_session_request(false);
+                            match link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&end_payload)) {
+                                Ok(()) => debug!(target: "vtx", "calibration session: end requested (abort)"),
+                                Err(e) => error!(target: "vtx", "failed to end calibration session: {e}"),
                             }
                         }
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
@@ -486,6 +521,9 @@ pub fn spawn(
                                     sent_ok = true;
                                 }
                                 Err(e) => error!(target: "vtx", "skip: failed to send safe state: {e}"),
+                            }
+                            if sent_ok {
+                                request_status_snapshot(link);
                             }
                         }
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
@@ -578,8 +616,20 @@ pub fn spawn(
                                     vbias_mv: reading.vref_mv,
                                     detector_mv: reading.detector_mv,
                                     pid_active: reading.pid_active,
+                                    session_active: reading.session_active,
                                 });
                                 drop(s);
+                                // Logged on every reply, not just the periodic poll --
+                                // this is what actually lets a state-changing command
+                                // (a retune, a calibration override, a session begin/
+                                // end) be checked against what the VTX reports right
+                                // after, by reading the log in order, rather than
+                                // having to infer it from side effects like the meter
+                                // reading.
+                                debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?}",
+                                    reading.power_level, power_mw, reading.boost_on, reading.rtc6705_level,
+                                    reading.frequency_mhz, reading.vref_mv, reading.detector_mv,
+                                    reading.pid_active, reading.session_active);
                                 pa_calibration_reading = Some(reading);
                             }
                         }
@@ -702,7 +752,10 @@ pub fn spawn(
                     }
                     if was_active && !engine.is_active() {
                         // Just transitioned to finished this tick (not aborted --
-                        // AbortSweep restores update_hz itself). Only runs once,
+                        // AbortSweep restores update_hz itself, AND sends its own
+                        // session-end -- this fires for that case too, since
+                        // is_active() goes false either way, but ending an
+                        // already-ended session is harmless). Only runs once,
                         // not every tick afterward -- the engine object persists
                         // after finishing, so gating on the transition (not just
                         // "currently inactive") is what avoids re-doing this
@@ -710,6 +763,12 @@ pub fn spawn(
                         let mut s = state.lock().unwrap();
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
                             s.update_hz = prev;
+                        }
+                        drop(s);
+                        let end_payload = msp::encode_pa_calibration_session_request(false);
+                        match link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&end_payload)) {
+                            Ok(()) => debug!(target: "vtx", "calibration session: end requested (sweep finished)"),
+                            Err(e) => error!(target: "vtx", "failed to end calibration session: {e}"),
                         }
                     }
                     ctx.request_repaint();
@@ -836,6 +895,23 @@ pub fn spawn(
             std::thread::sleep(Duration::from_millis(10));
         }
     });
+}
+
+/// Sends a bare MSP_PACALIBRATION status query -- call this right after
+/// any command that changes VTX state (a retune, an abort's safe-state
+/// push, a session begin/end that doesn't otherwise reply, etc.) so a
+/// fresh reply arrives promptly and gets logged by the read-dispatch's
+/// own "status: ..." line, close enough in the log timeline to the
+/// command that prompted it to make the correlation between "what we
+/// asked for" and "what the VTX now reports" obvious -- rather than
+/// waiting for the next periodic poll, up to VTX_STATUS_QUERY_INTERVAL
+/// away. A command whose OWN reply already carries a full status
+/// snapshot (SET_PACALIBRATION, SET_PACALIBRATION_SESSION) doesn't need
+/// this -- it's already covered.
+fn request_status_snapshot(link: &mut MspLink) {
+    if let Err(e) = link.send_v2(function::PACALIBRATION, None) {
+        error!(target: "vtx", "failed to request status snapshot: {e}");
+    }
 }
 
 fn read_pa_table(link: &mut MspLink) -> Result<Vec<msp::PaCalibration>> {

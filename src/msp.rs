@@ -26,6 +26,7 @@ pub mod function {
     pub const SET_PACALTABLE: u16 = 0x4801;
     pub const PACALIBRATION: u16 = 0x4802;
     pub const SET_PACALIBRATION: u16 = 0x4803;
+    pub const SET_PACALIBRATION_SESSION: u16 = 0x4804;
 }
 
 /// Decoded MSP_PACALIBRATION response -- vtx_msp_push_calibration()'s
@@ -38,14 +39,19 @@ pub struct PaCalibrationReading {
     pub power_level: u8,
     pub vref_mv: u16,
     pub detector_mv: u16,
-    /// Only present when the VTX firmware sends the extended (10-byte)
-    /// payload -- an older firmware's original 5-byte reply still
-    /// decodes the three fields above fine, with these left None rather
-    /// than defaulted to something that would look like real data.
+    /// Only present when the VTX firmware sends the extended (10-byte
+    /// or later) payload -- an older firmware's original 5-byte reply
+    /// still decodes the three fields above fine, with these left None
+    /// rather than defaulted to something that would look like real
+    /// data.
     pub boost_on: Option<bool>,
     pub rtc6705_level: Option<u8>,
     pub pid_active: Option<bool>,
     pub frequency_mhz: Option<u16>,
+    /// Only present with the 11-byte payload (added alongside
+    /// MSP_SET_PACALIBRATION_SESSION) -- see calibration_engine.rs's
+    /// session begin/end sends.
+    pub session_active: Option<bool>,
 }
 
 pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationReading> {
@@ -62,6 +68,7 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
     } else {
         (None, None, None, None)
     };
+    let session_active = if payload.len() >= 11 { Some(payload[10] != 0) } else { None };
     Ok(PaCalibrationReading {
         power_level: payload[0],
         vref_mv: (payload[1] as u16) | ((payload[2] as u16) << 8),
@@ -70,6 +77,7 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
         rtc6705_level,
         pid_active,
         frequency_mhz,
+        session_active,
     })
 }
 
@@ -85,6 +93,12 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
 pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>) -> Vec<u8> {
     let mv = mv.unwrap_or(0);
     vec![power_level, (mv & 0xff) as u8, (mv >> 8) as u8]
+}
+
+/// Encodes a SET_PACALIBRATION_SESSION request -- see
+/// vtx_msp_set_calibration_session()'s doc comment in vtx_msp.c.
+pub fn encode_pa_calibration_session_request(active: bool) -> Vec<u8> {
+    vec![if active { 1 } else { 0 }]
 }
 
 /// One decoded PA calibration table entry, matching cMsp.py's
