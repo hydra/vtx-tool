@@ -335,8 +335,59 @@ pub fn build_command_v2(cmd: u16, payload: Option<&[u8]>) -> Vec<u8> {
 /// A serial link speaking MSP, with a blocking-with-timeout read loop.
 /// Not async -- this tool is an interactive one-shot calibration run, not
 /// a long-lived service, so a simple blocking model keeps it dependency-light.
+/// Classifies an MSP send by how long the link should refuse further
+/// sends afterward -- see MspLink::note_sent(), and send()'s own
+/// enforcement of the resulting block. Putting this enforcement on the
+/// link itself (rather than as bookkeeping some higher-level caller is
+/// expected to check) makes it structurally impossible for ANY sender,
+/// present or future, to bypass a settle requirement by mistake -- which
+/// is exactly how a real bug happened: code outside the sweep engine
+/// sent directly, with no way for anything to know it needed to wait.
+#[derive(Debug, Clone, Copy)]
+pub enum MspCommandKind {
+    /// A VTX_CONFIG push where frequency, power, or pitmode actually
+    /// changes -- triggers a synth retune on the VTX
+    /// (rtc6705_set_frequency()), which per the firmware blocks the
+    /// VTX's entire main loop until rtc6705_wait_state_stable() returns.
+    /// That function's own intended worst case is
+    /// RTC6705_LOCK_WAIT_TIMEOUT_US (5ms) -- but the delay hook it's
+    /// built on (rtc6705_hook_delay_us) currently resolves to
+    /// millisecond- rather than microsecond-granularity in every
+    /// firmware file available to check this against, meaning the REAL
+    /// worst case is closer to 5 SECONDS until that's fixed. Any command
+    /// sent during that window is simply not received until it ends.
+    /// Deliberately generous rather than tuned to the intended 5ms for
+    /// that reason; tighten this once the firmware-side delay bug is
+    /// actually fixed and the real settle time is known, rather than
+    /// assumed.
+    Retune,
+    /// SET_PACALIBRATION -- a direct DAC write (dac_ch2_write_mv()) with
+    /// no synth reprogramming involved, so no comparable blocking is
+    /// expected. The sweep's own SampleWait mechanism already waits for
+    /// fresh readings before acting on any result, which provides
+    /// whatever settle time the DAC/detector themselves need -- this
+    /// isn't a substitute for that, just confirms no ADDITIONAL
+    /// command-level wait is required on top of it.
+    Calibration,
+    /// Anything else (queries, session begin/end, table pushes, EEPROM
+    /// writes) -- no known settle requirement.
+    Other,
+}
+
+impl MspCommandKind {
+    pub fn settle_duration(self) -> Duration {
+        match self {
+            MspCommandKind::Retune => Duration::from_millis(500),
+            MspCommandKind::Calibration | MspCommandKind::Other => Duration::ZERO,
+        }
+    }
+}
+
 pub struct MspLink {
     port: Box<dyn serialport::SerialPort>,
+    /// No send is allowed before this instant -- see note_sent() and
+    /// send()'s own enforcement. Starts at "now" (unblocked) on open().
+    can_send_at: Instant,
 }
 
 impl MspLink {
@@ -344,10 +395,49 @@ impl MspLink {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
             .open()?;
-        Ok(Self { port })
+        Ok(Self { port, can_send_at: Instant::now() })
+    }
+
+    /// Cheap, non-blocking check for whether a send would actually go
+    /// out right now. Callers that want to avoid attempting a send they
+    /// know will be refused (the normal, expected case for anything
+    /// respecting the gate) should check this first -- but send()
+    /// refuses regardless, so nothing can slip through by skipping the
+    /// check.
+    pub fn can_send_now(&self) -> bool {
+        Instant::now() >= self.can_send_at
+    }
+
+    /// How much longer until can_send_now() would return true, or None
+    /// if it already does.
+    pub fn blocked_for(&self) -> Option<Duration> {
+        let now = Instant::now();
+        if now >= self.can_send_at {
+            None
+        } else {
+            Some(self.can_send_at - now)
+        }
+    }
+
+    /// Extends the send-block until at least now + kind's own settle
+    /// duration. Call this right after any send that needs one. Only
+    /// ever extends, never shortens -- a send needing a short (or no)
+    /// settle shouldn't cut short a longer window a previous, more
+    /// demanding send already established.
+    pub fn note_sent(&mut self, kind: MspCommandKind) {
+        let until = Instant::now() + kind.settle_duration();
+        if until > self.can_send_at {
+            self.can_send_at = until;
+        }
     }
 
     pub fn send(&mut self, frame: &[u8]) -> Result<()> {
+        if !self.can_send_now() {
+            bail!(
+                "send blocked: {:?} remaining before the settle window from a previous command clears",
+                self.blocked_for().unwrap_or_default()
+            );
+        }
         self.port.write_all(frame)?;
         Ok(())
     }
