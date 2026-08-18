@@ -25,7 +25,7 @@
 //! "step toward more power" in this file goes through power_up_step()
 //! rather than a hardcoded `+=`.
 
-use crate::msp::{self, function, MspLink};
+use crate::msp::{self, function, MspCommandKind, MspLink};
 use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::vtxtable::VtxTableConfig;
 use log::debug;
@@ -179,7 +179,7 @@ impl SampleWait {
 /// Starting point for the coarse ramp -- extracted as a constant since
 /// sub_progress() needs the same value to compute how far the ramp has
 /// traveled toward the DAC boundary.
-const COARSE_RAMP_START_MV: i32 = 3200;
+const COARSE_RAMP_START_MV: i32 = 3300;
 const COARSE_RAMP_STEP_MV: i32 = 25;
 /// Rolling window used by Fine creep's thermal-rolloff check -- see
 /// rolling_average_since() and the Fine match arm's doc comment.
@@ -397,21 +397,18 @@ pub struct SweepEngine {
     /// pub so the UI can show it in a table column; cleared by
     /// clear_hard_limits() when the PA table is Refreshed.
     pub hard_limits: HashMap<u8, i32>,
-    /// General settle gate: no MSP send (from anywhere -- poll()'s own
-    /// retune/calibration sends, or an external caller like worker.rs
-    /// via note_external_send()) should happen before this instant.
-    /// Replaces an earlier one-off skip_settle_until, which only gated
-    /// the skip code path specifically -- but the actual constraint
-    /// (retuning blocks the VTX's whole main loop for a while --
-    /// confirmed against the firmware: rtc6705_set_frequency() waits on
-    /// rtc6705_wait_state_stable(), and the delay hook it's built on
-    /// currently resolves to millisecond- not microsecond-granularity,
-    /// so a real retune can block on the order of hundreds of ms to
-    /// several seconds) applies to ANY code path that sends a retune,
-    /// not just the skip button. See MspCommandKind::settle_duration()
-    /// for the per-command-type durations and note_sent()/
-    /// note_external_send() for how callers report a send.
-    next_send_allowed: Instant,
+    /// Sends the engine owes but hasn't issued yet -- safe-state pushes
+    /// (from skip_current()/abort()) and calibration session begin/end,
+    /// each processed one per eligible tick (see poll()'s own top-
+    /// priority handling), respecting link.can_send_now() the exact same
+    /// way every other send in this file does. This is what "only the
+    /// engine sends commands" actually means in practice: a caller like
+    /// worker.rs computes a payload (it owns vtx_table, this engine
+    /// doesn't) and hands it to skip_current()/abort() to queue, rather
+    /// than sending it directly itself -- which is exactly how a real
+    /// bug happened (an external, ungated send landing while the link
+    /// was still supposed to be settling from a previous command).
+    pending_sends: VecDeque<PendingSend>,
     /// First time this poll() saw the VTX and/or meter go quiet while
     /// Running, or None if both are currently responsive. A SUSTAINED
     /// silence (not a single missed tick) is what actually triggers
@@ -449,53 +446,16 @@ const HEARTBEAT_BACKOFF_MV: i32 = 50;
 /// forever with no exit condition.
 const PINNED_LIMIT: u32 = 5;
 
-/// Classifies an MSP send by what it requires the CALLER to wait for
-/// before sending anything else -- see settle_duration(). The point of
-/// having this as a type (rather than each call site inventing its own
-/// duration) is that every sender, inside this engine or external (e.g.
-/// worker.rs's skip-safety push, via note_external_send()), reports the
-/// same small set of kinds and gets the same duration back, rather than
-/// one-off delays scattered and re-derived per call site.
-#[derive(Debug, Clone, Copy)]
-pub enum MspCommandKind {
-    /// A VTX_CONFIG push where frequency, power, or pitmode actually
-    /// changes -- triggers a synth retune on the VTX
-    /// (rtc6705_set_frequency()), which per the firmware blocks the
-    /// VTX's entire main loop until rtc6705_wait_state_stable() returns.
-    /// That function's own intended worst case is
-    /// RTC6705_LOCK_WAIT_TIMEOUT_US (5ms) -- but the delay hook it's
-    /// built on (rtc6705_hook_delay_us) currently resolves to
-    /// millisecond- rather than microsecond-granularity in every
-    /// firmware file available to check this against, meaning the REAL
-    /// worst case is closer to 5 SECONDS until that's fixed. Any command
-    /// sent during that window is simply not received until it ends --
-    /// this is exactly what defeated the first fix attempt here (a
-    /// message with no wait attached did nothing, since the very next
-    /// command landed inside the same blocked window). Deliberately
-    /// generous rather than tuned to the intended 5ms for that reason;
-    /// tighten this once the firmware-side delay bug is actually fixed
-    /// and the real settle time is known, rather than assumed.
-    Retune,
-    /// SET_PACALIBRATION -- a direct DAC write (dac_ch2_write_mv()) with
-    /// no synth reprogramming involved, so no comparable blocking is
-    /// expected. The sweep's own SampleWait mechanism already waits for
-    /// fresh readings before acting on any result, which provides
-    /// whatever settle time the DAC/detector themselves need -- this
-    /// isn't a substitute for that, just confirms no ADDITIONAL
-    /// command-level wait is required on top of it.
-    Calibration,
-    /// Anything else (queries, table pushes, EEPROM writes) -- no known
-    /// settle requirement.
-    Other,
-}
-
-impl MspCommandKind {
-    pub fn settle_duration(self) -> Duration {
-        match self {
-            MspCommandKind::Retune => Duration::from_millis(500),
-            MspCommandKind::Calibration | MspCommandKind::Other => Duration::ZERO,
-        }
-    }
+/// A send the engine owes but hasn't issued yet -- see pending_sends'
+/// doc comment on SweepEngine. Each variant carries everything poll()
+/// needs to actually issue it once link.can_send_now() allows.
+enum PendingSend {
+    /// A pitmode-safe VTX_CONFIG push -- from skip_current()/abort().
+    /// The payload is computed by the caller (worker.rs, which owns
+    /// vtx_table) and just carried here for poll() to send.
+    SafeState(Vec<u8>),
+    SessionBegin,
+    SessionEnd,
 }
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
@@ -537,7 +497,7 @@ impl SweepEngine {
             pending_frequency_push: None,
             pending_meter_frequency: None,
             hard_limits: HashMap::new(),
-            next_send_allowed: Instant::now(),
+            pending_sends: VecDeque::new(),
             unresponsive_since: None,
         }
     }
@@ -565,6 +525,7 @@ impl SweepEngine {
         self.meter_capability = capability;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
+        self.pending_sends.push_back(PendingSend::SessionBegin);
         let first_freq = self.frequencies[0];
         self.begin_frequency(first_freq);
     }
@@ -624,10 +585,16 @@ impl SweepEngine {
         }
     }
 
-    /// Begins a safe-state abort -- caller (worker.rs) is expected to
-    /// have already sent a pitmode-forced VTX_CONFIG; this just marks
-    /// remaining levels as Aborted and stops the engine.
-    pub fn abort(&mut self) {
+    /// Begins a safe-state abort. `safe_state_payload` is a pitmode-
+    /// forced VTX_CONFIG payload the caller (worker.rs, which owns
+    /// vtx_table) computed -- queued here rather than sent directly, so
+    /// it goes out through the exact same gated mechanism as every other
+    /// send in this file (see pending_sends' doc comment on
+    /// SweepEngine). Clears anything already queued or pending (e.g. a
+    /// skip's own not-yet-sent safe-state push) and any pending retune,
+    /// since abort takes absolute precedence over whatever the sweep was
+    /// about to do next.
+    pub fn abort(&mut self, safe_state_payload: Vec<u8>) {
         debug!(target: "vtx", "[sweep] aborted at level={:?} freq_idx={} ({}/{} steps completed)",
             self.levels.get(self.level_idx), self.freq_idx, self.completed_steps, self.total_steps);
         for status in self.per_level_status.values_mut() {
@@ -637,6 +604,10 @@ impl SweepEngine {
         }
         self.state = EngineState::Idle;
         self.step = None;
+        self.pending_frequency_push = None;
+        self.pending_sends.clear();
+        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+        self.pending_sends.push_back(PendingSend::SessionEnd);
     }
 
     /// Skips whatever (level, freq) point is currently in progress and
@@ -660,7 +631,13 @@ impl SweepEngine {
     /// checking, transitioning to Idle rather than panicking when the
     /// sweep is genuinely done -- handle the rollover, rather than
     /// duplicating (and getting wrong) that logic here.
-    pub fn skip_current(&mut self) {
+    ///
+    /// `safe_state_payload` (computed by the caller from vtx_table, same
+    /// as abort()) is queued as a pitmode-safe VTX_CONFIG push, giving
+    /// the VTX a defined safe point between the skipped point and
+    /// whatever comes next, sent through the same gated mechanism as
+    /// every other send in this file rather than directly.
+    pub fn skip_current(&mut self, safe_state_payload: Vec<u8>) {
         if !matches!(self.state, EngineState::Running) {
             return;
         }
@@ -693,6 +670,7 @@ impl SweepEngine {
         self.step = None;
         self.level_idx += 1;
         self.per_level_status.insert(level, LevelStatus::Skipped);
+        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
     }
 
     pub fn is_active(&self) -> bool {
@@ -720,26 +698,59 @@ impl SweepEngine {
         latest_reading: Option<msp::PaCalibrationReading>,
         vtx_ready: bool,
         meter_ready: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        // Queued sends (safe-state pushes from skip_current()/abort(),
+        // calibration session begin/end) take absolute priority over
+        // everything else, and are processed regardless of engine state
+        // -- abort() already transitions to Idle synchronously, but its
+        // queued send still needs to go out. One per tick, same
+        // link.can_send_now() gate as every other send in this file, so
+        // there's no separate bookkeeping to keep in sync -- the link
+        // itself is the single source of truth for whether a send is
+        // allowed right now.
+        if !self.pending_sends.is_empty() {
+            if !link.can_send_now() {
+                return Ok(false);
+            }
+            match self.pending_sends.pop_front().unwrap() {
+                PendingSend::SafeState(payload) => {
+                    link.send_v1(function::VTX_CONFIG as u8, &payload)?;
+                    link.note_sent(MspCommandKind::Retune);
+                    debug!(target: "vtx", "[sweep] pitmode-safe state sent");
+                }
+                PendingSend::SessionBegin => {
+                    let payload = msp::encode_pa_calibration_session_request(true);
+                    link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&payload))?;
+                    link.note_sent(MspCommandKind::Other);
+                    debug!(target: "vtx", "[sweep] calibration session: begin requested");
+                }
+                PendingSend::SessionEnd => {
+                    let payload = msp::encode_pa_calibration_session_request(false);
+                    link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&payload))?;
+                    link.note_sent(MspCommandKind::Other);
+                    debug!(target: "vtx", "[sweep] calibration session: end requested");
+                }
+            }
+            return Ok(true);
+        }
+
         if let EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason } = self.state {
             if vtx_ready && meter_ready {
                 self.auto_resume(level, freq_mhz, vbias_mv_at_loss, reason);
             }
-            return Ok(());
+            return Ok(false);
         }
 
         if !matches!(self.state, EngineState::Running) {
-            return Ok(());
+            return Ok(false);
         }
 
-        if Instant::now() < self.next_send_allowed {
-            // Waiting out a settle period from whatever was last sent
-            // (this engine's own retune, or an external caller via
-            // note_external_send() -- e.g. worker.rs's skip-safety
-            // push). Do nothing this tick, including the heartbeat check
-            // below (the VTX being quiet during a deliberate settle
-            // pause is expected, not a sign of lost communication).
-            return Ok(());
+        if !link.can_send_now() {
+            // Waiting out a settle period from whatever was last sent.
+            // Do nothing this tick, including the heartbeat check below
+            // (the VTX being quiet during a deliberate settle pause is
+            // expected, not a sign of lost communication).
+            return Ok(false);
         }
 
         if vtx_ready && meter_ready {
@@ -778,7 +789,7 @@ impl SweepEngine {
                     }
                 }
                 self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason };
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -790,30 +801,27 @@ impl SweepEngine {
             if self.freq_idx >= self.frequencies.len() {
                 self.state = EngineState::Idle; // whole sweep done
                 debug!(target: "vtx", "[sweep] all frequencies complete");
-                return Ok(());
+                // Closes the session opened on start() -- queued, not sent
+                // directly, same as everything else: the very next poll()
+                // tick (once link.can_send_now() allows it) is what
+                // actually issues it.
+                self.pending_sends.push_back(PendingSend::SessionEnd);
+                return Ok(false);
             }
             let next_freq = self.frequencies[self.freq_idx];
             debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {next_freq}MHz",
                 self.freq_idx, self.frequencies.len());
             self.begin_frequency(next_freq);
-            return Ok(());
+            return Ok(false);
         }
 
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
             let payload = build_vtx_config_frequency_payload(freq_mhz, level);
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
-            self.note_sent(MspCommandKind::Retune);
+            link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
-            // A retune is exactly the kind of state-changing command worth
-            // confirming against what the VTX actually reports afterward --
-            // see worker.rs's PACALIBRATION read-dispatch, which logs every
-            // reply this prompts. Best-effort: a failed query here shouldn't
-            // abort the retune itself, which already landed.
-            if let Err(e) = link.send_v2(function::PACALIBRATION, None) {
-                debug!(target: "vtx", "[sweep] failed to request post-retune status: {e}");
-            }
-            return Ok(()); // next tick will wait out the settle gate before sending anything else
+            return Ok(true); // next tick will wait out the settle gate before sending anything else
         }
 
         let level = self.levels[self.level_idx];
@@ -853,7 +861,7 @@ impl SweepEngine {
                                 Some(peak) if rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
                                     debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
                                     self.finish_scan_pa(level, st.vbias_mv, false, true);
-                                    return Ok(());
+                                    return Ok(false);
                                 }
                                 Some(peak) => st.fine_highest_avg_mw = Some(peak.max(rolling)),
                                 None => st.fine_highest_avg_mw = Some(rolling),
@@ -863,26 +871,30 @@ impl SweepEngine {
                 }
 
                 if st.wait.is_none() {
+                    let mut sent = false;
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
                         self.last_send = Instant::now();
+                        sent = true;
                         let (needed, skip) = match st.phase {
                             ScanPaPhase::Fine | ScanPaPhase::CoarseRamp => (4, 0),
                         };
                         st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
                     self.step = Some(StepState::Pa(st));
-                    return Ok(());
+                    return Ok(sent);
                 }
 
                 let wait = st.wait.as_ref().unwrap();
                 if !wait.ready(now_seq) {
+                    let mut sent = false;
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
                         self.last_send = Instant::now();
+                        sent = true;
                     }
                     self.step = Some(StepState::Pa(st));
-                    return Ok(());
+                    return Ok(sent);
                 }
 
                 let avg_mw = wait.average(history);
@@ -930,7 +942,7 @@ impl SweepEngine {
                                 // actually looking into.
                                 debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point already read at or above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- no below-target point was ever established, bailing this (level,freq) rather than reporting a false success", st.vbias_mv);
                                 self.finish_scan_pa(level, st.vbias_mv, false, false);
-                                return Ok(());
+                                return Ok(false);
                             };
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}",
                                 st.vbias_mv);
@@ -956,7 +968,7 @@ impl SweepEngine {
                                 // overshooting -- bail this (level, freq) as best-effort.
                                 debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target -- bailing this (level,freq) as best-effort", st.vbias_mv);
                                 self.finish_scan_pa(level, st.vbias_mv, false, false);
-                                return Ok(());
+                                return Ok(false);
                             }
                             st.last_below_target_mv = Some(st.vbias_mv);
                             st.vbias_mv += up * next_step_mv;
@@ -978,11 +990,11 @@ impl SweepEngine {
                         if avg_mw >= target_mw {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at vbias_mv={} ({avg_mw:.4}mW)", st.vbias_mv);
                             self.finish_scan_pa(level, st.vbias_mv, true, false);
-                            return Ok(());
+                            return Ok(false);
                         } else if !(fine_lo..=fine_hi).contains(&(st.vbias_mv + up)) {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{fine_lo},{fine_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
                             self.finish_scan_pa(level, st.vbias_mv, false, false);
-                            return Ok(());
+                            return Ok(false);
                         } else {
                             st.vbias_mv += up;
                             st.wait = None;
@@ -1007,9 +1019,11 @@ impl SweepEngine {
 
             StepState::Detector(mut st) => {
                 if st.wait.is_none() {
+                    let mut sent = false;
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
                         self.last_send = Instant::now();
+                        sent = true;
                         let (needed, skip) = match st.phase {
                             ScanDetectorPhase::Backoff => (1, 0),
                             ScanDetectorPhase::Bracket => (20, 10),
@@ -1017,18 +1031,21 @@ impl SweepEngine {
                         st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
                     self.step = Some(StepState::Detector(st));
-                    return Ok(());
+                    return Ok(sent);
                 }
 
                 let wait = st.wait.as_ref().unwrap();
                 if !wait.ready(now_seq) {
+                    let mut sent = false;
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
                         self.last_send = Instant::now();
+                        sent = true;
                     }
                     self.step = Some(StepState::Detector(st));
-                    return Ok(());
+                    return Ok(sent);
                 }
+
 
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
@@ -1055,7 +1072,7 @@ impl SweepEngine {
                             if st.pinned_count >= PINNED_LIMIT {
                                 debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
                                 self.finish_scan_detector(level, detector_now, false);
-                                return Ok(());
+                                return Ok(false);
                             }
                         }
                     }
@@ -1090,14 +1107,14 @@ impl SweepEngine {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={detector_now} as a rough (not interpolated) fallback",
                                 st.pinned_count);
                             self.finish_scan_detector(level, detector_now, false);
-                            return Ok(());
+                            return Ok(false);
                         }
 
                         if let (Some(below), Some(above)) = (st.below, st.above) {
                             let detector = interpolate(target_mw, below, above);
                             debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
                             self.finish_scan_detector(level, detector, true);
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
@@ -1118,7 +1135,7 @@ impl SweepEngine {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Progress within the CURRENT (level, freq, op) step only -- coarse,
@@ -1287,25 +1304,6 @@ impl SweepEngine {
         self.det_cell_status.clear();
     }
 
-    /// Records that an MSP command of `kind` was just sent, from inside
-    /// this engine's own poll() -- see next_send_allowed's doc comment.
-    fn note_sent(&mut self, kind: MspCommandKind) {
-        self.next_send_allowed = Instant::now() + kind.settle_duration();
-    }
-
-    /// Same as note_sent(), for a command sent from OUTSIDE this engine
-    /// -- e.g. worker.rs's skip-safety push, which has to be sent
-    /// directly (it needs `link`/`vtx_table`, neither of which
-    /// skip_current() has access to) rather than through poll(). Lets an
-    /// external sender participate in the same settle gate poll() itself
-    /// respects, instead of needing its own separate, disconnected delay
-    /// mechanism -- which is exactly the shape the bug being fixed here
-    /// had: a message sent with no way to make the NEXT sender (poll(),
-    /// on the very next tick) actually wait for it.
-    pub fn note_external_send(&mut self, kind: MspCommandKind) {
-        self.note_sent(kind);
-    }
-
     /// Sets `map[key] = status`, except LimitHit is sticky -- once a
     /// cell is marked as the point where a trip happened, a later
     /// Calibrated/Uncalibrated/Current outcome for that same cell
@@ -1322,7 +1320,7 @@ impl SweepEngine {
         let (lo, hi) = self.effective_bounds(level);
         let vbias_mv = vbias_mv.clamp(lo, hi) as u16;
         link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))?;
-        self.note_sent(MspCommandKind::Calibration);
+        link.note_sent(MspCommandKind::Calibration);
         Ok(())
     }
 
