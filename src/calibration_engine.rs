@@ -199,6 +199,24 @@ const PA_FAILURE_WINDOW_SECS: f64 = 3.0;
 /// limited" example dropped from a 94% peak down to 89%, a ~5 point --
 /// not a fractional -- decline, well past this threshold).
 const PA_FAILURE_DROP_FRACTION: f32 = 0.03;
+/// How long to wait, after CoarseRamp hands off to Fine, before trusting
+/// any samples for Fine's own convergence check -- see the CoarseRamp
+/// match arm's doc comment for why. A real run on a Skyworks SE5004L
+/// board showed the PA's actual output measurably lagging the DAC value
+/// change at this handoff (capacitors in the VBIAS circuit), and
+/// SampleWait's own 4-sample gate is purely count-based -- a fast meter
+/// can satisfy it well before the hardware has physically caught up.
+const FINE_SETTLE_DELAY: Duration = Duration::from_secs(1);
+/// How long after Fine creep begins before the PA-Failure (thermal
+/// rolloff) check is actually armed. A real run showed the drop-
+/// detection tracking firing within the first few seconds of Fine
+/// starting -- well before the PA had any chance to genuinely thermally
+/// roll off, on ordinary settling/ramp-up behavior instead. This is
+/// deliberately much longer than FINE_SETTLE_DELAY above (a different,
+/// narrower concern -- letting the DAC's own physical settle finish) so
+/// there's real margin against early-Fine transients of any kind before
+/// a drop actually causes an abort.
+const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(10);
 
 enum ScanPaPhase {
     CoarseRamp,
@@ -238,6 +256,19 @@ struct ScanPaState {
     /// during this Fine creep -- see the Fine match arm's doc comment
     /// and rolling_average_since().
     fine_highest_avg_mw: Option<f32>,
+    /// Wall-clock deadline for FINE_SETTLE_DELAY -- set the moment
+    /// CoarseRamp hands off to Fine, cleared once elapsed. While Some
+    /// and not yet elapsed, Fine resends the DAC value (so it's
+    /// definitely in flight) but discards any completed SampleWait
+    /// rather than using it for the convergence check -- see the Fine
+    /// match arm's doc comment.
+    fine_settle_until: Option<Instant>,
+    /// Wall-clock instant Fine creep began -- separate from
+    /// fine_started_at_secs (history's own elapsed-seconds clock, used
+    /// by rolling_average_since) because PA_FAILURE_GRACE_DURATION and
+    /// debug_state()'s drop_detector_active need a clock they can read
+    /// without needing `history` in scope.
+    fine_started_instant: Option<Instant>,
 }
 
 enum ScanDetectorPhase {
@@ -352,6 +383,33 @@ pub struct CurrentStep {
     pub freq_idx: usize,
     pub vbias_mv: Option<i32>,
     pub detector_mv: Option<i32>,
+}
+
+/// Snapshot of the engine's internal ScanPa/ScanDetector step state, for
+/// the UI's diagnostic indicators displayed under the progress bar --
+/// separate from CurrentStep above, which only covers what the sweep
+/// table itself needs. See debug_state().
+pub struct StepDebugInfo {
+    /// ScanPa's own sub-phase: "Coarse" or "Fine" during a ScanPa step,
+    /// "Inactive" during a ScanDetector step or when no step is running.
+    pub scan_phase: &'static str,
+    /// True once Fine creep's PA-Failure (thermal rolloff) check is
+    /// actually armed -- Fine phase AND past PA_FAILURE_GRACE_DURATION.
+    /// False the rest of the time, including during the grace period
+    /// itself, even though fine_highest_avg_mw is still being tracked
+    /// then (see the Fine PA-Failure check's own doc comment).
+    pub drop_detector_active: bool,
+    pub fine_bound_mv: Option<i32>,
+    pub fine_highest_avg_mw: Option<f32>,
+    /// Some() only during a ScanDetector step.
+    pub detector: Option<DetectorDebugInfo>,
+}
+
+pub struct DetectorDebugInfo {
+    pub phase: &'static str, // "Backoff" or "Bracket"
+    pub below: Option<(f32, u16)>,
+    pub above: Option<(f32, u16)>,
+    pub pinned_count: u32,
 }
 
 pub struct SweepEngine {
@@ -1090,6 +1148,8 @@ impl SweepEngine {
                 fine_bound_mv: None,
                 fine_started_at_secs: None,
                 fine_highest_avg_mw: None,
+                fine_settle_until: None,
+                fine_started_instant: None,
             }));
             debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from vbias_mv={COARSE_RAMP_START_MV}");
             self.per_level_status.insert(
@@ -1107,8 +1167,17 @@ impl SweepEngine {
                 if matches!(st.phase, ScanPaPhase::Fine) {
                     if let Some(started_at) = st.fine_started_at_secs {
                         if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
+                            // Still tracked during the grace period (so once it
+                            // ends we have a real peak to compare against, not a
+                            // fresh start with no history) -- only the ABORT
+                            // itself is suppressed while still within
+                            // PA_FAILURE_GRACE_DURATION of Fine creep beginning.
+                            let in_grace_period = st
+                                .fine_started_instant
+                                .map(|t| t.elapsed() < PA_FAILURE_GRACE_DURATION)
+                                .unwrap_or(false);
                             match st.fine_highest_avg_mw {
-                                Some(peak) if rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
+                                Some(peak) if !in_grace_period && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
                                     debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
                                     self.finish_scan_pa(level, st.vbias_mv, false, true);
                                     return Ok(false);
@@ -1117,6 +1186,32 @@ impl SweepEngine {
                                 None => st.fine_highest_avg_mw = Some(rolling),
                             }
                         }
+                    }
+
+                    // 1-second DAC-settle delay right after the CoarseRamp->Fine
+                    // handoff -- see FINE_SETTLE_DELAY's doc comment. Placed
+                    // before `wait` is ever borrowed below, so resetting
+                    // st.wait here can't run into any borrow-checker questions
+                    // about a still-live reference into the same field.
+                    if let Some(settle_until) = st.fine_settle_until {
+                        if Instant::now() < settle_until {
+                            // Still settling -- discard any samples collected so
+                            // far (SampleWait's own gate is purely count-based,
+                            // so it can fill well before the VBIAS circuit has
+                            // physically caught up) and resend (throttled) so
+                            // the DAC value is definitely in flight, but don't
+                            // start counting toward the convergence check yet.
+                            st.wait = None;
+                            let mut sent = false;
+                            if !throttled {
+                                self.send_calibration(link, level, st.vbias_mv)?;
+                                self.last_send = Instant::now();
+                                sent = true;
+                            }
+                            self.step = Some(StepState::Pa(st));
+                            return Ok(sent);
+                        }
+                        st.fine_settle_until = None; // settled -- proceed normally from here on
                     }
                 }
 
@@ -1194,7 +1289,7 @@ impl SweepEngine {
                                 self.finish_scan_pa(level, st.vbias_mv, false, false);
                                 return Ok(false);
                             };
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}",
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
                                 st.vbias_mv);
                             st.fine_bound_mv = Some(st.vbias_mv);
                             st.vbias_mv = fine_start;
@@ -1202,6 +1297,8 @@ impl SweepEngine {
                             st.wait = None;
                             st.fine_started_at_secs = history.back().map(|e| e.0);
                             st.fine_highest_avg_mw = None;
+                            st.fine_settle_until = Some(Instant::now() + FINE_SETTLE_DELAY);
+                            st.fine_started_instant = Some(Instant::now());
                         } else {
                             let next_step_mv = if avg_mw >= target_mw * 0.90 {
                                 let halved = (st.coarse_step_mv / 2).max(1);
@@ -1453,6 +1550,53 @@ impl SweepEngine {
                 detector_mv: Some(st.last_detector_mv as i32),
             }),
             None => None,
+        }
+    }
+
+    /// Diagnostic snapshot of the engine's internal ScanPa/ScanDetector
+    /// step state, for the UI's debug indicators under the progress bar.
+    pub fn debug_state(&self) -> StepDebugInfo {
+        match &self.step {
+            Some(StepState::Pa(st)) => {
+                let scan_phase = match st.phase {
+                    ScanPaPhase::CoarseRamp => "Coarse",
+                    ScanPaPhase::Fine => "Fine",
+                };
+                let drop_detector_active = matches!(st.phase, ScanPaPhase::Fine)
+                    && st
+                        .fine_started_instant
+                        .map(|t| t.elapsed() >= PA_FAILURE_GRACE_DURATION)
+                        .unwrap_or(false);
+                StepDebugInfo {
+                    scan_phase,
+                    drop_detector_active,
+                    fine_bound_mv: st.fine_bound_mv,
+                    fine_highest_avg_mw: st.fine_highest_avg_mw,
+                    detector: None,
+                }
+            }
+            Some(StepState::Detector(st)) => StepDebugInfo {
+                scan_phase: "Inactive",
+                drop_detector_active: false,
+                fine_bound_mv: None,
+                fine_highest_avg_mw: None,
+                detector: Some(DetectorDebugInfo {
+                    phase: match st.phase {
+                        ScanDetectorPhase::Backoff => "Backoff",
+                        ScanDetectorPhase::Bracket => "Bracket",
+                    },
+                    below: st.below,
+                    above: st.above,
+                    pinned_count: st.pinned_count,
+                }),
+            },
+            None => StepDebugInfo {
+                scan_phase: "Inactive",
+                drop_detector_active: false,
+                fine_bound_mv: None,
+                fine_highest_avg_mw: None,
+                detector: None,
+            },
         }
     }
 
