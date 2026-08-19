@@ -542,6 +542,66 @@ pub fn show(
         ui.add(egui::ProgressBar::new(sub_val).text(if sub_label.is_empty() { "Idle" } else { sub_label }));
     }
 
+    // ---- Debug/diagnostic indicators (always shown) -----------------------
+    {
+        let debug = {
+            let g = sweep.lock().unwrap();
+            g.as_ref().map(|e| e.debug_state())
+        };
+        let (scan_phase, drop_active, fine_bound_mv, fine_highest_avg_mw, detector) = match debug {
+            Some(d) => (d.scan_phase, d.drop_detector_active, d.fine_bound_mv, d.fine_highest_avg_mw, d.detector),
+            None => ("Inactive", false, None, None, None),
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Scan Phase:");
+            ui.label(scan_phase);
+            ui.separator();
+
+            ui.label("Drop detector:");
+            ui.label(if drop_active { "Active" } else { "Inactive" });
+            ui.separator();
+
+            ui.label("fine_bound_mv:");
+            ui.label(match fine_bound_mv {
+                Some(v) => v.to_string(),
+                None => "None".to_string(),
+            });
+            ui.separator();
+
+            ui.label("fine_highest_average:");
+            ui.label(match fine_highest_avg_mw {
+                Some(v) => format!("{v:.4}mW"),
+                None => "None".to_string(),
+            });
+            ui.separator();
+
+            ui.label("Detector phase:");
+            ui.label(detector.as_ref().map(|d| d.phase).unwrap_or("None"));
+            ui.separator();
+
+            ui.label("Detector below:");
+            ui.label(match detector.as_ref().and_then(|d| d.below) {
+                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                None => "None".to_string(),
+            });
+            ui.separator();
+
+            ui.label("Detector above:");
+            ui.label(match detector.as_ref().and_then(|d| d.above) {
+                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                None => "None".to_string(),
+            });
+            ui.separator();
+
+            ui.label("Pinned counter:");
+            ui.label(match &detector {
+                Some(d) => d.pinned_count.to_string(),
+                None => "None".to_string(),
+            });
+        });
+    }
+
     // ---- Tolerance + Automatic/Manual/Stop/Skip -------------------------
     let (automatic_mode, manual_mode, manual_dac_mv) = {
         let g = sweep.lock().unwrap();
