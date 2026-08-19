@@ -676,16 +676,8 @@ pub fn show(
             let _ = cmd_tx.send(Command::SendCalTableToVtx);
         }
 
-        let any_calibrated = {
-            let g = sweep.lock().unwrap();
-            g.as_ref()
-                .map(|e| e.per_level_status.values().any(|s| matches!(s, LevelStatus::Done)))
-                .unwrap_or(false)
-        };
-        ui.add_enabled_ui(any_calibrated, |ui| {
-            if ui.button("Save EEPROM").clicked() {
-                let _ = cmd_tx.send(Command::SaveEeprom);
-            }
-        });
+        if ui.button("Save EEPROM").clicked() {
+            let _ = cmd_tx.send(Command::SaveEeprom);
+        }
     });
 }
