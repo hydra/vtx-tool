@@ -217,6 +217,18 @@ const FINE_SETTLE_DELAY: Duration = Duration::from_secs(1);
 /// there's real margin against early-Fine transients of any kind before
 /// a drop actually causes an abort.
 const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(10);
+/// How long to ignore samples after the PA's boost stage is observed
+/// transitioning from off to on -- separate from FINE_SETTLE_DELAY
+/// above (that one covers a DAC value change specifically at the
+/// CoarseRamp->Fine handoff; this covers the PA actually powering up at
+/// all, which can happen at the start of ANY step -- ScanPa's coarse
+/// ramp, Fine creep, or ScanDetector's own search -- whenever this is
+/// the first point after a level/frequency change and the level's
+/// ext_pa_enable first takes effect, or Manual mode's PA checkbox is
+/// switched on). A real run showed the coarse ramp's very first sample,
+/// taken the instant boost turned on, read as an immediate false
+/// overshoot -- before the PA had any chance to actually stabilize.
+const BOOST_ENABLE_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 enum ScanPaPhase {
     CoarseRamp,
@@ -514,6 +526,20 @@ pub struct SweepEngine {
     /// Off immediately after start_manual() (PA must not be enabled when
     /// Manual mode starts); On/Off after set_pa_boost().
     boost_mode: BoostMode,
+    /// Most recently observed boost_on value from live VTX telemetry --
+    /// compared against each new reading to detect an off-to-on
+    /// transition, which starts boost_settle_until below. None until the
+    /// first status reply arrives.
+    last_boost_on: Option<bool>,
+    /// Wall-clock deadline: no sample is trusted for ANY convergence
+    /// check (ScanPa coarse or fine, ScanDetector backoff or bracket)
+    /// while Instant::now() is before this. Set on every observed
+    /// boost_on false/none -> true transition, engine-wide rather than
+    /// per-step since boost state itself is global -- see
+    /// BOOST_ENABLE_SETTLE_DELAY's doc comment for why enabling the PA
+    /// needs this regardless of which phase happens to be running at the
+    /// time.
+    boost_settle_until: Option<Instant>,
 }
 
 /// How long the VTX (or meter) can go completely silent while a sweep is
@@ -634,6 +660,8 @@ impl SweepEngine {
             manual_send_pending: false,
             session_active: false,
             boost_mode: BoostMode::Auto,
+            last_boost_on: None,
+            boost_settle_until: None,
         }
     }
 
@@ -1037,6 +1065,22 @@ impl SweepEngine {
         vtx_ready: bool,
         meter_ready: bool,
     ) -> anyhow::Result<bool> {
+        // Track boost_on transitions from live telemetry before anything
+        // else this tick -- the PA can power up at the start of ANY
+        // phase (ScanPa coarse, Fine, ScanDetector, or Manual mode's own
+        // PA checkbox), so this has to run unconditionally rather than
+        // being embedded in one specific step's own handling. See
+        // BOOST_ENABLE_SETTLE_DELAY's doc comment.
+        if let Some(reading) = &latest_reading {
+            if let Some(boost_on) = reading.boost_on {
+                if boost_on && self.last_boost_on != Some(true) {
+                    debug!(target: "vtx", "[sweep] PA boost just enabled -- ignoring samples for {BOOST_ENABLE_SETTLE_DELAY:?}");
+                    self.boost_settle_until = Some(Instant::now() + BOOST_ENABLE_SETTLE_DELAY);
+                }
+                self.last_boost_on = Some(boost_on);
+            }
+        }
+
         // Queued sends (safe-state pushes from skip_current()/abort(),
         // calibration session begin/end) take absolute priority over
         // everything else, and are processed regardless of engine state
@@ -1164,6 +1208,28 @@ impl SweepEngine {
 
         match self.step.take().unwrap() {
             StepState::Pa(mut st) => {
+                // PA-enable settle gate -- applies to CoarseRamp and Fine
+                // alike, since the PA can power up at the start of either
+                // (whichever phase happens to be running when the level/
+                // frequency's boost first turns on). See
+                // BOOST_ENABLE_SETTLE_DELAY's doc comment. Placed before
+                // `wait` is ever borrowed below, same reasoning as
+                // fine_settle_until's own placement.
+                if let Some(settle_until) = self.boost_settle_until {
+                    if Instant::now() < settle_until {
+                        st.wait = None;
+                        let mut sent = false;
+                        if !throttled {
+                            self.send_calibration(link, level, st.vbias_mv)?;
+                            self.last_send = Instant::now();
+                            sent = true;
+                        }
+                        self.step = Some(StepState::Pa(st));
+                        return Ok(sent);
+                    }
+                    self.boost_settle_until = None; // settled -- proceed normally from here on
+                }
+
                 if matches!(st.phase, ScanPaPhase::Fine) {
                     if let Some(started_at) = st.fine_started_at_secs {
                         if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
@@ -1365,6 +1431,24 @@ impl SweepEngine {
             }
 
             StepState::Detector(mut st) => {
+                // PA-enable settle gate -- see the same check at the top
+                // of the Pa arm above for why this needs to cover
+                // ScanDetector too, not just ScanPa.
+                if let Some(settle_until) = self.boost_settle_until {
+                    if Instant::now() < settle_until {
+                        st.wait = None;
+                        let mut sent = false;
+                        if !throttled {
+                            self.send_calibration(link, level, st.vbias_mv)?;
+                            self.last_send = Instant::now();
+                            sent = true;
+                        }
+                        self.step = Some(StepState::Detector(st));
+                        return Ok(sent);
+                    }
+                    self.boost_settle_until = None; // settled -- proceed normally from here on
+                }
+
                 if st.wait.is_none() {
                     let mut sent = false;
                     if !throttled {
