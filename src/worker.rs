@@ -183,6 +183,21 @@ pub enum Command {
     /// conn_status::OverallState::Ready, but the handler re-checks both
     /// ports defensively regardless.
     StartSweep { levels: Vec<u8>, tolerance_pct: f32 },
+    /// Starts Manual mode -- see SweepEngine::start_manual(). Same
+    /// `levels` meaning as StartSweep's; no tolerance since Manual mode
+    /// doesn't do any automatic bracketing itself (the engine still
+    /// needs one internally, in case Re-calibrate later resumes
+    /// automatic scanning on this same instance -- see the handler).
+    StartManual { levels: Vec<u8> },
+    /// UI's DAC slider changed -- see SweepEngine::set_manual_dac().
+    SetManualDac { mv: i32 },
+    /// "Next" in Manual mode: commits the current slider value and the
+    /// VTX's live detector reading as this cell's result, then advances
+    /// -- see SweepEngine::manual_next().
+    ManualNext,
+    /// "Manual" pressed again to exit -- see SweepEngine::exit_manual().
+    /// The in-progress (not yet "Next"-ed) point is left untouched.
+    ExitManual,
     /// UI confirms the user has retuned a manual-frequency meter.
     ConfirmFrequency,
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
@@ -397,6 +412,25 @@ pub fn spawn(
                             error!(target: "vtx", "StartSweep requested while not fully connected (vtx={:?} meter={:?})",
                                 vtx_state_now, meter_state_now);
                         } else {
+                            // If Manual mode is currently active, "Re-calibrate"
+                            // resumes automatic scanning from wherever it was
+                            // sitting rather than starting over from scratch --
+                            // see resume_automatic_from_current()'s own doc
+                            // comment (every point Manual mode already
+                            // committed via "Next" stays as its Manual result).
+                            let resumed = {
+                                let mut guard = sweep.lock().unwrap();
+                                match guard.as_mut() {
+                                    Some(engine) if matches!(engine.state, calibration_engine::EngineState::ManualActive) => {
+                                        engine.resume_automatic_from_current();
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+                            if resumed {
+                                debug!(target: "vtx", "resumed automatic calibration from current manual position");
+                            } else {
                             let (pa_table, meter_kind, prev_update_hz) = {
                                 let s = state.lock().unwrap();
                                 (s.pa_table.clone(), s.meter_kind, s.update_hz)
@@ -437,6 +471,115 @@ pub fn spawn(
                                 }
                                 *sweep.lock().unwrap() = Some(engine);
                             }
+                            }
+                        }
+                    }
+
+                    Command::StartManual { levels } => {
+                        let (vtx_state_now, meter_state_now) = {
+                            let s = state.lock().unwrap();
+                            (s.vtx_port_state, s.meter_port_state)
+                        };
+                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready {
+                            error!(target: "vtx", "StartManual requested while not fully connected (vtx={:?} meter={:?})",
+                                vtx_state_now, meter_state_now);
+                        } else {
+                            let (pa_table, meter_kind, prev_update_hz) = {
+                                let s = state.lock().unwrap();
+                                (s.pa_table.clone(), s.meter_kind, s.update_hz)
+                            };
+                            let freq_entry = pa_table.iter().find(|e| e.idx == 0);
+                            let frequencies: Vec<u16> =
+                                freq_entry.map(|e| e.value.iter().copied().filter(|&f| f > 0).collect()).unwrap_or_default();
+                            let sign_inverted = freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
+
+                            let mut target_mw_by_level = std::collections::HashMap::new();
+                            for &lvl in &levels {
+                                if let Some(entry) = pa_table.iter().find(|e| e.idx == lvl) {
+                                    target_mw_by_level.insert(lvl, entry.m_w);
+                                }
+                            }
+
+                            if frequencies.is_empty() {
+                                error!(target: "vtx", "StartManual: no frequency breakpoints in the PA table -- Refresh it first");
+                            } else if levels.is_empty() {
+                                error!(target: "vtx", "StartManual: no power levels selected");
+                            } else {
+                                // tolerance_pct is irrelevant to Manual mode itself,
+                                // but the engine needs one anyway in case Re-calibrate
+                                // later resumes automatic scanning on this same
+                                // instance -- 10% matches automatic mode's own default.
+                                let mut engine = SweepEngine::new(
+                                    levels,
+                                    frequencies,
+                                    10.0,
+                                    sign_inverted,
+                                    target_mw_by_level,
+                                    meter_kind.max_update_hz(),
+                                );
+                                engine.start_manual(meter_kind.capability());
+                                // Seed the slider from whatever's already stored for
+                                // the first (level, freq) cell, so Manual mode starts
+                                // from the existing calibration rather than a blind
+                                // default -- see set_manual_dac()'s own doc comment.
+                                if let Some(&level) = engine.levels.first() {
+                                    if let Some(entry) = pa_table.iter().find(|e| e.idx == level) {
+                                        if let Some(&mv) = entry.value.first() {
+                                            engine.set_manual_dac(mv as i32);
+                                        }
+                                    }
+                                }
+                                let sweep_hz = engine.sweep_hz;
+                                debug!(target: "vtx", "manual mode started: {} levels, {} frequencies",
+                                    engine.levels.len(), engine.frequencies.len());
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.pre_sweep_update_hz = Some(prev_update_hz);
+                                    s.update_hz = sweep_hz;
+                                }
+                                *sweep.lock().unwrap() = Some(engine);
+                            }
+                        }
+                    }
+
+                    Command::SetManualDac { mv } => {
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.set_manual_dac(mv);
+                        }
+                    }
+
+                    Command::ManualNext => {
+                        let detector_mv = {
+                            let s = state.lock().unwrap();
+                            s.vtx_status.as_ref().map(|v| v.detector_mv).unwrap_or(0)
+                        };
+                        let next_pos = {
+                            let mut guard = sweep.lock().unwrap();
+                            guard.as_mut().and_then(|engine| engine.manual_next(detector_mv))
+                        };
+                        // Seed the slider for the new cell from its existing table
+                        // value, same as StartManual's own initial seed -- otherwise
+                        // it'd stay wherever the previous cell's slider was left,
+                        // which is very likely wrong for a different level/frequency.
+                        if let Some((level, freq_idx)) = next_pos {
+                            let pa_table = state.lock().unwrap().pa_table.clone();
+                            if let Some(entry) = pa_table.iter().find(|e| e.idx == level) {
+                                if let Some(&mv) = entry.value.get(freq_idx) {
+                                    if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                                        engine.set_manual_dac(mv as i32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Command::ExitManual => {
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.exit_manual();
+                        }
+                        let mut s = state.lock().unwrap();
+                        if let Some(prev) = s.pre_sweep_update_hz.take() {
+                            s.update_hz = prev;
                         }
                     }
 
