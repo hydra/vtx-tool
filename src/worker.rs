@@ -242,6 +242,13 @@ pub fn spawn(
         let mut vtx_last_reconnect_attempt = Instant::now();
         let mut meter_last_reconnect_attempt = Instant::now();
         let mut last_status_query = Instant::now();
+        // Periodic MSP-level TX/RX packet-count log -- see
+        // MspLink::tx_rx_counts()'s own doc comment for why: a basic
+        // "are commands reaching the VTX, are replies coming back at
+        // all" diagnostic that doesn't depend on interpreting any
+        // specific command's own behavior.
+        let mut last_txrx_log = Instant::now();
+        const TXRX_LOG_INTERVAL: Duration = Duration::from_secs(5);
         // Set true whenever poll() (or, before its own reply arrives, a
         // session begin/end) actually sent something state-changing this
         // tick -- see the PACALIBRATION read-dispatch below, which logs
@@ -693,6 +700,11 @@ pub fn spawn(
                     if let Err(e) = link.send_v2(function::PACALIBRATION, None) {
                         error!(target: "vtx", "failed to send status query: {e}");
                     }
+                }
+                if last_txrx_log.elapsed() >= TXRX_LOG_INTERVAL {
+                    last_txrx_log = Instant::now();
+                    let (tx, rx) = link.tx_rx_counts();
+                    debug!(target: "vtx", "MSP link: tx={tx} rx={rx}");
                 }
             }
 
