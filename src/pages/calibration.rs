@@ -52,6 +52,9 @@ pub struct CalibrationPageState {
     pub tolerance_pct: f32,
     pub checked: HashMap<u8, bool>,
     show_confirm_dialog: bool,
+    /// Manual mode's "fine" checkbox: true = the DAC slider moves in
+    /// 1mV steps, false = 25mV steps.
+    fine_step: bool,
 }
 
 impl Default for CalibrationPageState {
@@ -60,6 +63,7 @@ impl Default for CalibrationPageState {
             tolerance_pct: 10.0, // matches rf_calibration.py's own scanDetector default (max(0.1, mW*0.1))
             checked: HashMap::new(),
             show_confirm_dialog: false,
+            fine_step: false,
         }
     }
 }
@@ -77,6 +81,7 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
         CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
         CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),       // neutral grey -- deliberate, not a failure
         CellStatus::PaFailure => Some(egui::Color32::from_rgb(165, 80, 15)),    // distinct burnt orange -- hardware condition, not just a non-convergent search
+        CellStatus::Manual => Some(egui::Color32::from_rgb(80, 55, 100)),       // muted violet -- hand-set, distinct from an automatic Calibrated result
     }
 }
 
@@ -537,7 +542,11 @@ pub fn show(
         }
     }
 
-    // ---- Tolerance + Re-calibrate/Stop --------------------------------
+    // ---- Tolerance + Re-calibrate/Stop/Manual --------------------------
+    let manual_active = {
+        let g = sweep.lock().unwrap();
+        g.as_ref().map(|e| matches!(e.state, calibration_engine::EngineState::ManualActive)).unwrap_or(false)
+    };
     ui.horizontal(|ui| {
         ui.label("Scan detector tolerance:");
         ui.add(
@@ -547,7 +556,37 @@ pub fn show(
                 .speed(0.1),
         );
 
-        if sweep_active {
+        if manual_active {
+            if ui.button("Manual").clicked() {
+                let _ = cmd_tx.send(Command::ExitManual);
+            }
+            if ui.button("Re-calibrate").clicked() {
+                // Resumes automatic scanning from the current position on
+                // the existing engine -- see resume_automatic_from_current()'s
+                // doc comment. The confirm dialog is skipped here: RF output
+                // is already live from Manual mode, unlike starting a fresh
+                // sweep from Idle.
+                let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+                levels.sort_unstable();
+                let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
+            }
+
+            let mut current_mv = {
+                let g = sweep.lock().unwrap();
+                g.as_ref().map(|e| e.manual_dac_mv).unwrap_or(0)
+            };
+            let step = if page.fine_step { 1.0 } else { 25.0 };
+            let response =
+                ui.add(egui::Slider::new(&mut current_mv, 0..=3300).text("DAC mV").step_by(step));
+            if response.changed() {
+                let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
+            }
+            ui.checkbox(&mut page.fine_step, "fine");
+
+            if ui.button("Next >").clicked() {
+                let _ = cmd_tx.send(Command::ManualNext);
+            }
+        } else if sweep_active {
             if ui.button("Stop").clicked() {
                 let _ = cmd_tx.send(Command::AbortSweep);
             }
@@ -563,6 +602,11 @@ pub fn show(
             ui.add_enabled_ui(any_checked && overall_ready, |ui| {
                 if ui.button("Re-calibrate").clicked() {
                     page.show_confirm_dialog = true;
+                }
+                if ui.button("Manual").clicked() {
+                    let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+                    levels.sort_unstable();
+                    let _ = cmd_tx.send(Command::StartManual { levels });
                 }
             });
             if any_checked && !overall_ready {

@@ -126,6 +126,10 @@ pub enum CellStatus {
     /// -- distinct from Uncalibrated, which means a search actually ran
     /// and failed to converge; this means no search ran at all.
     Skipped,
+    /// Set directly by the user via Manual mode's DAC slider, rather
+    /// than found by an automatic search -- distinct from Calibrated so
+    /// the UI can show which cells were hand-set.
+    Manual,
     /// Fine creep aborted because the rolling power-meter average
     /// dropped below its own peak recorded during this creep -- the PA
     /// is very likely thermally rolling off under sustained drive
@@ -179,7 +183,7 @@ impl SampleWait {
 /// Starting point for the coarse ramp -- extracted as a constant since
 /// sub_progress() needs the same value to compute how far the ramp has
 /// traveled toward the DAC boundary.
-const COARSE_RAMP_START_MV: i32 = 3300;
+const COARSE_RAMP_START_MV: i32 = 3200;
 const COARSE_RAMP_STEP_MV: i32 = 25;
 /// Rolling window used by Fine creep's thermal-rolloff check -- see
 /// rolling_average_since() and the Fine match arm's doc comment.
@@ -280,6 +284,12 @@ pub enum EngineState {
     Idle,
     AwaitingFreqConfirm { freq_mhz: u16 },
     Running,
+    /// Manual mode is active: the person is directly driving the DAC via
+    /// a slider rather than an automatic search running. poll() takes a
+    /// completely different path in this state (see poll_manual()) --
+    /// no ScanPa/ScanDetector stepping, just sending whatever
+    /// manual_dac_mv currently holds when it changes.
+    ManualActive,
     /// No traffic from the VTX, or the power meter's connection lost/
     /// disconnected, for longer than a sweep in progress should ever go
     /// quiet. Paused here (not aborted) -- auto-resumes on its own once
@@ -414,6 +424,28 @@ pub struct SweepEngine {
     /// silence (not a single missed tick) is what actually triggers
     /// ConnectionLost -- see HEARTBEAT_TIMEOUT.
     unresponsive_since: Option<Instant>,
+
+    /// Whether begin_frequency()/confirm_frequency() should land in
+    /// ManualActive or Running once any AwaitingFreqConfirm prompt
+    /// clears -- both modes share that prompt (it's about the power
+    /// meter's own band, unrelated to which calibration mode is
+    /// active), so this is the one flag that decides which state comes
+    /// after it. Set by start_manual()/exit_manual()/
+    /// resume_automatic_from_current().
+    in_manual_mode: bool,
+    /// Current DAC value Manual mode is tracking -- set by
+    /// set_manual_dac() (the UI slider), read by poll_manual() to know
+    /// what to send. Not itself gated by anything; only the actual send
+    /// is (see manual_send_pending).
+    pub manual_dac_mv: i32,
+    /// True when manual_dac_mv has changed since it was last actually
+    /// sent -- poll_manual() sends and clears this, throttled by
+    /// last_send/SEND_INTERVAL the same way automatic mode's own steps
+    /// are, so a fast slider drag doesn't flood the link (only ever
+    /// matters as a rate limit here, since MspLink::send() would refuse
+    /// outright if the retune settle window from the initial per-point
+    /// retune were still open).
+    manual_send_pending: bool,
 }
 
 /// How long the VTX (or meter) can go completely silent while a sweep is
@@ -499,6 +531,9 @@ impl SweepEngine {
             hard_limits: HashMap::new(),
             pending_sends: VecDeque::new(),
             unresponsive_since: None,
+            in_manual_mode: false,
+            manual_dac_mv: 0,
+            manual_send_pending: false,
         }
     }
 
@@ -523,11 +558,136 @@ impl SweepEngine {
         self.step = None;
         self.last_prompted_band = None;
         self.meter_capability = capability;
+        self.in_manual_mode = false;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
         self.pending_sends.push_back(PendingSend::SessionBegin);
         let first_freq = self.frequencies[0];
         self.begin_frequency(first_freq);
+    }
+
+    /// Starts Manual mode -- the "Manual" button's counterpart to
+    /// start(). Same setup (first selected level/frequency, session
+    /// begin, initial retune), but lands in ManualActive once any
+    /// AwaitingFreqConfirm prompt clears, rather than Running.
+    ///
+    /// This does NOT set manual_dac_mv -- the caller (worker.rs, which
+    /// owns the PA table this engine doesn't) is expected to follow this
+    /// with set_manual_dac(), seeded from whatever's currently stored
+    /// for (levels[0], frequencies[0]) in the working table, so the
+    /// slider starts from the existing calibration rather than an
+    /// arbitrary default.
+    pub fn start_manual(&mut self, capability: FrequencyCapability) {
+        if self.levels.is_empty() || self.frequencies.is_empty() {
+            debug!(target: "vtx", "[sweep] start_manual() called with no levels/frequencies -- not starting");
+            self.state = EngineState::Idle;
+            return;
+        }
+        self.freq_idx = 0;
+        self.level_idx = 0;
+        self.step = None;
+        self.last_prompted_band = None;
+        self.meter_capability = capability;
+        self.in_manual_mode = true;
+        self.manual_send_pending = false;
+        debug!(target: "vtx", "[sweep] starting manual mode: {} levels {:?}, {} frequencies {:?}, meter_capability={:?}",
+            self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.meter_capability);
+        self.pending_sends.push_back(PendingSend::SessionBegin);
+        let first_freq = self.frequencies[0];
+        self.begin_frequency(first_freq);
+    }
+
+    /// Sets the DAC value Manual mode should be driving -- called by the
+    /// UI's slider on every change (including the initial seed after
+    /// start_manual()/each manual_next() advance). Doesn't send anything
+    /// itself; poll_manual() picks this up on its own next eligible
+    /// tick, throttled the same way every other send in this file is.
+    /// Clamped to the DAC's own raw range (0-3300mV) as basic sanity --
+    /// deliberately NOT clamped to effective_bounds(), since Manual mode
+    /// is meant to let the person reach the full range directly.
+    pub fn set_manual_dac(&mut self, mv: i32) {
+        self.manual_dac_mv = mv.clamp(0, 3300);
+        self.manual_send_pending = true;
+    }
+
+    /// "Next" in Manual mode: commits manual_dac_mv as this cell's
+    /// calibration value and `detector_mv` (read by the caller from the
+    /// live VTX status, NOT the external power meter) as its detector
+    /// value, in one step -- unlike automatic mode's two-phase ScanPa/
+    /// ScanDetector, since the person already knows both simultaneously.
+    /// Marks both cells CellStatus::Manual, then advances exactly like
+    /// automatic mode's own level/frequency rollover. Returns the new
+    /// (level, freq_idx) position for the caller to reseed
+    /// set_manual_dac() from the working table, or None if that was the
+    /// last point (manual mode is now finished, session closed).
+    pub fn manual_next(&mut self, detector_mv: u16) -> Option<(u8, usize)> {
+        if !matches!(self.state, EngineState::ManualActive) {
+            return None;
+        }
+        let level = self.levels[self.level_idx];
+        debug!(target: "vtx", "[sweep] manual: level={level} freq={}MHz vbias_mv={} detector_mv={detector_mv}",
+            self.frequencies[self.freq_idx], self.manual_dac_mv);
+        self.completed_steps += 2; // counts as both ops, same as skip_current()/PA Failure
+        self.pending_result = Some(SweepResult {
+            level,
+            freq_idx: self.freq_idx,
+            vbias_mv: Some(self.manual_dac_mv.clamp(0, 3300) as u16),
+            detector_mv: Some(detector_mv),
+            success: true,
+            pa_failure: false,
+        });
+        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Manual);
+        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Manual);
+        self.per_level_status.insert(level, LevelStatus::Done);
+
+        self.level_idx += 1;
+        if self.level_idx >= self.levels.len() {
+            self.level_idx = 0;
+            self.freq_idx += 1;
+            if self.freq_idx >= self.frequencies.len() {
+                debug!(target: "vtx", "[sweep] manual mode: all frequencies complete");
+                self.state = EngineState::Idle;
+                self.in_manual_mode = false;
+                self.pending_sends.push_back(PendingSend::SessionEnd);
+                return None;
+            }
+            let next_freq = self.frequencies[self.freq_idx];
+            self.begin_frequency(next_freq);
+        }
+        Some((self.levels[self.level_idx], self.freq_idx))
+    }
+
+    /// Exits Manual mode via the "Manual" button pressed a second time.
+    /// The current, not-yet-confirmed point is left exactly as it was --
+    /// no result written, no cell status touched -- matching "Next"
+    /// being the only thing that commits a point.
+    pub fn exit_manual(&mut self) {
+        debug!(target: "vtx", "[sweep] manual mode exited at level={:?} freq_idx={}",
+            self.levels.get(self.level_idx), self.freq_idx);
+        self.state = EngineState::Idle;
+        self.in_manual_mode = false;
+        self.step = None;
+        self.pending_frequency_push = None;
+        self.manual_send_pending = false;
+        self.pending_sends.push_back(PendingSend::SessionEnd);
+    }
+
+    /// "Re-calibrate" pressed while Manual mode is active: resumes
+    /// automatic scanning from wherever Manual mode was currently
+    /// sitting (NOT from the beginning) -- the current point's manual
+    /// slider value is discarded (automatic's own ScanPa starts fresh
+    /// from COARSE_RAMP_START_MV, same as any other point), but every
+    /// earlier point Manual mode already committed via "Next" stays as
+    /// its Manual result. The calibration session stays open throughout
+    /// (it doesn't care which sub-mode is driving it), so no new
+    /// SessionBegin is queued here.
+    pub fn resume_automatic_from_current(&mut self) {
+        debug!(target: "vtx", "[sweep] resuming automatic mode from level={:?} freq_idx={}",
+            self.levels.get(self.level_idx), self.freq_idx);
+        self.in_manual_mode = false;
+        self.step = None;
+        self.manual_send_pending = false;
+        self.state = EngineState::Running;
     }
 
     /// Decides what happens when the sweep is about to start working on
@@ -545,6 +705,7 @@ impl SweepEngine {
     /// Either way, pending_frequency_push is always set, since the VTX
     /// itself needs retuning regardless of what the meter needs.
     fn begin_frequency(&mut self, freq_mhz: u16) {
+        let not_confirming_state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
         match self.meter_capability.clone() {
             FrequencyCapability::Manual { .. } => {
                 self.state = EngineState::AwaitingFreqConfirm { freq_mhz };
@@ -553,7 +714,7 @@ impl SweepEngine {
                 let band = nearest_band(&bands_mhz, freq_mhz as u32);
                 if Some(band) == self.last_prompted_band {
                     debug!(target: "vtx", "[sweep] {freq_mhz}MHz maps to the same band ({band}MHz) as the last prompt -- skipping prompt");
-                    self.state = EngineState::Running;
+                    self.state = not_confirming_state;
                     self.pending_frequency_push = Some(freq_mhz);
                 } else {
                     self.last_prompted_band = Some(band);
@@ -564,13 +725,13 @@ impl SweepEngine {
                 let band = nearest_band(&bands_mhz, freq_mhz as u32);
                 debug!(target: "vtx", "[sweep] requesting meter retune to nearest band {band}MHz (for VTX freq {freq_mhz}MHz)");
                 self.pending_meter_frequency = Some(band);
-                self.state = EngineState::Running;
+                self.state = not_confirming_state;
                 self.pending_frequency_push = Some(freq_mhz);
             }
             FrequencyCapability::FullyProgrammable { .. } => {
                 debug!(target: "vtx", "[sweep] requesting meter retune to {freq_mhz}MHz");
                 self.pending_meter_frequency = Some(freq_mhz as u32);
-                self.state = EngineState::Running;
+                self.state = not_confirming_state;
                 self.pending_frequency_push = Some(freq_mhz);
             }
         }
@@ -580,7 +741,7 @@ impl SweepEngine {
     pub fn confirm_frequency(&mut self) {
         if let EngineState::AwaitingFreqConfirm { freq_mhz } = self.state {
             debug!(target: "vtx", "[sweep] frequency confirmed, resuming at {freq_mhz}MHz");
-            self.state = EngineState::Running;
+            self.state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
             self.pending_frequency_push = Some(freq_mhz);
         }
     }
@@ -739,6 +900,10 @@ impl SweepEngine {
                 self.auto_resume(level, freq_mhz, vbias_mv_at_loss, reason);
             }
             return Ok(false);
+        }
+
+        if matches!(self.state, EngineState::ManualActive) {
+            return self.poll_manual(link);
         }
 
         if !matches!(self.state, EngineState::Running) {
@@ -1182,6 +1347,13 @@ impl SweepEngine {
 
     pub fn current_step(&self) -> Option<CurrentStep> {
         let level = self.levels.get(self.level_idx).copied()?;
+        if matches!(self.state, EngineState::ManualActive) {
+            // Manual mode never uses StepState -- report the slider's
+            // live value directly instead. Detector isn't reported here;
+            // the VTX Status panel's own live detector_mv already covers
+            // that (Manual mode doesn't run its own search against it).
+            return Some(CurrentStep { level, freq_idx: self.freq_idx, vbias_mv: Some(self.manual_dac_mv), detector_mv: None });
+        }
         match &self.step {
             Some(StepState::Pa(st)) => Some(CurrentStep {
                 level,
@@ -1314,6 +1486,28 @@ impl SweepEngine {
             return;
         }
         map.insert(key, status);
+    }
+
+    /// poll()'s dispatch target while ManualActive. Sends manual_dac_mv
+    /// if it's changed since the last send, throttled by SEND_INTERVAL
+    /// the same way every other send in this file is. Deliberately does
+    /// NOT clamp to effective_bounds() the way send_calibration() does
+    /// for automatic mode -- Manual mode is meant to reach the DAC's
+    /// full raw range, not the same safety-narrowed bounds automatic
+    /// searches respect. No heartbeat/ConnectionLost tracking here: the
+    /// person is actively watching and driving this directly, unlike an
+    /// automatic sweep running unattended.
+    fn poll_manual(&mut self, link: &mut MspLink) -> anyhow::Result<bool> {
+        if !self.manual_send_pending || !link.can_send_now() || self.last_send.elapsed() < SEND_INTERVAL {
+            return Ok(false);
+        }
+        let level = self.levels[self.level_idx];
+        let vbias_mv = self.manual_dac_mv.clamp(0, 3300) as u16;
+        link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))?;
+        link.note_sent(MspCommandKind::Calibration);
+        self.last_send = Instant::now();
+        self.manual_send_pending = false;
+        Ok(true)
     }
 
     fn send_calibration(&mut self, link: &mut MspLink, level: u8, vbias_mv: i32) -> anyhow::Result<()> {
