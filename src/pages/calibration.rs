@@ -1,7 +1,7 @@
 //! Calibration page: live power meter reading (with a rolling plot), the
 //! PA calibration table (now with per-level checkboxes, boost/RTC6705
 //! display columns, and a live calibration-status column), and the
-//! Re-calibrate sweep controls (see calibration_engine.rs for the actual sweep
+//! Automatic/Manual sweep controls (see calibration_engine.rs for the actual sweep
 //! state machine this drives).
 
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
@@ -527,26 +527,40 @@ pub fn show(
             .show(ui, &mut delegate);
     });
 
-    // ---- Progress bars -------------------------------------------------
+    // ---- Progress bars (always shown) -----------------------------------
     {
         let g = sweep.lock().unwrap();
-        if let Some(engine) = g.as_ref() {
-            if engine.is_active() || engine.completed_steps > 0 {
-                ui.add(egui::ProgressBar::new(engine.progress()).text("Overall").show_percentage());
-
+        let (overall, sub_val, sub_label) = match g.as_ref() {
+            Some(engine) => {
                 let (sub, label) = engine.sub_progress();
-                if !label.is_empty() {
-                    ui.add(egui::ProgressBar::new(sub).text(label));
-                }
+                (engine.progress(), sub, label)
             }
-        }
+            None => (0.0, 0.0, ""),
+        };
+        ui.add(egui::ProgressBar::new(overall).text("Overall").show_percentage());
+        ui.add(egui::ProgressBar::new(sub_val).text(if sub_label.is_empty() { "Idle" } else { sub_label }));
     }
 
-    // ---- Tolerance + Re-calibrate/Stop/Manual --------------------------
-    let manual_active = {
+    // ---- Tolerance + Automatic/Manual/Stop/Skip -------------------------
+    let (automatic_mode, manual_mode, manual_dac_mv) = {
         let g = sweep.lock().unwrap();
-        g.as_ref().map(|e| matches!(e.state, calibration_engine::EngineState::ManualActive)).unwrap_or(false)
+        match g.as_ref() {
+            Some(e) => (e.is_automatic_mode(), e.is_manual_mode(), e.manual_dac_mv),
+            None => (false, false, 0),
+        }
     };
+    // boost_on comes from live VTX telemetry (SharedState), not the engine --
+    // it's the actual GPIO state reported back, not just what was last requested.
+    let pa_boost_on = {
+        let s = shared.lock().unwrap();
+        s.vtx_status.as_ref().and_then(|v| v.boost_on)
+    };
+    let any_checked = page.checked.values().any(|&v| v);
+    let overall_ready = {
+        let s = shared.lock().unwrap();
+        conn_status::OverallState::from_ports(s.vtx_port_state, s.meter_port_state) == conn_status::OverallState::Ready
+    };
+
     ui.horizontal(|ui| {
         ui.label("Scan detector tolerance:");
         ui.add(
@@ -556,25 +570,55 @@ pub fn show(
                 .speed(0.1),
         );
 
-        if manual_active {
-            if ui.button("Manual").clicked() {
-                let _ = cmd_tx.send(Command::ExitManual);
-            }
-            if ui.button("Re-calibrate").clicked() {
-                // Resumes automatic scanning from the current position on
-                // the existing engine -- see resume_automatic_from_current()'s
-                // doc comment. The confirm dialog is skipped here: RF output
-                // is already live from Manual mode, unlike starting a fresh
-                // sweep from Idle.
+        // Automatic: starts fresh from Idle (with a confirm dialog), or
+        // resumes in place if Manual mode is currently active (see
+        // resume_automatic_from_current()) -- disabled only while
+        // automatic is already the active mode; the extra !manual_mode-
+        // aware "any_checked" requirement only applies to the fresh-start
+        // case, since resuming doesn't need a fresh level selection.
+        let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
+        if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
+            if manual_mode {
                 let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
                 levels.sort_unstable();
                 let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
+            } else {
+                page.show_confirm_dialog = true;
             }
+        }
 
-            let mut current_mv = {
-                let g = sweep.lock().unwrap();
-                g.as_ref().map(|e| e.manual_dac_mv).unwrap_or(0)
-            };
+        // Manual: only usable from Idle -- deliberately also disabled
+        // while automatic is running (not just while already manual),
+        // since starting Manual mode replaces the engine outright and
+        // doing that mid-automatic-run would abruptly end it without a
+        // proper abort/session-end.
+        let manual_enabled = !automatic_mode && !manual_mode && overall_ready && any_checked;
+        if ui.add_enabled(manual_enabled, egui::Button::new("Manual")).clicked() {
+            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+            levels.sort_unstable();
+            let _ = cmd_tx.send(Command::StartManual { levels });
+        }
+
+        if ui.add_enabled(sweep_active, egui::Button::new("Stop")).clicked() {
+            let _ = cmd_tx.send(Command::AbortSweep);
+        }
+        if ui.add_enabled(sweep_active, egui::Button::new("Skip >")).clicked() {
+            let _ = cmd_tx.send(Command::SkipCurrent);
+        }
+
+        if any_checked && !overall_ready {
+            ui.label(
+                egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
+                    .weak()
+                    .italics(),
+            );
+        }
+    });
+
+    // ---- Manual mode controls (always shown, disabled outside Manual) ---
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(manual_mode, |ui| {
+            let mut current_mv = manual_dac_mv;
             let step = if page.fine_step { 1.0 } else { 25.0 };
             let response =
                 ui.add(egui::Slider::new(&mut current_mv, 0..=3300).text("DAC mV").step_by(step));
@@ -583,41 +627,17 @@ pub fn show(
             }
             ui.checkbox(&mut page.fine_step, "fine");
 
+            let mut pa_on = pa_boost_on.unwrap_or(false);
+            if ui.checkbox(&mut pa_on, "PA").changed() {
+                let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
+            }
+
             if ui.button("Next >").clicked() {
                 let _ = cmd_tx.send(Command::ManualNext);
             }
-        } else if sweep_active {
-            if ui.button("Stop").clicked() {
-                let _ = cmd_tx.send(Command::AbortSweep);
-            }
-            if ui.button("Skip >").clicked() {
-                let _ = cmd_tx.send(Command::SkipCurrent);
-            }
-        } else {
-            let any_checked = page.checked.values().any(|&v| v);
-            let overall_ready = {
-                let s = shared.lock().unwrap();
-                conn_status::OverallState::from_ports(s.vtx_port_state, s.meter_port_state) == conn_status::OverallState::Ready
-            };
-            ui.add_enabled_ui(any_checked && overall_ready, |ui| {
-                if ui.button("Re-calibrate").clicked() {
-                    page.show_confirm_dialog = true;
-                }
-                if ui.button("Manual").clicked() {
-                    let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-                    levels.sort_unstable();
-                    let _ = cmd_tx.send(Command::StartManual { levels });
-                }
-            });
-            if any_checked && !overall_ready {
-                ui.label(
-                    egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
-                        .weak()
-                        .italics(),
-                );
-            }
-        }
+        });
     });
+
 
     if page.show_confirm_dialog {
         let mut open = true;

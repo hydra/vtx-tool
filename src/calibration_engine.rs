@@ -446,6 +446,16 @@ pub struct SweepEngine {
     /// outright if the retune settle window from the initial per-point
     /// retune were still open).
     manual_send_pending: bool,
+    /// Current desired calibration-session state, included on every
+    /// SET_PACALIBRATION send (see vtx_msp_set_calibration()'s doc
+    /// comment in vtx_msp.c) -- true for the whole time start()/
+    /// start_manual() has been active and hasn't ended.
+    session_active: bool,
+    /// Current desired PA boost mode, included on every SET_PACALIBRATION
+    /// send the same way session_active is. Auto outside Manual mode;
+    /// Off immediately after start_manual() (PA must not be enabled when
+    /// Manual mode starts); On/Off after set_pa_boost().
+    boost_mode: BoostMode,
 }
 
 /// How long the VTX (or meter) can go completely silent while a sweep is
@@ -486,8 +496,38 @@ enum PendingSend {
     /// The payload is computed by the caller (worker.rs, which owns
     /// vtx_table) and just carried here for poll() to send.
     SafeState(Vec<u8>),
-    SessionBegin,
-    SessionEnd,
+    /// A calibration-state-only push -- establishes/updates
+    /// session_active and/or boost_mode (both fields on SweepEngine
+    /// itself now, carried on every SET_PACALIBRATION send -- see
+    /// vtx_msp_set_calibration()'s doc comment in vtx_msp.c) without
+    /// stepping any real (level, freq) point. Sent with level=0, mv=0
+    /// (vtx_msp_set_calibration()'s own "don't touch either" convention)
+    /// plus whichever session_active/boost_mode the engine currently
+    /// holds at send time -- there's no separate command for this, so a
+    /// state-only push still has to go out as a SET_PACALIBRATION.
+    CalibrationState,
+}
+
+/// The wire-level meaning of SET_PACALIBRATION's trailing boost byte --
+/// see vtx_msp_set_calibration()'s doc comment in vtx_msp.c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoostMode {
+    Off,
+    On,
+    /// Automatic mode's own ext_pa_enable-driven behavior -- the
+    /// firmware default, and where this always sits for automatic
+    /// sends.
+    Auto,
+}
+
+impl BoostMode {
+    fn wire_byte(self) -> u8 {
+        match self {
+            BoostMode::Off => 0,
+            BoostMode::On => 1,
+            BoostMode::Auto => 2,
+        }
+    }
 }
 
 const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
@@ -534,6 +574,8 @@ impl SweepEngine {
             in_manual_mode: false,
             manual_dac_mv: 0,
             manual_send_pending: false,
+            session_active: false,
+            boost_mode: BoostMode::Auto,
         }
     }
 
@@ -559,9 +601,11 @@ impl SweepEngine {
         self.last_prompted_band = None;
         self.meter_capability = capability;
         self.in_manual_mode = false;
+        self.session_active = true;
+        self.boost_mode = BoostMode::Auto;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
-        self.pending_sends.push_back(PendingSend::SessionBegin);
+        self.pending_sends.push_back(PendingSend::CalibrationState);
         let first_freq = self.frequencies[0];
         self.begin_frequency(first_freq);
     }
@@ -590,11 +634,28 @@ impl SweepEngine {
         self.meter_capability = capability;
         self.in_manual_mode = true;
         self.manual_send_pending = false;
+        self.session_active = true;
+        // PA must not be enabled when manual mode starts -- see
+        // set_pa_boost()'s doc comment and rf_pa_manual_boost_set() in
+        // the firmware.
+        self.boost_mode = BoostMode::Off;
         debug!(target: "vtx", "[sweep] starting manual mode: {} levels {:?}, {} frequencies {:?}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.meter_capability);
-        self.pending_sends.push_back(PendingSend::SessionBegin);
+        self.pending_sends.push_back(PendingSend::CalibrationState);
         let first_freq = self.frequencies[0];
         self.begin_frequency(first_freq);
+    }
+
+    /// Manual mode's explicit PA-enable checkbox -- see
+    /// rf_pa_manual_boost_set()'s doc comment in the firmware's rf_pa.h.
+    /// Doesn't queue a separate send -- boost_mode rides on the next
+    /// regular per-step send poll_manual() makes (same as manual_dac_mv
+    /// does), so this just updates the state and makes sure that send
+    /// actually happens soon, even if the DAC value itself hasn't
+    /// changed.
+    pub fn set_pa_boost(&mut self, on: bool) {
+        self.boost_mode = if on { BoostMode::On } else { BoostMode::Off };
+        self.manual_send_pending = true;
     }
 
     /// Sets the DAC value Manual mode should be driving -- called by the
@@ -639,7 +700,20 @@ impl SweepEngine {
         Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Manual);
         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Manual);
         self.per_level_status.insert(level, LevelStatus::Done);
+        self.advance_manual_position()
+    }
 
+    /// Shared by manual_next() and skip_current()'s Manual-mode path --
+    /// advances level_idx/freq_idx exactly like automatic mode's own
+    /// rollover, EXCEPT Manual mode can't rely on poll()'s "if level_idx
+    /// >= levels.len()" check the way automatic's skip_current() does
+    /// (poll_manual() never runs that check -- it would index
+    /// self.levels[self.level_idx] directly and panic on overflow), so
+    /// this does the rollover itself, including retuning via
+    /// begin_frequency() when the frequency actually changes. Returns
+    /// the new (level, freq_idx), or None if that was the last point
+    /// (Manual mode is now finished, session closed).
+    fn advance_manual_position(&mut self) -> Option<(u8, usize)> {
         self.level_idx += 1;
         if self.level_idx >= self.levels.len() {
             self.level_idx = 0;
@@ -648,7 +722,9 @@ impl SweepEngine {
                 debug!(target: "vtx", "[sweep] manual mode: all frequencies complete");
                 self.state = EngineState::Idle;
                 self.in_manual_mode = false;
-                self.pending_sends.push_back(PendingSend::SessionEnd);
+                self.session_active = false;
+                self.boost_mode = BoostMode::Auto;
+                self.pending_sends.push_back(PendingSend::CalibrationState);
                 return None;
             }
             let next_freq = self.frequencies[self.freq_idx];
@@ -669,7 +745,9 @@ impl SweepEngine {
         self.step = None;
         self.pending_frequency_push = None;
         self.manual_send_pending = false;
-        self.pending_sends.push_back(PendingSend::SessionEnd);
+        self.session_active = false;
+        self.boost_mode = BoostMode::Auto;
+        self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
     /// "Re-calibrate" pressed while Manual mode is active: resumes
@@ -680,7 +758,7 @@ impl SweepEngine {
     /// earlier point Manual mode already committed via "Next" stays as
     /// its Manual result. The calibration session stays open throughout
     /// (it doesn't care which sub-mode is driving it), so no new
-    /// SessionBegin is queued here.
+    /// SessionBegin is queued here -- session_active just stays true.
     pub fn resume_automatic_from_current(&mut self) {
         debug!(target: "vtx", "[sweep] resuming automatic mode from level={:?} freq_idx={}",
             self.levels.get(self.level_idx), self.freq_idx);
@@ -688,6 +766,14 @@ impl SweepEngine {
         self.step = None;
         self.manual_send_pending = false;
         self.state = EngineState::Running;
+        // Clears Manual mode's PA boost override, if one was set, so
+        // automatic mode's own ext_pa_enable-driven behavior (which the
+        // very next retune will apply) takes back over rather than
+        // staying pinned at whatever the checkbox last said. session_active
+        // itself stays true -- the session doesn't end here, just the
+        // sub-mode driving it changes.
+        self.boost_mode = BoostMode::Auto;
+        self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
     /// Decides what happens when the sweep is about to start working on
@@ -766,9 +852,13 @@ impl SweepEngine {
         self.state = EngineState::Idle;
         self.step = None;
         self.pending_frequency_push = None;
+        self.in_manual_mode = false;
+        self.manual_send_pending = false;
+        self.session_active = false;
+        self.boost_mode = BoostMode::Auto;
         self.pending_sends.clear();
         self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
-        self.pending_sends.push_back(PendingSend::SessionEnd);
+        self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
     /// Skips whatever (level, freq) point is currently in progress and
@@ -798,9 +888,21 @@ impl SweepEngine {
     /// the VTX a defined safe point between the skipped point and
     /// whatever comes next, sent through the same gated mechanism as
     /// every other send in this file rather than directly.
-    pub fn skip_current(&mut self, safe_state_payload: Vec<u8>) {
+    pub fn skip_current(&mut self, safe_state_payload: Vec<u8>) -> Option<(u8, usize)> {
+        if matches!(self.state, EngineState::ManualActive) {
+            let level = self.levels[self.level_idx];
+            debug!(target: "vtx", "[sweep] manual: skipped level={level} freq_idx={}", self.freq_idx);
+            self.completed_steps += 2; // same accounting as manual_next()/automatic's own skip below
+            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+            self.per_level_status.insert(level, LevelStatus::Skipped);
+            let next_pos = self.advance_manual_position();
+            self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+            return next_pos;
+        }
+
         if !matches!(self.state, EngineState::Running) {
-            return;
+            return None;
         }
         let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
         debug!(target: "vtx", "[sweep] skipped level={level} freq_idx={} ({}/{} steps completed)",
@@ -832,10 +934,27 @@ impl SweepEngine {
         self.level_idx += 1;
         self.per_level_status.insert(level, LevelStatus::Skipped);
         self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+        None
     }
 
     pub fn is_active(&self) -> bool {
         !matches!(self.state, EngineState::Idle)
+    }
+
+    /// True whenever Manual mode is the active sub-mode -- covers
+    /// ManualActive itself plus its own AwaitingFreqConfirm/
+    /// ConnectionLost pauses (in_manual_mode isn't cleared by either),
+    /// false once Idle or switched to automatic. Used by the UI to
+    /// decide which of the Automatic/Manual buttons to disable, and
+    /// whether the DAC slider/fine checkbox/PA checkbox are usable.
+    pub fn is_manual_mode(&self) -> bool {
+        self.in_manual_mode
+    }
+
+    /// True whenever automatic scanning is the active sub-mode --
+    /// active but NOT manual. See is_manual_mode()'s own doc comment.
+    pub fn is_automatic_mode(&self) -> bool {
+        self.is_active() && !self.in_manual_mode
     }
 
     /// Advances the sweep by whatever's possible this tick. `link` is
@@ -879,17 +998,12 @@ impl SweepEngine {
                     link.note_sent(MspCommandKind::Retune);
                     debug!(target: "vtx", "[sweep] pitmode-safe state sent");
                 }
-                PendingSend::SessionBegin => {
-                    let payload = msp::encode_pa_calibration_session_request(true);
-                    link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&payload))?;
+                PendingSend::CalibrationState => {
+                    let payload = msp::encode_pa_calibration_request(0, None, self.session_active, self.boost_mode.wire_byte());
+                    link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
                     link.note_sent(MspCommandKind::Other);
-                    debug!(target: "vtx", "[sweep] calibration session: begin requested");
-                }
-                PendingSend::SessionEnd => {
-                    let payload = msp::encode_pa_calibration_session_request(false);
-                    link.send_v2(function::SET_PACALIBRATION_SESSION, Some(&payload))?;
-                    link.note_sent(MspCommandKind::Other);
-                    debug!(target: "vtx", "[sweep] calibration session: end requested");
+                    debug!(target: "vtx", "[sweep] calibration state pushed: session_active={} boost_mode={:?}",
+                        self.session_active, self.boost_mode);
                 }
             }
             return Ok(true);
@@ -903,7 +1017,7 @@ impl SweepEngine {
         }
 
         if matches!(self.state, EngineState::ManualActive) {
-            return self.poll_manual(link);
+            return self.poll_manual(link, vtx_ready, meter_ready);
         }
 
         if !matches!(self.state, EngineState::Running) {
@@ -918,44 +1032,13 @@ impl SweepEngine {
             return Ok(false);
         }
 
-        if vtx_ready && meter_ready {
-            self.unresponsive_since = None;
-        } else {
-            let since = *self.unresponsive_since.get_or_insert_with(Instant::now);
-            if since.elapsed() > HEARTBEAT_TIMEOUT {
-                let vbias_mv_at_loss = match &self.step {
-                    Some(StepState::Pa(st)) => st.vbias_mv,
-                    Some(StepState::Detector(st)) => st.vbias_mv,
-                    None => 0,
-                };
-                let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
-                let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
-                let reason = match (vtx_ready, meter_ready) {
-                    (false, false) => ConnectionLossReason::Both,
-                    (false, true) => ConnectionLossReason::Vtx,
-                    (true, false) => ConnectionLossReason::Meter,
-                    (true, true) => unreachable!("loop body only reached when at least one is false"),
-                };
-                debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_at_loss})",
-                    since.elapsed());
-                // Only mark the cell as the trip point (red, sticky) when
-                // the VTX itself was actually involved -- a pure meter
-                // dropout says nothing about whether this mV value was
-                // dangerous, so marking it here would be misleading.
-                if !matches!(reason, ConnectionLossReason::Meter) {
-                    match &self.step {
-                        Some(StepState::Pa(_)) => {
-                            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
-                        }
-                        Some(StepState::Detector(_)) => {
-                            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
-                        }
-                        None => {}
-                    }
-                }
-                self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason };
-                return Ok(false);
-            }
+        let vbias_mv_now = match &self.step {
+            Some(StepState::Pa(st)) => st.vbias_mv,
+            Some(StepState::Detector(st)) => st.vbias_mv,
+            None => 0,
+        };
+        if self.maybe_trip_connection_lost(vtx_ready, meter_ready, vbias_mv_now) {
+            return Ok(false);
         }
 
         if self.level_idx >= self.levels.len() {
@@ -970,7 +1053,9 @@ impl SweepEngine {
                 // directly, same as everything else: the very next poll()
                 // tick (once link.can_send_now() allows it) is what
                 // actually issues it.
-                self.pending_sends.push_back(PendingSend::SessionEnd);
+                self.session_active = false;
+                self.boost_mode = BoostMode::Auto;
+                self.pending_sends.push_back(PendingSend::CalibrationState);
                 return Ok(false);
             }
             let next_freq = self.frequencies[self.freq_idx];
@@ -1399,7 +1484,8 @@ impl SweepEngine {
     /// necessary if it did (a reboot needs retuning and level reselection
     /// from scratch).
     fn auto_resume(&mut self, level: u8, freq_mhz: u16, vbias_mv_at_loss: i32, reason: ConnectionLossReason) {
-        debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz");
+        debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz manual={}",
+            self.in_manual_mode);
         if matches!(reason, ConnectionLossReason::Vtx | ConnectionLossReason::Both) {
             let up = power_up_step(self.sign_inverted);
             let safe_vbias_mv = (vbias_mv_at_loss - up * HEARTBEAT_BACKOFF_MV).clamp(0, 3300);
@@ -1416,11 +1502,19 @@ impl SweepEngine {
                 }
                 None => {}
             }
+            if self.in_manual_mode {
+                // Same backed-off value the slider will show on resume --
+                // the person can always push it back up manually, but
+                // resuming AT the value that just caused a trip would be
+                // exactly the wrong default.
+                self.manual_dac_mv = safe_vbias_mv;
+                self.manual_send_pending = true;
+            }
         } else {
             debug!(target: "vtx", "[sweep] meter-only dropout -- resuming without changing mV or setting a hard limit");
         }
         self.unresponsive_since = None;
-        self.state = EngineState::Running;
+        self.state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
         self.pending_frequency_push = Some(freq_mhz);
     }
 
@@ -1488,22 +1582,84 @@ impl SweepEngine {
         map.insert(key, status);
     }
 
+    /// Shared heartbeat tracking for both automatic (poll()) and Manual
+    /// (poll_manual()) modes -- if the VTX and/or meter have been silent
+    /// for longer than HEARTBEAT_TIMEOUT, transitions to ConnectionLost.
+    /// Manual mode gets the exact same "Connection error" dialog and
+    /// auto-resume behavior automatic mode already has (see
+    /// auto_resume(), which resumes back into whichever mode was active
+    /// when the trip happened) -- the person needs to know their PA just
+    /// went quiet regardless of which mode was driving it.
+    /// `vbias_mv_now` is whatever DAC value was in play when this is
+    /// called (automatic mode reads it from the active step, Manual mode
+    /// from manual_dac_mv) -- captured as evidence a hard limit may sit
+    /// near this value if the VTX itself is what went quiet. Returns
+    /// true if it just transitioned to ConnectionLost this call (the
+    /// caller should do nothing else this tick).
+    fn maybe_trip_connection_lost(&mut self, vtx_ready: bool, meter_ready: bool, vbias_mv_now: i32) -> bool {
+        if vtx_ready && meter_ready {
+            self.unresponsive_since = None;
+            return false;
+        }
+        let since = *self.unresponsive_since.get_or_insert_with(Instant::now);
+        if since.elapsed() <= HEARTBEAT_TIMEOUT {
+            return false;
+        }
+        let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
+        let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
+        let reason = match (vtx_ready, meter_ready) {
+            (false, false) => ConnectionLossReason::Both,
+            (false, true) => ConnectionLossReason::Vtx,
+            (true, false) => ConnectionLossReason::Meter,
+            (true, true) => unreachable!("only reached when at least one is false"),
+        };
+        debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_now}, manual={})",
+            since.elapsed(), self.in_manual_mode);
+        // Only mark the cell as the trip point (red, sticky) when the VTX
+        // itself was actually involved -- a pure meter dropout says
+        // nothing about whether this mV value was dangerous, so marking
+        // it here would be misleading.
+        if !matches!(reason, ConnectionLossReason::Meter) {
+            if matches!(self.state, EngineState::ManualActive) {
+                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+            } else {
+                match &self.step {
+                    Some(StepState::Pa(_)) => {
+                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    }
+                    Some(StepState::Detector(_)) => {
+                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss: vbias_mv_now, reason };
+        true
+    }
+
     /// poll()'s dispatch target while ManualActive. Sends manual_dac_mv
     /// if it's changed since the last send, throttled by SEND_INTERVAL
     /// the same way every other send in this file is. Deliberately does
     /// NOT clamp to effective_bounds() the way send_calibration() does
     /// for automatic mode -- Manual mode is meant to reach the DAC's
     /// full raw range, not the same safety-narrowed bounds automatic
-    /// searches respect. No heartbeat/ConnectionLost tracking here: the
-    /// person is actively watching and driving this directly, unlike an
-    /// automatic sweep running unattended.
-    fn poll_manual(&mut self, link: &mut MspLink) -> anyhow::Result<bool> {
-        if !self.manual_send_pending || !link.can_send_now() || self.last_send.elapsed() < SEND_INTERVAL {
+    /// searches respect. Heartbeat/ConnectionLost tracking is the same
+    /// as automatic mode's own (see maybe_trip_connection_lost).
+    fn poll_manual(&mut self, link: &mut MspLink, vtx_ready: bool, meter_ready: bool) -> anyhow::Result<bool> {
+        if !link.can_send_now() {
+            return Ok(false);
+        }
+        if self.maybe_trip_connection_lost(vtx_ready, meter_ready, self.manual_dac_mv) {
+            return Ok(false);
+        }
+        if !self.manual_send_pending || self.last_send.elapsed() < SEND_INTERVAL {
             return Ok(false);
         }
         let level = self.levels[self.level_idx];
         let vbias_mv = self.manual_dac_mv.clamp(0, 3300) as u16;
-        link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))?;
+        let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, self.boost_mode.wire_byte());
+        link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
         link.note_sent(MspCommandKind::Calibration);
         self.last_send = Instant::now();
         self.manual_send_pending = false;
@@ -1513,7 +1669,8 @@ impl SweepEngine {
     fn send_calibration(&mut self, link: &mut MspLink, level: u8, vbias_mv: i32) -> anyhow::Result<()> {
         let (lo, hi) = self.effective_bounds(level);
         let vbias_mv = vbias_mv.clamp(lo, hi) as u16;
-        link.send_v2(function::SET_PACALIBRATION, Some(&msp::encode_pa_calibration_request(level, Some(vbias_mv))))?;
+        let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, self.boost_mode.wire_byte());
+        link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
         link.note_sent(MspCommandKind::Calibration);
         Ok(())
     }
