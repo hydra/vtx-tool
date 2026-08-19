@@ -15,6 +15,7 @@ use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use egui::SliderClamping;
 use egui_table::AutoSizeMode;
 
 /// Candidate update rates, always shown -- entries exceeding the
@@ -620,8 +621,13 @@ pub fn show(
         ui.add_enabled_ui(manual_mode, |ui| {
             let mut current_mv = manual_dac_mv;
             let step = if page.fine_step { 1.0 } else { 25.0 };
+            let message = if page.fine_step { "DAC mV (+/-1mv)" } else { "DAC mV (+/-25mV)" };
             let response =
-                ui.add(egui::Slider::new(&mut current_mv, 0..=3300).text("DAC mV").step_by(step));
+                ui.add_sized([400.0, 10.0], egui::Slider::new(&mut current_mv, 0..=3300)
+                    .text(message)
+                    .clamping(SliderClamping::Never)
+                    .drag_value_speed(0.1)
+                    .step_by(step));
             if response.changed() {
                 let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
             }
