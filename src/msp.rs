@@ -26,7 +26,6 @@ pub mod function {
     pub const SET_PACALTABLE: u16 = 0x4801;
     pub const PACALIBRATION: u16 = 0x4802;
     pub const SET_PACALIBRATION: u16 = 0x4803;
-    pub const SET_PACALIBRATION_SESSION: u16 = 0x4804;
 }
 
 /// Decoded MSP_PACALIBRATION response -- vtx_msp_push_calibration()'s
@@ -48,9 +47,10 @@ pub struct PaCalibrationReading {
     pub rtc6705_level: Option<u8>,
     pub pid_active: Option<bool>,
     pub frequency_mhz: Option<u16>,
-    /// Only present with the 11-byte payload (added alongside
-    /// MSP_SET_PACALIBRATION_SESSION) -- see calibration_engine.rs's
-    /// session begin/end sends.
+    /// Only present with the 11-byte payload -- see
+    /// rf_pa_calibration_session_begin()'s doc comment in the firmware's
+    /// rf_pa.h. Set by the trailing session_active field on this tool's
+    /// own SET_PACALIBRATION requests (see encode_pa_calibration_request).
     pub session_active: Option<bool>,
 }
 
@@ -82,23 +82,27 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
 }
 
 /// Encodes a SET_PACALIBRATION request: select `power_level` (switches
-/// the VTX's active level if different from its current one) and
-/// optionally override the DAC directly. `mv = None` sends value=0 --
-/// a pure telemetry poll, doesn't touch the DAC (matches
-/// rf_calibration.py's send_MSP_SET_PACALIBRATION(0) pattern). `mv =
-/// Some(1)` is the script's own convention for "select this level and
-/// kick the DAC to a near-zero safe starting point" -- callers wanting
-/// that should pass Some(1) explicitly, this function doesn't special-
-/// case it.
-pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>) -> Vec<u8> {
+/// the VTX's active level if different from its current one), optionally
+/// override the DAC directly, and carry the tool's current calibration-
+/// session/PA-boost state -- see vtx_msp_set_calibration()'s doc comment
+/// in vtx_msp.c for the full 5-byte payload layout. `mv = None` sends
+/// value=0, which doesn't touch the DAC (matches rf_calibration.py's
+/// send_MSP_SET_PACALIBRATION(0) pattern). `session_active` and
+/// `boost_mode` (0=off, 1=on, 2=auto/ext_pa_enable-driven) are sent on
+/// EVERY request now, not just a one-off "begin/end" message -- there is
+/// no separate command for either; the firmware only acts when a value
+/// actually differs from its current state, so repeating the same value
+/// on every calibration point is a no-op there, not something that needs
+/// avoiding on this end.
+pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>, session_active: bool, boost_mode: u8) -> Vec<u8> {
     let mv = mv.unwrap_or(0);
-    vec![power_level, (mv & 0xff) as u8, (mv >> 8) as u8]
-}
-
-/// Encodes a SET_PACALIBRATION_SESSION request -- see
-/// vtx_msp_set_calibration_session()'s doc comment in vtx_msp.c.
-pub fn encode_pa_calibration_session_request(active: bool) -> Vec<u8> {
-    vec![if active { 1 } else { 0 }]
+    vec![
+        power_level,
+        (mv & 0xff) as u8,
+        (mv >> 8) as u8,
+        if session_active { 1 } else { 0 },
+        boost_mode,
+    ]
 }
 
 /// One decoded PA calibration table entry, matching cMsp.py's

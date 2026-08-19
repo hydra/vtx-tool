@@ -198,6 +198,8 @@ pub enum Command {
     /// "Manual" pressed again to exit -- see SweepEngine::exit_manual().
     /// The in-progress (not yet "Next"-ed) point is left untouched.
     ExitManual,
+    /// Manual mode's PA-enable checkbox -- see SweepEngine::set_pa_boost().
+    SetPaBoost { on: bool },
     /// UI confirms the user has retuned a manual-frequency meter.
     ConfirmFrequency,
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
@@ -583,6 +585,12 @@ pub fn spawn(
                         }
                     }
 
+                    Command::SetPaBoost { on } => {
+                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                            engine.set_pa_boost(on);
+                        }
+                    }
+
                     Command::ConfirmFrequency => {
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
                             engine.confirm_frequency();
@@ -621,8 +629,22 @@ pub fn spawn(
                         // with no wait, before the settle gate the engine itself
                         // was tracking ever got a say).
                         let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
-                        if let Some(engine) = sweep.lock().unwrap().as_mut() {
-                            engine.skip_current(payload);
+                        let next_pos = {
+                            let mut guard = sweep.lock().unwrap();
+                            guard.as_mut().and_then(|engine| engine.skip_current(payload))
+                        };
+                        // Only Some() when Manual mode's own skip advanced the
+                        // position -- reseed the slider from the new cell's
+                        // existing table value, same as ManualNext does.
+                        if let Some((level, freq_idx)) = next_pos {
+                            let pa_table = state.lock().unwrap().pa_table.clone();
+                            if let Some(entry) = pa_table.iter().find(|e| e.idx == level) {
+                                if let Some(&mv) = entry.value.get(freq_idx) {
+                                    if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                                        engine.set_manual_dac(mv as i32);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -859,14 +881,14 @@ pub fn spawn(
                     if was_active && !engine.is_active() {
                         // Just transitioned to finished this tick (not aborted --
                         // AbortSweep restores update_hz itself, and abort() queues
-                        // its own session-end). poll() itself already queued a
-                        // session-end the moment it detected "all frequencies
-                        // complete" (see PendingSend::SessionEnd there) -- nothing
-                        // to send here, just the update_hz restore. Only runs
-                        // once, not every tick afterward -- the engine object
-                        // persists after finishing, so gating on the transition
-                        // (not just "currently inactive") is what avoids re-doing
-                        // this every 10ms indefinitely.
+                        // its own session-close push). poll() itself already queued
+                        // one the moment it detected "all frequencies complete" (see
+                        // PendingSend::CalibrationState there) -- nothing to send
+                        // here, just the update_hz restore. Only runs once, not
+                        // every tick afterward -- the engine object persists after
+                        // finishing, so gating on the transition (not just
+                        // "currently inactive") is what avoids re-doing this every
+                        // 10ms indefinitely.
                         let mut s = state.lock().unwrap();
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
                             s.update_hz = prev;
