@@ -392,6 +392,17 @@ pub struct MspLink {
     /// No send is allowed before this instant -- see note_sent() and
     /// send()'s own enforcement. Starts at "now" (unblocked) on open().
     can_send_at: Instant,
+    /// Every frame actually written to the port via send() -- incremented
+    /// regardless of MSP version/function, purely "did a write happen".
+    /// See tx_rx_counts()/worker.rs's periodic log of these -- added
+    /// specifically to make "are commands even reaching the VTX, are
+    /// replies even coming back" answerable from the log instead of
+    /// inferred indirectly from symptoms.
+    tx_count: u64,
+    /// Every frame read_frame() successfully parsed (checksum-valid,
+    /// complete) and returned as Some(..) -- NOT incremented for
+    /// timeouts or bytes discarded while scanning for the next '$'.
+    rx_count: u64,
 }
 
 impl MspLink {
@@ -399,7 +410,7 @@ impl MspLink {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
             .open()?;
-        Ok(Self { port, can_send_at: Instant::now() })
+        Ok(Self { port, can_send_at: Instant::now(), tx_count: 0, rx_count: 0 })
     }
 
     /// Cheap, non-blocking check for whether a send would actually go
@@ -435,6 +446,15 @@ impl MspLink {
         }
     }
 
+    /// Current (tx_count, rx_count) -- see their own doc comments on the
+    /// struct. worker.rs logs these periodically as a basic MSP-level
+    /// diagnostic: if tx keeps climbing but rx doesn't, commands aren't
+    /// reaching the VTX or it isn't replying; if neither climbs, sends
+    /// themselves aren't happening.
+    pub fn tx_rx_counts(&self) -> (u64, u64) {
+        (self.tx_count, self.rx_count)
+    }
+
     pub fn send(&mut self, frame: &[u8]) -> Result<()> {
         if !self.can_send_now() {
             bail!(
@@ -443,6 +463,7 @@ impl MspLink {
             );
         }
         self.port.write_all(frame)?;
+        self.tx_count += 1;
         Ok(())
     }
 
@@ -475,6 +496,7 @@ impl MspLink {
             }
             // Found '$' -- read the rest of the header to decide v1 vs v2.
             if let Some(frame) = self.try_read_after_dollar(deadline)? {
+                self.rx_count += 1;
                 return Ok(Some(frame));
             }
             // Bad frame (checksum mismatch, unexpected header) -- keep
