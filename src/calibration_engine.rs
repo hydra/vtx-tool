@@ -1065,6 +1065,27 @@ impl SweepEngine {
         vtx_ready: bool,
         meter_ready: bool,
     ) -> anyhow::Result<bool> {
+        let result = self.poll_inner(link, history, reading_seq, latest_reading, vtx_ready, meter_ready);
+
+        match &mut self.step {
+            Some(StepState::Detector(detector_state)) => {
+                if let Some(reading) = latest_reading {
+                    detector_state.last_detector_mv = reading.detector_mv;
+                }
+            }
+            _ => ()
+        }
+        result
+    }
+    pub fn poll_inner(
+        &mut self,
+        link: &mut MspLink,
+        history: &VecDeque<(f64, f32)>,
+        reading_seq: u64,
+        latest_reading: Option<msp::PaCalibrationReading>,
+        vtx_ready: bool,
+        meter_ready: bool,
+    ) -> anyhow::Result<bool> {
         // Track boost_on transitions from live telemetry before anything
         // else this tick -- the PA can power up at the start of ANY
         // phase (ScanPa coarse, Fine, ScanDetector, or Manual mode's own
@@ -1560,10 +1581,6 @@ impl SweepEngine {
                     )),
                 );
 
-                if let Some(reading) = latest_reading {
-                    st.last_detector_mv = reading.detector_mv;
-                }
-                
                 self.step = Some(StepState::Detector(st));
             }
         }
