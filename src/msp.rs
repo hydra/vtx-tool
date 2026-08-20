@@ -26,6 +26,11 @@ pub mod function {
     pub const SET_PACALTABLE: u16 = 0x4801;
     pub const PACALIBRATION: u16 = 0x4802;
     pub const SET_PACALIBRATION: u16 = 0x4803;
+    /// MSP_DISPLAYPORT -- see msp_displayport.c. Sent via send_v1(), not
+    /// send_v2() -- it's a classic low-numbered MSP command, matching
+    /// both convention and how this firmware's own MSP_SET_OSD_CANVAS
+    /// reply already goes out (v1).
+    pub const DISPLAYPORT: u16 = 182;
 }
 
 /// Decoded MSP_PACALIBRATION response -- vtx_msp_push_calibration()'s
@@ -103,6 +108,56 @@ pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>, session_a
         if session_active { 1 } else { 0 },
         boost_mode,
     ]
+}
+
+/// DisplayPort sub-command bytes -- see msp_displayport.c's
+/// msp_displayport_cmd_t. Only the ones this tool actually sends are
+/// listed (CLEAR/SET_OPTIONS/DRAW_SYSTEM are firmware-side concerns not
+/// used here).
+pub mod displayport_cmd {
+    pub const KEEPALIVE: u8 = 0;
+    pub const RELEASE: u8 = 1;
+    pub const CLEAR: u8 = 2;
+    pub const DRAW_STRING: u8 = 3;
+    pub const DRAW_SCREEN: u8 = 4;
+}
+
+/// The firmware's own OSD canvas dimensions -- see canvas_char.h's
+/// COLUMN_SIZE/ROW_SIZE. encode_displayport_draw_string() clamps against
+/// this itself (belt-and-suspenders alongside the firmware's own clamp
+/// in msp_displayport_handle_msp() -- neither should be the only thing
+/// standing between a too-long string and a buffer overflow).
+pub const DISPLAYPORT_COLUMNS: u8 = 30;
+pub const DISPLAYPORT_ROWS: u8 = 16;
+
+pub fn encode_displayport_keepalive() -> Vec<u8> {
+    vec![displayport_cmd::KEEPALIVE]
+}
+
+pub fn encode_displayport_release() -> Vec<u8> {
+    vec![displayport_cmd::RELEASE]
+}
+
+pub fn encode_displayport_clear() -> Vec<u8> {
+    vec![displayport_cmd::CLEAR]
+}
+
+pub fn encode_displayport_draw_screen() -> Vec<u8> {
+    vec![displayport_cmd::DRAW_SCREEN]
+}
+
+/// Encodes DRAW_STRING for one row starting at `col`. `text` is clamped
+/// to DISPLAYPORT_COLUMNS - col bytes -- matching, but not relying on,
+/// the firmware's own clamp for the same reason. byte[3] is an unused
+/// "attribute" byte the firmware's own offset math expects present
+/// (text starts at payload[4]) but never reads.
+pub fn encode_displayport_draw_string(row: u8, col: u8, text: &str) -> Vec<u8> {
+    let max_len = DISPLAYPORT_COLUMNS.saturating_sub(col) as usize;
+    let bytes = text.as_bytes();
+    let bytes = if bytes.len() > max_len { &bytes[..max_len] } else { bytes };
+    let mut v = vec![displayport_cmd::DRAW_STRING, row, col, 0];
+    v.extend_from_slice(bytes);
+    v
 }
 
 /// One decoded PA calibration table entry, matching cMsp.py's

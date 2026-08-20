@@ -249,6 +249,19 @@ pub fn spawn(
         // specific command's own behavior.
         let mut last_txrx_log = Instant::now();
         const TXRX_LOG_INTERVAL: Duration = Duration::from_secs(5);
+        // DisplayPort debug overlay -- see build_status_displayport_frames()
+        // and its call site below. Queued and drained one frame per tick
+        // (same discipline as every other send in this file), rather than
+        // firing all ~10 frames from one status update in a single burst --
+        // DisplayPort commands use MspCommandKind::Other (zero settle), so
+        // nothing else would naturally pace them.
+        let mut displayport_queue: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut last_displayport_keepalive = Instant::now();
+        // Chosen to comfortably beat any reasonable OSD-side keepalive
+        // timeout without adding meaningful extra traffic -- this is a
+        // low-frequency "still here" signal, not the actual debug content
+        // (that's driven by every status reply, far more often than this).
+        const DISPLAYPORT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
         // Set true whenever poll() (or, before its own reply arrives, a
         // session begin/end) actually sent something state-changing this
         // tick -- see the PACALIBRATION read-dispatch below, which logs
@@ -294,6 +307,18 @@ pub fn spawn(
                                             Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
                                             Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
                                         }
+                                        // Open the OSD debug overlay and start it from a
+                                        // known-clean (cleared) screen -- see
+                                        // build_status_displayport_frames()'s doc comment
+                                        // for why this exists.
+                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                            error!(target: "vtx", "failed to send DisplayPort keepalive on connect: {e}");
+                                        }
+                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                            error!(target: "vtx", "failed to clear DisplayPort screen on connect: {e}");
+                                        }
+                                        last_displayport_keepalive = Instant::now();
+                                        displayport_queue.clear();
                                     }
                                 }
                                 Err(e) => {
@@ -310,6 +335,12 @@ pub fn spawn(
                         } else {
                             state.lock().unwrap().vtx_port_state = PortState::Disconnecting;
                             ctx.request_repaint();
+                            if let Some(link) = vtx.as_mut() {
+                                if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_release()) {
+                                    error!(target: "vtx", "failed to release DisplayPort on disconnect: {e}");
+                                }
+                            }
+                            displayport_queue.clear();
                             vtx = None;
                             vtx_last_seen = None;
                             vtx_port_path = None;
@@ -706,6 +737,24 @@ pub fn spawn(
                     let (tx, rx) = link.tx_rx_counts();
                     debug!(target: "vtx", "MSP link: tx={tx} rx={rx}");
                 }
+                if last_displayport_keepalive.elapsed() >= DISPLAYPORT_KEEPALIVE_INTERVAL && link.can_send_now() {
+                    last_displayport_keepalive = Instant::now();
+                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                        error!(target: "vtx", "failed to send DisplayPort keepalive: {e}");
+                    }
+                }
+                // At most one queued DisplayPort frame per tick -- DRAW_STRING/
+                // DRAW_SCREEN use MspCommandKind::Other (zero settle), so
+                // nothing else would naturally pace a whole batch of these.
+                // Still gated on can_send_now() so this never jumps ahead of
+                // an actual retune's own settle window.
+                if link.can_send_now() {
+                    if let Some(frame) = displayport_queue.pop_front() {
+                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
+                            error!(target: "vtx", "failed to send DisplayPort frame: {e}");
+                        }
+                    }
+                }
             }
 
             // One read per tick, dispatched to whichever consumer wants
@@ -736,7 +785,7 @@ pub fn spawn(
                                 let mut s = state.lock().unwrap();
                                 let power_mw =
                                     s.pa_table.iter().find(|e| e.idx == reading.power_level).map(|e| e.m_w);
-                                s.vtx_status = Some(VtxStatus {
+                                let status = VtxStatus {
                                     level: reading.power_level,
                                     power_mw,
                                     boost_on: reading.boost_on,
@@ -746,8 +795,11 @@ pub fn spawn(
                                     detector_mv: reading.detector_mv,
                                     pid_active: reading.pid_active,
                                     session_active: reading.session_active,
-                                });
+                                };
+                                s.vtx_status = Some(status.clone());
                                 drop(s);
+                                //displayport_queue.clear();
+                                displayport_queue.extend(build_status_displayport_frames(&status));
                                 // Only logged when this is the first reply after a
                                 // state-changing send (a retune, a calibration
                                 // override, a session begin/end -- see
@@ -829,6 +881,17 @@ pub fn spawn(
                                     if let Err(e) = link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                         error!(target: "vtx", "failed to push safe-state VTX_CONFIG after reconnect: {e}");
                                     }
+                                    // Same "open + clear" as the initial connect --
+                                    // this is specifically the "reconnecting after
+                                    // power failure" case.
+                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                        error!(target: "vtx", "failed to send DisplayPort keepalive after reconnect: {e}");
+                                    }
+                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                        error!(target: "vtx", "failed to clear DisplayPort screen after reconnect: {e}");
+                                    }
+                                    last_displayport_keepalive = Instant::now();
+                                    displayport_queue.clear();
                                 }
                             }
                             Err(e) => debug!(target: "vtx", "reconnect attempt for {path} failed: {e}"),
@@ -1030,6 +1093,44 @@ pub fn spawn(
             std::thread::sleep(Duration::from_millis(10));
         }
     });
+}
+
+/// Builds the DisplayPort debug overlay for one VTX status reply: nine
+/// label/value rows (Level, Power mW, PA, RTC6705, Freq, VBIAS, Vdet,
+/// PID, Session) followed by a DRAW_SCREEN to commit them, each row a
+/// single DRAW_STRING starting at column 0 -- the label/value split and
+/// justification are computed here in Rust (trivial with format!'s own
+/// padding) rather than asking the firmware's single "write chars at
+/// (row,col)" primitive to do any layout of its own. See the "Check the
+/// C MSP and VTX code" investigation this was built alongside: this
+/// overlay exists so a hung MCU is visible on the OSD itself (frozen
+/// text, stopped LED) as a check independent of whatever the serial
+/// link is or isn't reporting.
+fn build_status_displayport_frames(status: &VtxStatus) -> Vec<Vec<u8>> {
+    // Label column left-justified at 12 chars, value column right-
+    // justified at 18 -- 30 total, exactly DISPLAYPORT_COLUMNS.
+    fn row(label: &str, value: String) -> String {
+        format!("{label:<12}{value:>18}")
+    }
+    let rows = [
+        row("Level", status.level.to_string()),
+        row("Power mW", status.power_mw.map(|v| format!("{v}mW")).unwrap_or_else(|| "-".to_string())),
+        row("PA", status.boost_on.map(|b| if b { "ON" } else { "OFF" }.to_string()).unwrap_or_else(|| "?".to_string())),
+        row("RTC6705", status.rtc6705_level.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())),
+        row("Freq", status.frequency_mhz.map(|v| format!("{v}MHz")).unwrap_or_else(|| "-".to_string())),
+        row("VBIAS", format!("{}mV", status.vbias_mv)),
+        row("Vdet", status.detector_mv.to_string()),
+        row("PID", status.pid_active.map(|b| if b { "Active" } else { "Idle" }.to_string()).unwrap_or_else(|| "?".to_string())),
+        row("Session", status.session_active.map(|b| if b { "Open" } else { "Closed" }.to_string()).unwrap_or_else(|| "?".to_string())),
+    ];
+
+    let mut frames: Vec<Vec<u8>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, text)| msp::encode_displayport_draw_string(i as u8, 0, text))
+        .collect();
+    frames.push(msp::encode_displayport_draw_screen());
+    frames
 }
 
 fn read_pa_table(link: &mut MspLink) -> Result<Vec<msp::PaCalibration>> {
