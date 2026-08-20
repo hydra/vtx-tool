@@ -31,6 +31,12 @@ pub mod function {
     /// both convention and how this firmware's own MSP_SET_OSD_CANVAS
     /// reply already goes out (v1).
     pub const DISPLAYPORT: u16 = 182;
+    /// MSP_SET_OSD_CANVAS -- the VTX's reply to a DisplayPort KEEPALIVE,
+    /// reporting its own canvas size (columns, rows). Sent via v1 by the
+    /// firmware (see msp_displayport.c) -- decode_osd_canvas() below reads
+    /// it regardless of which framing carried it, same as every other
+    /// incoming frame this tool handles.
+    pub const SET_OSD_CANVAS: u16 = 188;
 }
 
 /// Decoded MSP_PACALIBRATION response -- vtx_msp_push_calibration()'s
@@ -158,6 +164,17 @@ pub fn encode_displayport_draw_string(row: u8, col: u8, text: &str) -> Vec<u8> {
     let mut v = vec![displayport_cmd::DRAW_STRING, row, col, 0];
     v.extend_from_slice(bytes);
     v
+}
+
+/// Decodes MSP_SET_OSD_CANVAS's 2-byte payload: [columns, rows] -- see
+/// msp_displayport_handle_msp()'s KEEPALIVE handling in the firmware,
+/// which is what actually sends this (as a reply, not something this
+/// tool requests separately).
+pub fn decode_osd_canvas(payload: &[u8]) -> Option<(u8, u8)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    Some((payload[0], payload[1]))
 }
 
 /// One decoded PA calibration table entry, matching cMsp.py's
