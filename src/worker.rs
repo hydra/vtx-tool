@@ -832,6 +832,7 @@ pub fn spawn(
                                 // often than every status reply whenever the link is
                                 // busy, but every batch that DOES go out is complete.
                                 if displayport_queue.is_empty() {
+                                    displayport_queue.push_back(msp::encode_displayport_clear());
                                     displayport_queue.extend(build_status_displayport_frames(&status));
                                 }
                                 // Always logged now -- was previously gated to only
