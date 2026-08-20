@@ -306,7 +306,10 @@ impl eframe::App for App {
                 // no reading has arrived yet (or the connected firmware
                 // doesn't send that particular field), never a guessed or
                 // defaulted value that could be mistaken for real data.
-                let vtx_status = self.state.lock().unwrap().vtx_status.clone();
+                let (vtx_status, vtx_last_seen_at, osd_canvas, osd_keepalive_at) = {
+                    let s = self.state.lock().unwrap();
+                    (s.vtx_status.clone(), s.vtx_last_seen_at.clone(), s.osd_canvas, s.osd_keepalive_at.clone())
+                };
                 match vtx_status {
                     Some(status) => {
                         egui::Grid::new("vtx_status_grid").num_columns(2).show(ui, |ui| {
@@ -367,12 +370,40 @@ impl eframe::App for App {
                                 None => "—",
                             });
                             ui.end_row();
+
+                            ui.label("Last seen:");
+                            ui.label(vtx_last_seen_at.as_deref().unwrap_or("—"));
+                            ui.end_row();
                         });
                     }
                     None => {
                         ui.label(egui::RichText::new("No status received yet.").weak().italics());
                     }
                 }
+
+                ui.separator();
+                ui.heading("OSD Status");
+                // Both fields below come from what THIS tool has sent/
+                // received over MSP_DISPLAYPORT -- see
+                // build_status_displayport_frames()'s doc comment in
+                // worker.rs for why this overlay exists (an MCU hang should
+                // show up here as a screen that stops updating, independent
+                // of whatever the serial link itself is or isn't reporting).
+                egui::Grid::new("osd_status_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Size:");
+                    ui.label(match osd_canvas {
+                        Some((cols, rows)) => format!("{cols}x{rows}"),
+                        None => "None".to_string(),
+                    });
+                    ui.end_row();
+
+                    ui.label("Status:");
+                    ui.label(match osd_keepalive_at {
+                        Some(ts) => format!("Keepalive ({ts})"),
+                        None => "None".to_string(),
+                    });
+                    ui.end_row();
+                });
             });
 
         // Center: whichever pages are open, as dock tabs.
