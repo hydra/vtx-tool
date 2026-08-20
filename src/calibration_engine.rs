@@ -1481,11 +1481,8 @@ impl SweepEngine {
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
-                let detector_now = latest_reading.map(|r| r.detector_mv).unwrap_or(0);
-                if let Some(reading) = latest_reading {
-                    st.last_detector_mv = reading.detector_mv;
-                }
-                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={detector_now}", st.vbias_mv);
+
+                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={}", st.vbias_mv, st.last_detector_mv);
 
                 match st.phase {
                     ScanDetectorPhase::Backoff => {
@@ -1502,7 +1499,7 @@ impl SweepEngine {
                             st.wait = None;
                             if st.pinned_count >= PINNED_LIMIT {
                                 debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_detector(level, detector_now, false);
+                                self.finish_scan_detector(level, st.last_detector_mv, false);
                                 return Ok(false);
                             }
                         }
@@ -1514,12 +1511,12 @@ impl SweepEngine {
                         } else if avg_mw > target_mw + dev {
                             st.vbias_mv - up * 2
                         } else if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={detector_now}", st.vbias_mv);
-                            st.below = Some((avg_mw, detector_now));
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", st.vbias_mv, st.last_detector_mv);
+                            st.below = Some((avg_mw, st.last_detector_mv));
                             st.vbias_mv + up
                         } else {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={detector_now}", st.vbias_mv);
-                            st.above = Some((avg_mw, detector_now));
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", st.vbias_mv, st.last_detector_mv);
+                            st.above = Some((avg_mw, st.last_detector_mv));
                             st.vbias_mv - up
                         };
                         let clamped = desired.clamp(bound_lo, bound_hi);
@@ -1535,9 +1532,9 @@ impl SweepEngine {
                         st.wait = None;
 
                         if st.pinned_count >= PINNED_LIMIT {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={detector_now} as a rough (not interpolated) fallback",
-                                st.pinned_count);
-                            self.finish_scan_detector(level, detector_now, false);
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={} as a rough (not interpolated) fallback",
+                                st.pinned_count, st.last_detector_mv);
+                            self.finish_scan_detector(level, st.last_detector_mv, false);
                             return Ok(false);
                         }
 
@@ -1562,6 +1559,11 @@ impl SweepEngine {
                         st.vbias_mv
                     )),
                 );
+
+                if let Some(reading) = latest_reading {
+                    st.last_detector_mv = reading.detector_mv;
+                }
+                
                 self.step = Some(StepState::Detector(st));
             }
         }
