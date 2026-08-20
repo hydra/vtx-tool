@@ -426,16 +426,18 @@ pub enum MspCommandKind {
     /// (rtc6705_set_frequency()), which per the firmware blocks the
     /// VTX's entire main loop until rtc6705_wait_state_stable() returns.
     /// That function's own intended worst case is
-    /// RTC6705_LOCK_WAIT_TIMEOUT_US (5ms) -- but the delay hook it's
-    /// built on (rtc6705_hook_delay_us) currently resolves to
-    /// millisecond- rather than microsecond-granularity in every
-    /// firmware file available to check this against, meaning the REAL
-    /// worst case is closer to 5 SECONDS until that's fixed. Any command
-    /// sent during that window is simply not received until it ends.
-    /// Deliberately generous rather than tuned to the intended 5ms for
-    /// that reason; tighten this once the firmware-side delay bug is
-    /// actually fixed and the real settle time is known, rather than
-    /// assumed.
+    /// RTC6705_LOCK_WAIT_TIMEOUT_US (5ms) -- previously the delay hook
+    /// it's built on (rtc6705_hook_delay_us) resolved to millisecond-
+    /// rather than microsecond-granularity (a ~100x overshoot per
+    /// iteration of that function's own polling loop, since each
+    /// iteration calls it with us=10 expecting ~10us but got ~1ms via
+    /// HAL_Delay's own millisecond floor), making the REAL worst case
+    /// closer to ~500ms -- during which no incoming MSP byte on either
+    /// UART or USB was processed at all, since the whole MCU main loop
+    /// was frozen inside the busy-wait. Now fixed firmware-side (see
+    /// rtc6705_hook_delay_us() in rtc6705.c), so this settle window is
+    /// back down to the intended ~5ms plus real margin, not the ~500ms
+    /// this was previously padded against.
     Retune,
     /// SET_PACALIBRATION -- a direct DAC write (dac_ch2_write_mv()) with
     /// no synth reprogramming involved, so no comparable blocking is
@@ -453,7 +455,7 @@ pub enum MspCommandKind {
 impl MspCommandKind {
     pub fn settle_duration(self) -> Duration {
         match self {
-            MspCommandKind::Retune => Duration::from_millis(500),
+            MspCommandKind::Retune => Duration::from_millis(50),
             MspCommandKind::Calibration | MspCommandKind::Other => Duration::ZERO,
         }
     }
