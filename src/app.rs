@@ -486,6 +486,16 @@ impl eframe::App for App {
                     });
                     ui.end_row();
                 });
+
+                // While unchecked, worker.rs sends NO MSP_DISPLAYPORT traffic
+                // at all -- no keepalive, no clear, no draw_string/draw_screen
+                // -- so the firmware's own OSD content (e.g. debug_pa_loop()'s
+                // PID debug rows) can be observed with this tool's own
+                // overlay entirely out of the picture.
+                let mut osd_debug_overlay_enabled = self.state.lock().unwrap().osd_debug_overlay_enabled;
+                if ui.checkbox(&mut osd_debug_overlay_enabled, "Enable debug overlay").changed() {
+                    self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
+                }
             });
 
         // Center: whichever pages are open, as dock tabs.
