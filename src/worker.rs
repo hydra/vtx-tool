@@ -134,6 +134,14 @@ pub struct SharedState {
     /// from vtx_ready (a derived "was it recent enough" bool): this is
     /// the raw timestamp itself, for the VTX Status panel.
     pub vtx_last_seen_at: Option<String>,
+    /// Written directly by the UI's "Enable debug overlay" checkbox in
+    /// the OSD Status section. While false, worker.rs sends NO
+    /// MSP_DISPLAYPORT traffic at all -- no keepalive, no clear, no
+    /// draw_string/draw_screen -- specifically so the firmware's own
+    /// OSD content (e.g. debug_pa_loop()'s PID debug rows) can be
+    /// observed with this tool's own overlay entirely out of the
+    /// picture. Defaults true to match this tool's existing behavior.
+    pub osd_debug_overlay_enabled: bool,
 }
 
 /// How recently the VTX (or power meter) must have said ANYTHING for
@@ -168,6 +176,7 @@ impl Default for SharedState {
             osd_canvas: None,
             osd_keepalive_at: None,
             vtx_last_seen_at: None,
+            osd_debug_overlay_enabled: true,
         }
     }
 }
@@ -319,19 +328,26 @@ pub fn spawn(
                                         // Open the OSD debug overlay and start it from a
                                         // known-clean (cleared) screen -- see
                                         // build_status_displayport_frames()'s doc comment
-                                        // for why this exists.
-                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
-                                            error!(target: "vtx", "failed to send DisplayPort keepalive on connect: {e}");
+                                        // for why this exists. Gated on the "Enable debug
+                                        // overlay" checkbox -- while off, this tool sends
+                                        // no MSP_DISPLAYPORT traffic at all, so the
+                                        // firmware's own OSD content can be observed with
+                                        // this tool's own overlay entirely out of the
+                                        // picture.
+                                        if state.lock().unwrap().osd_debug_overlay_enabled {
+                                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                                error!(target: "vtx", "failed to send DisplayPort keepalive on connect: {e}");
+                                            }
+                                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                                error!(target: "vtx", "failed to clear DisplayPort screen on connect: {e}");
+                                            }
+                                            last_displayport_keepalive = Instant::now();
+                                            let mut s = state.lock().unwrap();
+                                            s.osd_keepalive_at = Some(format_time_hms());
+                                            s.osd_canvas = None;
+                                            drop(s);
+                                            displayport_queue.clear();
                                         }
-                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
-                                            error!(target: "vtx", "failed to clear DisplayPort screen on connect: {e}");
-                                        }
-                                        last_displayport_keepalive = Instant::now();
-                                        let mut s = state.lock().unwrap();
-                                        s.osd_keepalive_at = Some(format_time_hms());
-                                        s.osd_canvas = None;
-                                        drop(s);
-                                        displayport_queue.clear();
                                     }
                                 }
                                 Err(e) => {
@@ -349,8 +365,10 @@ pub fn spawn(
                             state.lock().unwrap().vtx_port_state = PortState::Disconnecting;
                             ctx.request_repaint();
                             if let Some(link) = vtx.as_mut() {
-                                if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_release()) {
-                                    error!(target: "vtx", "failed to release DisplayPort on disconnect: {e}");
+                                if state.lock().unwrap().osd_debug_overlay_enabled {
+                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_release()) {
+                                        error!(target: "vtx", "failed to release DisplayPort on disconnect: {e}");
+                                    }
                                 }
                             }
                             displayport_queue.clear();
@@ -753,24 +771,32 @@ pub fn spawn(
                     let (tx, rx) = link.tx_rx_counts();
                     debug!(target: "vtx", "MSP link: tx={tx} rx={rx}");
                 }
-                if last_displayport_keepalive.elapsed() >= DISPLAYPORT_KEEPALIVE_INTERVAL && link.can_send_now() {
-                    last_displayport_keepalive = Instant::now();
-                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
-                        error!(target: "vtx", "failed to send DisplayPort keepalive: {e}");
+                let osd_debug_overlay_enabled = state.lock().unwrap().osd_debug_overlay_enabled;
+                if osd_debug_overlay_enabled {
+                    if last_displayport_keepalive.elapsed() >= DISPLAYPORT_KEEPALIVE_INTERVAL && link.can_send_now() {
+                        last_displayport_keepalive = Instant::now();
+                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                            error!(target: "vtx", "failed to send DisplayPort keepalive: {e}");
+                        }
+                        state.lock().unwrap().osd_keepalive_at = Some(format_time_hms());
                     }
-                    state.lock().unwrap().osd_keepalive_at = Some(format_time_hms());
-                }
-                // At most one queued DisplayPort frame per tick -- DRAW_STRING/
-                // DRAW_SCREEN use MspCommandKind::Other (zero settle), so
-                // nothing else would naturally pace a whole batch of these.
-                // Still gated on can_send_now() so this never jumps ahead of
-                // an actual retune's own settle window.
-                if link.can_send_now() {
-                    if let Some(frame) = displayport_queue.pop_front() {
-                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
-                            error!(target: "vtx", "failed to send DisplayPort frame: {e}");
+                    // At most one queued DisplayPort frame per tick -- DRAW_STRING/
+                    // DRAW_SCREEN use MspCommandKind::Other (zero settle), so
+                    // nothing else would naturally pace a whole batch of these.
+                    // Still gated on can_send_now() so this never jumps ahead of
+                    // an actual retune's own settle window.
+                    if link.can_send_now() {
+                        if let Some(frame) = displayport_queue.pop_front() {
+                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
+                                error!(target: "vtx", "failed to send DisplayPort frame: {e}");
+                            }
                         }
                     }
+                } else if !displayport_queue.is_empty() {
+                    // Disabled mid-batch (or just toggled off) -- drop whatever was
+                    // queued rather than let it drain out later once re-enabled,
+                    // showing stale content from before the toggle.
+                    displayport_queue.clear();
                 }
             }
 
@@ -820,6 +846,7 @@ pub fn spawn(
                                     session_active: reading.session_active,
                                 };
                                 s.vtx_status = Some(status.clone());
+                                let osd_debug_overlay_enabled = s.osd_debug_overlay_enabled;
                                 drop(s);
                                 // Only start a fresh batch once the previous one has
                                 // fully drained (ending in its own DRAW_SCREEN) --
@@ -831,7 +858,11 @@ pub fn spawn(
                                 // DRAW_SCREEN ever landing at all. This sends less
                                 // often than every status reply whenever the link is
                                 // busy, but every batch that DOES go out is complete.
-                                if displayport_queue.is_empty() {
+                                // Gated on "Enable debug overlay" too -- while off,
+                                // nothing gets queued at all, so worker.rs's own drain
+                                // loop below never has anything of this tool's own to
+                                // send.
+                                if osd_debug_overlay_enabled && displayport_queue.is_empty() {
                                     displayport_queue.push_back(msp::encode_displayport_clear());
                                     displayport_queue.extend(build_status_displayport_frames(&status));
                                 }
@@ -914,19 +945,23 @@ pub fn spawn(
                                     }
                                     // Same "open + clear" as the initial connect --
                                     // this is specifically the "reconnecting after
-                                    // power failure" case.
-                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
-                                        error!(target: "vtx", "failed to send DisplayPort keepalive after reconnect: {e}");
+                                    // power failure" case. Gated on the "Enable debug
+                                    // overlay" checkbox, same as every other DisplayPort
+                                    // send site.
+                                    if state.lock().unwrap().osd_debug_overlay_enabled {
+                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                            error!(target: "vtx", "failed to send DisplayPort keepalive after reconnect: {e}");
+                                        }
+                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                            error!(target: "vtx", "failed to clear DisplayPort screen after reconnect: {e}");
+                                        }
+                                        last_displayport_keepalive = Instant::now();
+                                        let mut s = state.lock().unwrap();
+                                        s.osd_keepalive_at = Some(format_time_hms());
+                                        s.osd_canvas = None;
+                                        drop(s);
+                                        displayport_queue.clear();
                                     }
-                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
-                                        error!(target: "vtx", "failed to clear DisplayPort screen after reconnect: {e}");
-                                    }
-                                    last_displayport_keepalive = Instant::now();
-                                    let mut s = state.lock().unwrap();
-                                    s.osd_keepalive_at = Some(format_time_hms());
-                                    s.osd_canvas = None;
-                                    drop(s);
-                                    displayport_queue.clear();
                                 }
                             }
                             Err(e) => debug!(target: "vtx", "reconnect attempt for {path} failed: {e}"),
