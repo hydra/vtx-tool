@@ -295,11 +295,26 @@ struct ScanDetectorState {
     below: Option<(f32, u16)>, // (power_mw, detector_mv)
     above: Option<(f32, u16)>,
     pinned_count: u32, // consecutive steps clamped at a bound without progress -- see PINNED_LIMIT
-    /// Most recent detector ADC reading (VDET) seen from the VTX for
-    /// this step -- distinct from `vbias_mv` above. current_step() reports
-    /// THIS for the UI's live Detector-column cell, since that column is
-    /// about detector readings, not DAC values.
-    last_detector_mv: u16,
+    /// Most recent COMPLETE VTX status reply received SINCE the current
+    /// vbias_mv was commanded -- reset to None every time vbias_mv
+    /// changes (see every site that does `st.wait = None` below, now
+    /// paired with `st.last_reading = None`), so a decision can never
+    /// pair this step's freshly-averaged meter reading with a VTX status
+    /// reply that actually describes an earlier, already-superseded
+    /// vbias_mv. Holds the whole reading (vref_mv and detector_mv
+    /// together, exactly as the VTX reported them in the SAME message)
+    /// rather than separate fields updated independently -- that's what
+    /// let vbias_mv (self-tracked, commanded) and a detector_mv field
+    /// (separately updated, reported) drift out of sync by a tick,
+    /// which is exactly what produced a real detector=0 bug: the
+    /// bracket/backoff decision below firing before this step's first
+    /// real reading had ever arrived, reading a leftover sentinel
+    /// instead. None until a fresh reading arrives -- there is no
+    /// synthetic/sentinel/zero fallback for this; every place that
+    /// needs it either has a real, current reading or doesn't make the
+    /// decision yet (see the atomic-data gate in poll_inner()'s
+    /// Detector arm).
+    last_reading: Option<msp::PaCalibrationReading>,
 }
 
 enum StepState {
@@ -1070,7 +1085,7 @@ impl SweepEngine {
         match &mut self.step {
             Some(StepState::Detector(detector_state)) => {
                 if let Some(reading) = latest_reading {
-                    detector_state.last_detector_mv = reading.detector_mv;
+                    detector_state.last_reading = Some(reading);
                 }
             }
             _ => ()
@@ -1498,19 +1513,37 @@ impl SweepEngine {
                     return Ok(sent);
                 }
 
+                // Atomic-data gate: no decision below runs without a real
+                // VTX status reply that postdates the current vbias_mv --
+                // see last_reading's own doc comment. wait.ready() only
+                // means the METER has enough fresh samples; it says
+                // nothing about whether the VTX's own reported state has
+                // arrived yet, since the meter and the VTX are two
+                // independent, asynchronously-polled data sources.
+                let Some(reading) = st.last_reading else {
+                    let mut sent = false;
+                    if !throttled {
+                        self.send_calibration(link, level, st.vbias_mv)?;
+                        self.last_send = Instant::now();
+                        sent = true;
+                    }
+                    self.step = Some(StepState::Detector(st));
+                    return Ok(sent);
+                };
 
                 let avg_mw = wait.average(history);
                 let up = power_up_step(self.sign_inverted);
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
 
-                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={}", st.vbias_mv, st.last_detector_mv);
+                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={}", reading.vref_mv, reading.detector_mv);
 
                 match st.phase {
                     ScanDetectorPhase::Backoff => {
                         if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at vbias_mv={}, entering bracket search", st.vbias_mv);
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at vbias_mv={}, entering bracket search", reading.vref_mv);
                             st.phase = ScanDetectorPhase::Bracket;
                             st.wait = None;
+                            st.last_reading = None;
                             st.pinned_count = 0;
                         } else {
                             let desired = st.vbias_mv - up;
@@ -1518,9 +1551,10 @@ impl SweepEngine {
                             st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
                             st.vbias_mv = clamped;
                             st.wait = None;
+                            st.last_reading = None;
                             if st.pinned_count >= PINNED_LIMIT {
                                 debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_detector(level, st.last_detector_mv, false);
+                                self.finish_scan_detector(level, reading.detector_mv, false);
                                 return Ok(false);
                             }
                         }
@@ -1532,12 +1566,12 @@ impl SweepEngine {
                         } else if avg_mw > target_mw + dev {
                             st.vbias_mv - up * 2
                         } else if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", st.vbias_mv, st.last_detector_mv);
-                            st.below = Some((avg_mw, st.last_detector_mv));
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
+                            st.below = Some((avg_mw, reading.detector_mv));
                             st.vbias_mv + up
                         } else {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", st.vbias_mv, st.last_detector_mv);
-                            st.above = Some((avg_mw, st.last_detector_mv));
+                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
+                            st.above = Some((avg_mw, reading.detector_mv));
                             st.vbias_mv - up
                         };
                         let clamped = desired.clamp(bound_lo, bound_hi);
@@ -1551,11 +1585,12 @@ impl SweepEngine {
                         st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
                         st.vbias_mv = clamped;
                         st.wait = None;
+                        st.last_reading = None;
 
                         if st.pinned_count >= PINNED_LIMIT {
                             debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={} as a rough (not interpolated) fallback",
-                                st.pinned_count, st.last_detector_mv);
-                            self.finish_scan_detector(level, st.last_detector_mv, false);
+                                st.pinned_count, reading.detector_mv);
+                            self.finish_scan_detector(level, reading.detector_mv, false);
                             return Ok(false);
                         }
 
@@ -1650,7 +1685,7 @@ impl SweepEngine {
                 level,
                 freq_idx: self.freq_idx,
                 vbias_mv: None,
-                detector_mv: Some(st.last_detector_mv as i32),
+                detector_mv: st.last_reading.map(|r| r.detector_mv as i32),
             }),
             None => None,
         }
@@ -1746,6 +1781,7 @@ impl SweepEngine {
                 Some(StepState::Detector(st)) => {
                     st.vbias_mv = safe_vbias_mv;
                     st.wait = None;
+                    st.last_reading = None;
                 }
                 None => {}
             }
@@ -1983,7 +2019,7 @@ impl SweepEngine {
             below: None,
             above: None,
             pinned_count: 0,
-            last_detector_mv: 0,
+            last_reading: None,
         }));
     }
 
