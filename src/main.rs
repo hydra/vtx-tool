@@ -66,6 +66,12 @@ struct Args {
     /// Minimum log level to record (error, warn, info, debug, trace)
     #[arg(long, default_value = "debug")]
     log_level: LevelFilter,
+
+    /// Path to a VTX table JSON file to load at startup. Optional --
+    /// if omitted, the last loaded/saved path (settings.json) is used
+    /// instead, if any.
+    #[arg(long)]
+    vtx_table: Option<String>,
 }
 
 fn main() -> eframe::Result<()> {
@@ -86,12 +92,26 @@ fn main() -> eframe::Result<()> {
     if let Some(a) = args.attenuation {
         initial_settings.attenuation_db = a;
     }
+    if let Some(t) = &args.vtx_table {
+        initial_settings.vtx_table_path = t.clone();
+    }
     let initial_meter_kind = initial_settings.meter_kind;
 
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
     state.lock().unwrap().meter_kind = initial_meter_kind;
     state.lock().unwrap().attenuation_db = initial_settings.attenuation_db;
-    let vtx_table = Arc::new(Mutex::new(VtxTableConfig::default()));
+    // Auto-loaded from settings.json (or --vtx-table) if a path is set --
+    // falls back to VtxTableConfig::default() (an empty table) the same
+    // way it always has if the path is empty, or the load fails (a
+    // missing/corrupt file at a remembered path shouldn't prevent the
+    // app from starting; the VTX Table page's own file field still
+    // shows the path, and the user can fix it or Load again from there).
+    let initial_vtx_table = if initial_settings.vtx_table_path.is_empty() {
+        VtxTableConfig::default()
+    } else {
+        VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)).unwrap_or_default()
+    };
+    let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();
 

@@ -34,6 +34,13 @@ pub struct AppSettings {
     /// 0.0dB, not the 30dB the UI actually defaults to.
     #[serde(default = "default_attenuation_db")]
     pub attenuation_db: f32,
+    /// Path to the last loaded/saved VTX table JSON file -- loaded
+    /// automatically on startup if non-empty (see main.rs). Same
+    /// #[serde(default)] reasoning as the other fields: a settings file
+    /// saved before this field existed still parses correctly, just
+    /// with no path to auto-load.
+    #[serde(default)]
+    pub vtx_table_path: String,
 }
 
 impl Default for AppSettings {
@@ -43,6 +50,7 @@ impl Default for AppSettings {
             meter_port: String::new(),
             meter_kind: PowerMeterKind::default(),
             attenuation_db: default_attenuation_db(),
+            vtx_table_path: String::new(),
         }
     }
 }
