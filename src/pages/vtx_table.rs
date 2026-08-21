@@ -8,6 +8,7 @@
 //! lines.
 
 use crate::msp::{VtxBand, VtxPowerLevel};
+use crate::settings::AppSettings;
 use crate::vtxtable::VtxTableConfig;
 use crate::worker::{Command, SharedState};
 use eframe::egui;
@@ -16,8 +17,6 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 const MAX_CHANNELS_PER_BAND: usize = 8; // fixed by the wire format (freq[8] in VtxBand/SET_VTXTABLE_BAND)
-const MIN_FREQ_KHZ: u32 = 5_600_000; // RTC6705's usable range, as enforced by vtx_msp.c's freq_is_in_58ghz()
-const MAX_FREQ_KHZ: u32 = 6_000_000;
 
 /// UI-thread-owned scratch state that doesn't belong in the persisted
 /// VtxTableConfig itself (file path text field, CLI paste buffer, last
@@ -27,36 +26,64 @@ pub struct VtxTablePageState {
     pub file_path: String,
     pub cli_text: String,
     pub last_error: Option<String>,
+    /// Set when Save is clicked and the target file already exists --
+    /// renders the overwrite-confirm dialog instead of saving
+    /// immediately. Cleared (without saving) if the user cancels or
+    /// closes the dialog.
+    pub confirm_overwrite: bool,
+    /// Bands removed by lowering "Number of bands", most-recently-
+    /// removed last -- restored (in reverse, i.e. most-recent-first)
+    /// the next time the count is raised again, so briefly lowering
+    /// then raising the count never loses what was actually typed in.
+    /// Cleared on Load/Import, since restoring bands from a previous,
+    /// unrelated table into a freshly loaded one wouldn't make sense.
+    pub removed_bands: Vec<VtxBand>,
+    /// Same idea as removed_bands, for power levels.
+    pub removed_power_levels: Vec<VtxPowerLevel>,
 }
 
-fn resize_bands(cfg: &mut VtxTableConfig, target: usize) {
-    while cfg.bands.len() < target {
-        let idx = cfg.bands.len() as u8 + 1;
-        cfg.bands.push(VtxBand {
-            index: idx,
-            name: format!("BAND{idx}"),
-            letter: char::from(b'A' + (idx - 1).min(25)),
-            is_factory: false,
-            channel_count: cfg.channels,
-            freqs_mhz: [5800; 8],
-        });
+fn resize_bands(cfg: &mut VtxTableConfig, target: usize, removed: &mut Vec<VtxBand>) {
+    while cfg.bands.len() > target {
+        if let Some(b) = cfg.bands.pop() {
+            removed.push(b);
+        }
     }
-    cfg.bands.truncate(target);
+    while cfg.bands.len() < target {
+        let band = removed.pop().unwrap_or_else(|| {
+            let idx = cfg.bands.len() as u8 + 1;
+            VtxBand {
+                index: idx,
+                name: format!("BAND{idx}"),
+                letter: char::from(b'A' + (idx - 1).min(25)),
+                is_factory: false,
+                channel_count: cfg.channels,
+                freqs_mhz: [5800; 8],
+            }
+        });
+        cfg.bands.push(band);
+    }
     for (i, b) in cfg.bands.iter_mut().enumerate() {
         b.index = i as u8 + 1;
     }
 }
 
-fn resize_power_levels(cfg: &mut VtxTableConfig, target: usize) {
-    while cfg.power_levels.len() < target {
-        let idx = cfg.power_levels.len() as u8 + 1;
-        cfg.power_levels.push(VtxPowerLevel {
-            index: idx,
-            m_w: 25,
-            label: "25".to_string(),
-        });
+fn resize_power_levels(cfg: &mut VtxTableConfig, target: usize, removed: &mut Vec<VtxPowerLevel>) {
+    while cfg.power_levels.len() > target {
+        if let Some(p) = cfg.power_levels.pop() {
+            removed.push(p);
+        }
     }
-    cfg.power_levels.truncate(target);
+    while cfg.power_levels.len() < target {
+        let level = removed.pop().unwrap_or_else(|| {
+            let idx = cfg.power_levels.len() as u8 + 1;
+            VtxPowerLevel {
+                index: idx,
+                m_w: 25,
+                label: "25".to_string(),
+            }
+        });
+        cfg.power_levels.push(level);
+    }
     for (i, p) in cfg.power_levels.iter_mut().enumerate() {
         p.index = i as u8 + 1;
     }
@@ -78,19 +105,33 @@ pub fn show(
         ui.horizontal(|ui| {
             ui.label("File:");
             ui.text_edit_singleline(&mut page.file_path);
-            if ui.button("Save").clicked() {
-                match cfg.save_to_file(Path::new(&page.file_path)) {
-                    Ok(()) => page.last_error = None,
-                    Err(e) => page.last_error = Some(format!("save failed: {e}")),
-                }
-            }
             if ui.button("Load").clicked() {
                 match VtxTableConfig::load_from_file(Path::new(&page.file_path)) {
                     Ok(loaded) => {
                         *cfg = loaded;
                         page.last_error = None;
+                        page.removed_bands.clear();
+                        page.removed_power_levels.clear();
+                        let mut settings = AppSettings::load();
+                        settings.vtx_table_path = page.file_path.clone();
+                        let _ = settings.save(); // best-effort -- same pattern as the port fields
                     }
                     Err(e) => page.last_error = Some(format!("load failed: {e}")),
+                }
+            }
+            if ui.button("Save").clicked() {
+                if Path::new(&page.file_path).exists() {
+                    page.confirm_overwrite = true;
+                } else {
+                    match cfg.save_to_file(Path::new(&page.file_path)) {
+                        Ok(()) => {
+                            page.last_error = None;
+                            let mut settings = AppSettings::load();
+                            settings.vtx_table_path = page.file_path.clone();
+                            let _ = settings.save();
+                        }
+                        Err(e) => page.last_error = Some(format!("save failed: {e}")),
+                    }
                 }
             }
         });
@@ -103,6 +144,8 @@ pub fn show(
                     Ok(parsed) => {
                         *cfg = parsed;
                         page.last_error = None;
+                        page.removed_bands.clear();
+                        page.removed_power_levels.clear();
                     }
                     Err(e) => page.last_error = Some(format!("import failed: {e}")),
                 }
@@ -114,79 +157,44 @@ pub fn show(
         }
     });
 
-    ui.separator();
-
-    // ---- Selected: what this tool reports to the VTX when it asks ---
-    ui.group(|ui| {
-        ui.strong("Frequency");
-
-        ui.checkbox(&mut cfg.pitmode, "Pit mode");
-
-        let mut manual_mode = cfg.selected_band == 0;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut manual_mode, false, "Band/Channel");
-            ui.selectable_value(&mut manual_mode, true, "Manual");
-        });
-
-        if manual_mode {
-            cfg.selected_band = 0;
-            let mut freq_khz = cfg.selected_freq_mhz as u32 * 1000;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut freq_khz)
-                        .range(MIN_FREQ_KHZ..=MAX_FREQ_KHZ)
-                        .suffix(" kHz")
-                        .speed(1000),
-                )
-                .changed()
-            {
-                cfg.selected_freq_mhz = (freq_khz / 1000) as u16;
-            }
-            ui.label("Frequency");
-        } else {
-            if cfg.selected_band == 0 {
-                cfg.selected_band = 1;
-            }
-            let band_indices: Vec<u8> = cfg.bands.iter().map(|b| b.index).collect();
-            egui::ComboBox::from_label("Band")
-                .selected_text(
-                    cfg.bands
-                        .iter()
-                        .find(|b| b.index == cfg.selected_band)
-                        .map(|b| format!("{} ({})", b.name, b.letter))
-                        .unwrap_or_else(|| "-".to_string()),
-                )
-                .show_ui(ui, |ui| {
-                    for idx in band_indices {
-                        if let Some(b) = cfg.bands.iter().find(|b| b.index == idx) {
-                            let label = format!("{} ({})", b.name, b.letter);
-                            ui.selectable_value(&mut cfg.selected_band, idx, label);
-                        }
+    if page.confirm_overwrite {
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Overwrite existing file?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("'{}' already exists. Overwrite it?", page.file_path));
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
                     }
                 });
-
-            let chan_count = cfg
-                .bands
-                .iter()
-                .find(|b| b.index == cfg.selected_band)
-                .map(|b| b.channel_count.max(1))
-                .unwrap_or(1);
-            ui.add(egui::Slider::new(&mut cfg.selected_channel, 1..=chan_count).text("Channel"));
-
-            let freq = cfg.selected_frequency_mhz();
-            ui.label(format!("-> {freq} MHz"));
+            });
+        if !open {
+            cancelled = true; // closed via the window's own X -- default is Cancel, per spec
         }
-
-        let power_count = cfg.power_levels.len().max(1) as u8;
-        ui.add(egui::Slider::new(&mut cfg.selected_power, 1..=power_count).text("Power level"));
-        if let Some(p) = cfg.power_levels.iter().find(|p| p.index == cfg.selected_power) {
-            ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
+        if confirmed {
+            page.confirm_overwrite = false;
+            match cfg.save_to_file(Path::new(&page.file_path)) {
+                Ok(()) => {
+                    page.last_error = None;
+                    let mut settings = AppSettings::load();
+                    settings.vtx_table_path = page.file_path.clone();
+                    let _ = settings.save();
+                }
+                Err(e) => page.last_error = Some(format!("save failed: {e}")),
+            }
+        } else if cancelled {
+            page.confirm_overwrite = false;
         }
-
-        if ui.button("Save").clicked() {
-            let _ = cmd_tx.send(Command::PushVtxConfig);
-        }
-    });
+    }
 
     ui.separator();
 
@@ -197,7 +205,7 @@ pub fn show(
         ui.horizontal(|ui| {
             let mut num_bands = cfg.bands.len() as u8;
             if ui.add(egui::DragValue::new(&mut num_bands).range(0..=20)).changed() {
-                resize_bands(&mut cfg, num_bands as usize);
+                resize_bands(&mut cfg, num_bands as usize, &mut page.removed_bands);
             }
             ui.label("Number of bands");
 
@@ -246,7 +254,7 @@ pub fn show(
 
         let mut num_levels = cfg.power_levels.len() as u8;
         if ui.add(egui::DragValue::new(&mut num_levels).range(0..=20)).changed() {
-            resize_power_levels(&mut cfg, num_levels as usize);
+            resize_power_levels(&mut cfg, num_levels as usize, &mut page.removed_power_levels);
         }
         ui.label("Number of power levels");
 

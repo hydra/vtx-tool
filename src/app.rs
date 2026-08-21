@@ -28,6 +28,12 @@ use crate::vtxtable::VtxTableConfig;
 use crate::worker::{Command, SharedState, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
+
+/// RTC6705's usable range, as enforced by vtx_msp.c's freq_is_in_58ghz()
+/// -- moved here from pages/vtx_table.rs alongside the Frequency section
+/// itself.
+const MIN_FREQ_KHZ: u32 = 5_600_000;
+const MAX_FREQ_KHZ: u32 = 6_000_000;
 use egui_dock::{DockArea, DockState};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -112,7 +118,10 @@ impl App {
             cmd_tx,
             logs,
             dock_state: DockState::new(vec![Page::Home]),
-            vtx_table_page: VtxTablePageState::default(),
+            vtx_table_page: VtxTablePageState {
+                file_path: initial_settings.vtx_table_path.clone(),
+                ..VtxTablePageState::default()
+            },
             calibration_page: CalibrationPageState::default(),
             vtx_port_input: initial_settings.vtx_port,
             meter_port_input: initial_settings.meter_port,
@@ -293,6 +302,79 @@ impl eframe::App for App {
                                 meter_kind: self.meter_kind,
                             });
                         }
+                    }
+                }
+
+                ui.separator();
+                ui.heading("Frequency");
+                {
+                    let mut cfg = self.vtx_table.lock().unwrap();
+
+                    ui.checkbox(&mut cfg.pitmode, "Pit mode");
+
+                    let mut manual_mode = cfg.selected_band == 0;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut manual_mode, false, "Band/Channel");
+                        ui.selectable_value(&mut manual_mode, true, "Manual");
+                    });
+
+                    if manual_mode {
+                        cfg.selected_band = 0;
+                        let mut freq_khz = cfg.selected_freq_mhz as u32 * 1000;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut freq_khz)
+                                    .range(MIN_FREQ_KHZ..=MAX_FREQ_KHZ)
+                                    .suffix(" kHz")
+                                    .speed(1000),
+                            )
+                            .changed()
+                        {
+                            cfg.selected_freq_mhz = (freq_khz / 1000) as u16;
+                        }
+                        ui.label("Frequency");
+                    } else {
+                        if cfg.selected_band == 0 {
+                            cfg.selected_band = 1;
+                        }
+                        let band_indices: Vec<u8> = cfg.bands.iter().map(|b| b.index).collect();
+                        egui::ComboBox::from_label("Band")
+                            .selected_text(
+                                cfg.bands
+                                    .iter()
+                                    .find(|b| b.index == cfg.selected_band)
+                                    .map(|b| format!("{} ({})", b.name, b.letter))
+                                    .unwrap_or_else(|| "-".to_string()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for idx in band_indices {
+                                    if let Some(b) = cfg.bands.iter().find(|b| b.index == idx) {
+                                        let label = format!("{} ({})", b.name, b.letter);
+                                        ui.selectable_value(&mut cfg.selected_band, idx, label);
+                                    }
+                                }
+                            });
+
+                        let chan_count = cfg
+                            .bands
+                            .iter()
+                            .find(|b| b.index == cfg.selected_band)
+                            .map(|b| b.channel_count.max(1))
+                            .unwrap_or(1);
+                        ui.add(egui::Slider::new(&mut cfg.selected_channel, 1..=chan_count).text("Channel"));
+
+                        let freq = cfg.selected_frequency_mhz();
+                        ui.label(format!("-> {freq} MHz"));
+                    }
+
+                    let power_count = cfg.power_levels.len().max(1) as u8;
+                    ui.add(egui::Slider::new(&mut cfg.selected_power, 1..=power_count).text("Power level"));
+                    if let Some(p) = cfg.power_levels.iter().find(|p| p.index == cfg.selected_power) {
+                        ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
+                    }
+
+                    if ui.button("Save").clicked() {
+                        let _ = self.cmd_tx.send(Command::PushVtxConfig);
                     }
                 }
 
