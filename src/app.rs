@@ -184,14 +184,19 @@ impl eframe::App for App {
 
         // Left: page list + connection controls.
         egui::Panel::left("nav_panel")
-            .resizable(false)
-            .default_size(180.0)
+            .resizable(true)
+            .default_size(250.0)
+            .min_size(120.0)
+            .max_size(500.0)
+            .show_separator_line(true)
             .show(ui, |ui| {
                 // Content here can outgrow the panel's available height
                 // (e.g. once VTX Status/OSD Status are populated, or
-                // when the bottom logs panel is dragged tall) -- without
-                // this it just clipped silently instead of scrolling.
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // when the bottom logs panel is dragged tall) -- and now
+                // that the panel itself is resizable, width too (drag it
+                // narrow enough and rows like the port fields no longer
+                // fit). ScrollArea::both handles both without clipping.
+                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.heading("Pages");
                 ui.separator();
                 if ui.button("Home").clicked() {
@@ -219,7 +224,9 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.add_enabled(
                         vtx_state.is_idle(),
-                        egui::TextEdit::singleline(&mut self.vtx_port_input).hint_text("VTX port"),
+                        egui::TextEdit::singleline(&mut self.vtx_port_input)
+                            .desired_width(100.0)
+                            .hint_text("VTX port"),
                     );
                     let label = if vtx_state.is_ready() { "Disconnect" } else { "Connect" };
                     if ui.small_button(label).clicked() {
@@ -243,7 +250,9 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.add_enabled(
                         meter_state.is_idle(),
-                        egui::TextEdit::singleline(&mut self.meter_port_input).hint_text("Power meter port"),
+                        egui::TextEdit::singleline(&mut self.meter_port_input)
+                            .desired_width(100.0)
+                            .hint_text("Power meter port"),
                     );
                     let label = if meter_state.is_ready() { "Disconnect" } else { "Connect" };
                     if ui.small_button(label).clicked() {
