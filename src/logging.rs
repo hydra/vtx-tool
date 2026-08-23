@@ -19,7 +19,7 @@
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::SystemTime;
 
 pub const MAX_MESSAGES: usize = 100;
 
@@ -27,7 +27,10 @@ pub const MAX_MESSAGES: usize = 100;
 pub struct LogEntry {
     pub level: Level,
     pub text: String,
-    pub at: Instant,
+    /// Wall-clock time the entry was logged -- SystemTime (not Instant)
+    /// specifically so it can be rendered as an HH:MM:SS.mmm timestamp
+    /// column in the UI.
+    pub at: SystemTime,
 }
 
 #[derive(Default)]
@@ -97,7 +100,7 @@ impl Log for BufferLogger {
             let entry = LogEntry {
                 level: record.level(),
                 text: format!("{}", record.args()),
-                at: Instant::now(),
+                at: SystemTime::now(),
             };
             let bucket = match record.target() {
                 "vtx" => &self.logs.vtx,
@@ -146,29 +149,126 @@ fn level_color(ui: &eframe::egui::Ui, level: Level) -> eframe::egui::Color32 {
     }
 }
 
-/// Renders one port's scrollable log panel. `title` must be unique
-/// across panels shown in the same frame (used as the egui id source for
-/// the scroll area/grid).
+/// HH:MM:SS.mmm (UTC, same as worker.rs's format_time_hms, but with
+/// millisecond precision since log lines can arrive faster than once a
+/// second).
+fn format_timestamp(at: SystemTime) -> String {
+    let dur = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
+}
+
+/// Fixed widths for the timestamp/severity columns, in points -- wide
+/// enough for "23:59:59.999" and the full word "Severity" (the header,
+/// which is the widest thing in that column) respectively, plus the
+/// Frame margins in header_cell_ui/cell_ui below. Both are still
+/// user-resizable (see Column::resizable below).
+const TIMESTAMP_COL_WIDTH: f32 = 104.0;
+const SEVERITY_COL_WIDTH: f32 = 92.0;
+
+/// egui_table delegate for one port's log. Holds a borrow of the
+/// messages for the duration of one `show_panel` call.
+struct LogTableDelegate<'a> {
+    entries: &'a VecDeque<LogEntry>,
+}
+
+impl egui_table::TableDelegate for LogTableDelegate<'_> {
+    fn header_cell_ui(&mut self, ui: &mut eframe::egui::Ui, cell: &egui_table::HeaderCellInfo) {
+        // egui_table adds no cell margins itself (see crate docs) -- a
+        // Frame with inner_margin is what stops adjacent header/cell
+        // text from touching the next column.
+        eframe::egui::Frame::new()
+            .inner_margin(eframe::egui::Margin::symmetric(6, 2))
+            .show(ui, |ui| {
+                let title = match cell.col_range.start {
+                    0 => "Time",
+                    1 => "Severity",
+                    _ => "Message",
+                };
+                ui.strong(title);
+            });
+    }
+
+    fn cell_ui(&mut self, ui: &mut eframe::egui::Ui, cell: &egui_table::CellInfo) {
+        use eframe::egui::{Frame, Margin, RichText};
+
+        let Some(entry) = self.entries.get(cell.row_nr as usize) else {
+            return;
+        };
+        let color = level_color(ui, entry.level);
+        Frame::new().inner_margin(Margin::symmetric(6, 2)).show(ui, |ui| {
+            match cell.col_nr {
+                0 => {
+                    ui.label(RichText::new(format_timestamp(entry.at)).monospace().weak());
+                }
+                1 => {
+                    ui.label(RichText::new(entry.level.to_string()).monospace().color(color));
+                }
+                _ => {
+                    ui.label(RichText::new(&entry.text).color(color));
+                }
+            }
+        });
+    }
+
+    fn default_row_height(&self) -> f32 {
+        20.0
+    }
+}
+
+/// Renders one port's log as a table: Time | Severity | Message, with a
+/// user-draggable divider between every column. `title` must be unique
+/// across panels shown in the same frame (used as the table's id salt).
 pub fn show_panel(ui: &mut eframe::egui::Ui, title: &str, port_log: &PortLog) {
-    use eframe::egui;
+    use eframe::egui::Rangef;
 
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
             ui.strong(title);
             ui.label(format!("{} message(s)", port_log.messages.len()));
         });
-        egui::ScrollArea::vertical()
+
+        let mut delegate = LogTableDelegate {
+            entries: &port_log.messages,
+        };
+
+        egui_table::Table::new()
             .id_salt(title)
-            .auto_shrink([false, false])
+            .num_rows(port_log.messages.len() as u64)
+            .columns(vec![
+                // Kept narrow-ranged so AutoSizeMode::OnParentResize below
+                // has almost no room to grow these -- extra/deficit width
+                // goes to the Message column instead. Still resizable by
+                // hand within that narrow band.
+                egui_table::Column::new(TIMESTAMP_COL_WIDTH)
+                    .range(Rangef::new(TIMESTAMP_COL_WIDTH - 4.0, TIMESTAMP_COL_WIDTH + 24.0))
+                    .resizable(true),
+                egui_table::Column::new(SEVERITY_COL_WIDTH)
+                    .range(Rangef::new(SEVERITY_COL_WIDTH - 4.0, SEVERITY_COL_WIDTH + 16.0))
+                    .resizable(true),
+                // Not resizable, and given a wide-open range (the
+                // Column default, 4.0..INFINITY) -- see auto_size_mode
+                // below for how this actually gets filled.
+                egui_table::Column::new(160.0),
+            ])
+            .headers([egui_table::HeaderRow::new(20.0)])
+            // AutoSizeMode::Always, not OnParentResize: OnParentResize
+            // only recomputes when the table's parent width *changes*
+            // between frames (state.parent_width != Some(parent_width)).
+            // Only *resizable* columns get their width written into that
+            // persisted state, though -- this Message column is
+            // deliberately non-resizable, so its width is never
+            // persisted and resets to the 160.0 seed above at the top of
+            // every single frame. With OnParentResize, once the parent
+            // width stops changing (i.e. after the first frame or two),
+            // auto_size stops re-running and the column is stuck back at
+            // that 160.0 seed forever. Always recomputes it every frame
+            // unconditionally, which is what a non-persisted column
+            // actually needs.
+            .auto_size_mode(egui_table::AutoSizeMode::Always)
             .stick_to_bottom(true)
-            .show(ui, |ui| {
-                egui::Grid::new(title).num_columns(1).striped(true).show(ui, |ui| {
-                    for entry in port_log.messages.iter() {
-                        let color = level_color(ui, entry.level);
-                        ui.colored_label(color, format!("[{:>5}] {}", entry.level, entry.text));
-                        ui.end_row();
-                    }
-                });
-            });
+            .show(ui, &mut delegate);
     });
 }
