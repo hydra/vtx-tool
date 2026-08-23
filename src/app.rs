@@ -187,6 +187,11 @@ impl eframe::App for App {
             .resizable(false)
             .default_size(180.0)
             .show(ui, |ui| {
+                // Content here can outgrow the panel's available height
+                // (e.g. once VTX Status/OSD Status are populated, or
+                // when the bottom logs panel is dragged tall) -- without
+                // this it just clipped silently instead of scrolling.
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.heading("Pages");
                 ui.separator();
                 if ui.button("Home").clicked() {
@@ -506,6 +511,7 @@ impl eframe::App for App {
                 if ui.checkbox(&mut osd_debug_overlay_enabled, "Enable debug overlay").changed() {
                     self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
                 }
+                }); // ScrollArea
             });
 
         // Center: whichever pages are open, as dock tabs.
