@@ -156,20 +156,30 @@ impl eframe::App for App {
         egui::Panel::bottom("logs_panel")
             .resizable(true)
             .default_size(220.0)
+            .min_size(80.0)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let half_width = (ui.available_width() - 8.0) / 2.0;
-
-                    ui.allocate_ui(egui::vec2(half_width, ui.available_height()), |ui| {
+                // Nested resizable panel gives a real draggable divider
+                // between the two logs (with its own persisted width).
+                // Fixed default well clear of nav_panel's own default
+                // width below: egui's Panel derives its available rect
+                // from parent_ui.available_rect_before_wrap(), so a
+                // panel shown later (nav_panel) correctly inherits the
+                // space this one already claimed -- that part isn't
+                // buggy. What was happening is two independent dividers
+                // (this one, and nav_panel's right edge) landing at
+                // nearly the same x-position and reading as one
+                // continuous line running through both panels.
+                egui::Panel::left("vtx_log_panel")
+                    .resizable(true)
+                    .default_size(420.0)
+                    .min_size(160.0)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
                         logging::show_panel(ui, "VTX log", &self.logs.vtx.lock().unwrap());
                     });
 
-                    ui.add(egui::Separator::default().vertical());
-
-                    ui.allocate_ui(egui::vec2(half_width, ui.available_height()), |ui| {
-                        logging::show_panel(ui, "Power meter log", &self.logs.meter.lock().unwrap());
-                    });
-                });
+                // Takes whatever width the vtx_log_panel above left behind.
+                logging::show_panel(ui, "Power meter log", &self.logs.meter.lock().unwrap());
             });
 
         // Left: page list + connection controls.
