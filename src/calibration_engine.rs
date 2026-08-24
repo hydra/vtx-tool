@@ -46,6 +46,25 @@ fn power_up_step(sign_inverted: bool) -> i32 {
     }
 }
 
+/// The coarse ramp's starting point -- the safe/low-power end of the
+/// effective range for THIS board's sign, backed off
+/// COARSE_RAMP_START_MARGIN_MV so it isn't sitting exactly on the
+/// boundary. For a normal board (sign_inverted=false, up>0: higher
+/// vbias_mv means more power) that's near bound_lo; for an inverted
+/// board (sign_inverted=true, up<0: lower vbias_mv means more power)
+/// that's near bound_hi -- the same "which end is safe" logic
+/// sub_progress() already applies to its own "boundary" (the opposite
+/// end, where the ramp is headed TOWARD), just applied to the end it
+/// starts FROM instead.
+fn coarse_ramp_start_vbias_mv(sign_inverted: bool, bound_lo: i32, bound_hi: i32) -> i32 {
+    let up = power_up_step(sign_inverted);
+    if up > 0 {
+        (bound_lo + COARSE_RAMP_START_MARGIN_MV).min(bound_hi)
+    } else {
+        (bound_hi - COARSE_RAMP_START_MARGIN_MV).max(bound_lo)
+    }
+}
+
 /// Average of `history` readings that occurred both (a) at or after
 /// `since_secs` (the point this belongs to -- readings from a PREVIOUS
 /// frequency or level must never leak into this) and (b) within the
@@ -180,10 +199,14 @@ impl SampleWait {
     }
 }
 
-/// Starting point for the coarse ramp -- extracted as a constant since
-/// sub_progress() needs the same value to compute how far the ramp has
-/// traveled toward the DAC boundary.
-const COARSE_RAMP_START_MV: i32 = 3200;
+/// Margin the coarse ramp starts away from the DAC boundary that's safe
+/// (low-power) for this board's sign -- NOT a fixed DAC value, since
+/// "safe/low-power" is a different physical end of the range depending
+/// on sign_inverted (see coarse_ramp_start_vbias_mv()). Matches the
+/// previous fixed 3200 (100mV shy of the 3300mV default max) for
+/// inverted boards, where that was correct; now derived symmetrically
+/// for either sign rather than assumed.
+const COARSE_RAMP_START_MARGIN_MV: i32 = 25;
 const COARSE_RAMP_STEP_MV: i32 = 25;
 /// Rolling window used by Fine creep's thermal-rolloff check -- see
 /// rolling_average_since() and the Fine match arm's doc comment.
@@ -855,9 +878,9 @@ impl SweepEngine {
     /// automatic scanning from wherever Manual mode was currently
     /// sitting (NOT from the beginning) -- the current point's manual
     /// slider value is discarded (automatic's own ScanPa starts fresh
-    /// from COARSE_RAMP_START_MV, same as any other point), but every
-    /// earlier point Manual mode already committed via "Next" stays as
-    /// its Manual result. The calibration session stays open throughout
+    /// from coarse_ramp_start_vbias_mv(), same as any other point), but
+    /// every earlier point Manual mode already committed via "Next" stays
+    /// as its Manual result. The calibration session stays open throughout
     /// (it doesn't care which sub-mode is driving it), so no new
     /// SessionBegin is queued here -- session_active just stays true.
     pub fn resume_automatic_from_current(&mut self) {
@@ -1217,10 +1240,14 @@ impl SweepEngine {
         let target_mw = *self.target_mw_by_level.get(&level).unwrap_or(&0) as f32;
 
         if self.step.is_none() {
-            // Entering a fresh (level, freq): start with ScanPa's coarse ramp.
+            // Entering a fresh (level, freq): start with ScanPa's coarse ramp,
+            // from the safe/low-power end of the range for THIS board's sign
+            // -- see coarse_ramp_start_vbias_mv()'s own doc comment.
+            let (bound_lo, bound_hi) = self.effective_bounds(level);
+            let start_vbias_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
             self.step = Some(StepState::Pa(ScanPaState {
                 phase: ScanPaPhase::CoarseRamp,
-                vbias_mv: COARSE_RAMP_START_MV,
+                vbias_mv: start_vbias_mv,
                 wait: None,
                 coarse_steps_taken: 0,
                 last_below_target_mv: None,
@@ -1231,7 +1258,7 @@ impl SweepEngine {
                 fine_settle_until: None,
                 fine_started_instant: None,
             }));
-            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from vbias_mv={COARSE_RAMP_START_MV}");
+            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from vbias_mv={start_vbias_mv} (sign_inverted={})", self.sign_inverted);
             self.per_level_status.insert(
                 level,
                 LevelStatus::InProgress(format!("{} / coarse ramp @ {freq_mhz}MHz", SweepOp::ScanPa.label())),
@@ -1641,7 +1668,8 @@ impl SweepEngine {
                     let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
                     let (bound_lo, bound_hi) = self.effective_bounds(level);
                     let boundary = if up > 0 { bound_hi } else { bound_lo };
-                    let total_possible = ((boundary - COARSE_RAMP_START_MV) as f32 / COARSE_RAMP_STEP_MV as f32)
+                    let start = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
+                    let total_possible = ((boundary - start) as f32 / COARSE_RAMP_STEP_MV as f32)
                         .abs()
                         .max(1.0);
                     let frac = (st.coarse_steps_taken as f32 / total_possible).clamp(0.0, 1.0);
