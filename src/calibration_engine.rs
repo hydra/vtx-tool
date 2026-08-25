@@ -206,7 +206,7 @@ impl SampleWait {
 /// previous fixed 3200 (100mV shy of the 3300mV default max) for
 /// inverted boards, where that was correct; now derived symmetrically
 /// for either sign rather than assumed.
-const COARSE_RAMP_START_MARGIN_MV: i32 = 25;
+const COARSE_RAMP_START_MARGIN_MV: i32 = 0;
 const COARSE_RAMP_STEP_MV: i32 = 25;
 /// Rolling window used by Fine creep's thermal-rolloff check -- see
 /// rolling_average_since() and the Fine match arm's doc comment.
@@ -229,7 +229,7 @@ const PA_FAILURE_DROP_FRACTION: f32 = 0.03;
 /// change at this handoff (capacitors in the VBIAS circuit), and
 /// SampleWait's own 4-sample gate is purely count-based -- a fast meter
 /// can satisfy it well before the hardware has physically caught up.
-const FINE_SETTLE_DELAY: Duration = Duration::from_secs(1);
+const FINE_SETTLE_DELAY: Duration = Duration::from_secs(2);
 /// How long after Fine creep begins before the PA-Failure (thermal
 /// rolloff) check is actually armed. A real run showed the drop-
 /// detection tracking firing within the first few seconds of Fine
@@ -239,7 +239,7 @@ const FINE_SETTLE_DELAY: Duration = Duration::from_secs(1);
 /// narrower concern -- letting the DAC's own physical settle finish) so
 /// there's real margin against early-Fine transients of any kind before
 /// a drop actually causes an abort.
-const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(10);
+const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(15);
 /// How long to ignore samples after the PA's boost stage is observed
 /// transitioning from off to on -- separate from FINE_SETTLE_DELAY
 /// above (that one covers a DAC value change specifically at the
@@ -251,7 +251,7 @@ const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(10);
 /// switched on). A real run showed the coarse ramp's very first sample,
 /// taken the instant boost turned on, read as an immediate false
 /// overshoot -- before the PA had any chance to actually stabilize.
-const BOOST_ENABLE_SETTLE_DELAY: Duration = Duration::from_secs(1);
+const BOOST_ENABLE_SETTLE_DELAY: Duration = Duration::from_secs(2);
 
 enum ScanPaPhase {
     CoarseRamp,
