@@ -477,6 +477,14 @@ impl eframe::App for App {
                             });
                             ui.end_row();
 
+                            ui.label("PA NTC ADC:");
+                            ui.label(status.ntc_raw.map(|raw| raw.to_string()).unwrap_or_else(|| "—".to_string()));
+                            ui.end_row();
+
+                            ui.label("PA temperature:");
+                            ui.label(status.pa_temp_c.map(|c| format!("{c:.1} °C")).unwrap_or_else(|| "—".to_string()));
+                            ui.end_row();
+
                             ui.label("Last seen:");
                             ui.label(vtx_last_seen_at.as_deref().unwrap_or("—"));
                             ui.end_row();

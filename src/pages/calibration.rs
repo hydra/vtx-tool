@@ -11,7 +11,7 @@ use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::settings::AppSettings;
 use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -56,6 +56,13 @@ pub struct CalibrationPageState {
     /// Manual mode's "fine" checkbox: true = the DAC slider moves in
     /// 1mV steps, false = 25mV steps.
     fine_step: bool,
+    /// Set by the plot's own right-click "Reset" context menu item, on
+    /// the frame it's clicked -- egui_plot's Plot::reset() has to be
+    /// called on the builder BEFORE that same frame's show(), so a
+    /// context-menu click (only detectable from the response show()
+    /// itself returns) can only ever take effect starting the frame
+    /// after it's clicked, not the same one. Cleared once applied.
+    plot_reset_requested: bool,
 }
 
 impl Default for CalibrationPageState {
@@ -65,6 +72,7 @@ impl Default for CalibrationPageState {
             checked: HashMap::new(),
             show_confirm_dialog: false,
             fine_step: false,
+            plot_reset_requested: false,
         }
     }
 }
@@ -279,6 +287,24 @@ fn status_text(status: Option<&LevelStatus>) -> String {
     }
 }
 
+/// Y-value range across `points`, or `(default_lo, default_hi)` if the
+/// series is empty OR constant (min == max) -- the latter would
+/// otherwise hand show()'s temp_to_power()/power_to_temp() closures a
+/// zero-width range to divide by.
+fn min_max_or(points: &[[f64; 2]], default_lo: f64, default_hi: f64) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &[_, y] in points {
+        lo = lo.min(y);
+        hi = hi.max(y);
+    }
+    if lo < hi {
+        (lo, hi)
+    } else {
+        (default_lo, default_hi)
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<SharedState>>,
@@ -301,22 +327,57 @@ pub fn show(
             None => "Power meter: (no reading yet)".to_string(),
         });
 
-        let points: PlotPoints = state
-            .power_history
-            .iter()
-            .map(|&(t, mw)| [t, mw as f64])
-            .collect();
+        let power_points: Vec<[f64; 2]> = state.power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
+        let temp_points_raw: Vec<[f64; 2]> = state.temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
         let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0);
 
-        Plot::new("power_history_plot")
+        // egui_plot has no true independent y-scale per line -- custom_y_axes
+        // draws multiple axis labels/formatters over ONE shared coordinate
+        // transform, it doesn't give each line its own range. So the
+        // temperature series is linearly remapped into the power series'
+        // own numeric range before plotting (temp_to_power below), and the
+        // right axis's formatter applies the inverse map to whatever tick
+        // value it's handed, so it still displays real °C numbers. Computed
+        // fresh from this frame's own data (not last frame's plot bounds,
+        // which would lag a frame and is unnecessary here) -- falls back to
+        // a degenerate-safe [0,1] range when a series is empty or constant,
+        // so this never divides by zero.
+        let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
+        let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
+        let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
+        let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
+        let temp_points_scaled: PlotPoints =
+            temp_points_raw.iter().map(|&[t, c]| [t, temp_to_power(c)]).collect();
+        let power_points: PlotPoints = power_points.into();
+
+        let left_axis = AxisHints::new_y().label("mW").placement(HPlacement::Left);
+        let right_axis = AxisHints::new_y()
+            .label("°C")
+            .placement(HPlacement::Right)
+            .formatter(move |mark, _range| format!("{:.1}", power_to_temp(mark.value)));
+
+        let mut plot = Plot::new("power_history_plot")
             .height(180.0)
             .include_x(latest_t - HISTORY_WINDOW_SECS)
             .include_x(latest_t)
             .x_axis_label("seconds")
-            .y_axis_label("mW")
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("Power (mW)", points));
-            });
+            .custom_y_axes(vec![left_axis, right_axis])
+            .legend(Legend::default());
+        if page.plot_reset_requested {
+            plot = plot.reset();
+            page.plot_reset_requested = false;
+        }
+        let plot_response = plot.show(ui, |plot_ui| {
+            plot_ui.line(Line::new("Power (mW)", power_points));
+            if !temp_points_raw.is_empty() {
+                plot_ui.line(Line::new("PA temp (°C)", temp_points_scaled).color(egui::Color32::YELLOW));
+            }
+        });
+        plot_response.response.context_menu(|ui| {
+            if ui.button("Reset").clicked() {
+                page.plot_reset_requested = true;
+            }
+        });
     }
 
     ui.horizontal(|ui| {
