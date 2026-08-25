@@ -63,6 +63,16 @@ pub struct PaCalibrationReading {
     /// rf_pa.h. Set by the trailing session_active field on this tool's
     /// own SET_PACALIBRATION requests (see encode_pa_calibration_request).
     pub session_active: Option<bool>,
+    /// Only present with the 15-byte payload. Raw 12-bit ADC code from
+    /// the PA's NTC thermistor, and the firmware's own conversion to
+    /// degrees C from it (see rf_pa_ntc_raw_to_celsius()'s doc comment
+    /// in the firmware's rf_pa.c for the assumed circuit and math).
+    /// Both are 0 on a board with no NTC configured -- not
+    /// distinguishable here from a board that genuinely reported a 0
+    /// code, but that's the same convention the firmware's own reply
+    /// already uses elsewhere for "nothing to report".
+    pub ntc_raw: Option<u16>,
+    pub pa_temp_c: Option<f32>,
 }
 
 pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationReading> {
@@ -80,6 +90,13 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
         (None, None, None, None)
     };
     let session_active = if payload.len() >= 11 { Some(payload[10] != 0) } else { None };
+    let (ntc_raw, pa_temp_c) = if payload.len() >= 15 {
+        let ntc_raw = (payload[11] as u16) | ((payload[12] as u16) << 8);
+        let pa_temp_c_x10 = (payload[13] as i16) | ((payload[14] as i16) << 8);
+        (Some(ntc_raw), Some(pa_temp_c_x10 as f32 / 10.0))
+    } else {
+        (None, None)
+    };
     Ok(PaCalibrationReading {
         power_level: payload[0],
         vref_mv: (payload[1] as u16) | ((payload[2] as u16) << 8),
@@ -89,6 +106,8 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
         pid_active,
         frequency_mhz,
         session_active,
+        ntc_raw,
+        pa_temp_c,
     })
 }
 

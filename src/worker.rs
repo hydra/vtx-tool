@@ -59,6 +59,13 @@ pub struct VtxStatus {
     /// rf_pa_calibration_session_begin()'s doc comment in the firmware's
     /// rf_pa.h for what that actually changes.
     pub session_active: Option<bool>,
+    /// PA thermistor: raw 12-bit ADC code and the firmware's own
+    /// conversion to degrees C -- see msp::PaCalibrationReading's own
+    /// doc comment for why both are 0 (not None -- present, but 0) on a
+    /// board with no NTC configured, once the firmware reports the
+    /// extended payload these come from at all.
+    pub ntc_raw: Option<u16>,
+    pub pa_temp_c: Option<f32>,
 }
 
 pub type SharedSweep = Arc<Mutex<Option<SweepEngine>>>;
@@ -70,6 +77,15 @@ pub struct SharedState {
     /// HISTORY_WINDOW_SECS. elapsed-seconds rather than wall-clock time
     /// so the plot's x-axis is a simple, always-increasing float.
     pub power_history: VecDeque<(f64, f32)>,
+    /// (elapsed_secs_since_worker_start, °C) pairs -- same time basis and
+    /// pruning window as power_history, but populated from the VTX's own
+    /// status replies (see msp::PaCalibrationReading::pa_temp_c) rather
+    /// than the power meter, since it's a separate, asynchronous source
+    /// arriving at its own rate. Only appended to when a reply actually
+    /// carries a reading (firmware sends the extended payload) -- stays
+    /// empty on an older firmware or a board with no NTC, rather than
+    /// filling with 0s that would look like real readings.
+    pub temp_history: VecDeque<(f64, f32)>,
     /// Total power readings ever taken, monotonically increasing --
     /// unlike power_history.len() (which is capped by the rolling
     /// HISTORY_WINDOW_SECS window and stops growing once it fills, since
@@ -163,6 +179,7 @@ impl Default for SharedState {
             pa_table: Vec::new(),
             last_dbm: None,
             power_history: VecDeque::new(),
+            temp_history: VecDeque::new(),
             reading_seq: 0,
             meter_kind: PowerMeterKind::default(),
             attenuation_db: 30.0, // matches settings.rs's default_attenuation_db(); main.rs overwrites this from AppSettings right after construction
@@ -844,8 +861,21 @@ pub fn spawn(
                                     detector_mv: reading.detector_mv,
                                     pid_active: reading.pid_active,
                                     session_active: reading.session_active,
+                                    ntc_raw: reading.ntc_raw,
+                                    pa_temp_c: reading.pa_temp_c,
                                 };
                                 s.vtx_status = Some(status.clone());
+                                if let Some(temp_c) = reading.pa_temp_c {
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    s.temp_history.push_back((elapsed, temp_c));
+                                    while let Some(&(t, _)) = s.temp_history.front() {
+                                        if elapsed - t > HISTORY_WINDOW_SECS {
+                                            s.temp_history.pop_front();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
                                 let osd_debug_overlay_enabled = s.osd_debug_overlay_enabled;
                                 drop(s);
                                 // Only start a fresh batch once the previous one has
@@ -873,10 +903,10 @@ pub fn spawn(
                                 // a complete, continuous status trace is what's
                                 // actually needed while tracking down the VTX
                                 // becoming unresponsive.
-                                debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?}",
+                                debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?} ntc_raw={:?} pa_temp_c={:?}",
                                     reading.power_level, power_mw, reading.boost_on, reading.rtc6705_level,
                                     reading.frequency_mhz, reading.vref_mv, reading.detector_mv,
-                                    reading.pid_active, reading.session_active);
+                                    reading.pid_active, reading.session_active, reading.ntc_raw, reading.pa_temp_c);
                                 pa_calibration_reading = Some(reading);
                             }
                         }
