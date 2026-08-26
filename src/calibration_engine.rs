@@ -2164,6 +2164,18 @@ impl SweepEngine {
         if self.maybe_trip_connection_lost(vtx_ready, meter_ready, self.manual_dac_mv) {
             return Ok(false);
         }
+        // Frequency changes take priority over the regular per-step DAC
+        // send, same as poll_inner()'s own handling for automatic mode --
+        // see this function's own doc comment for why this check has to
+        // be here at all.
+        if let Some(freq_mhz) = self.pending_frequency_push.take() {
+            let level = self.levels.first().copied().unwrap_or(1);
+            let payload = build_vtx_config_frequency_payload(freq_mhz, level);
+            link.send_v1(function::VTX_CONFIG as u8, &payload)?;
+            link.note_sent(MspCommandKind::Retune);
+            debug!(target: "vtx", "[sweep] manual: pushed frequency change to {freq_mhz}MHz (power={level})");
+            return Ok(true); // next tick will wait out the settle gate before sending anything else
+        }
         if !self.manual_send_pending || self.last_send.elapsed() < SEND_INTERVAL {
             return Ok(false);
         }
