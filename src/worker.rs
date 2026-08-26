@@ -797,16 +797,25 @@ pub fn spawn(
                         }
                         state.lock().unwrap().osd_keepalive_at = Some(format_time_hms());
                     }
-                    // At most one queued DisplayPort frame per tick -- DRAW_STRING/
-                    // DRAW_SCREEN use MspCommandKind::Other (zero settle), so
-                    // nothing else would naturally pace a whole batch of these.
-                    // Still gated on can_send_now() so this never jumps ahead of
-                    // an actual retune's own settle window.
-                    if link.can_send_now() {
-                        if let Some(frame) = displayport_queue.pop_front() {
-                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
-                                error!(target: "vtx", "failed to send DisplayPort frame: {e}");
-                            }
+                    // Whole batch in one go, not paced one frame per tick --
+                    // checked both sides before removing the old pacing:
+                    // DRAW_STRING/DRAW_SCREEN never call note_sent() (they
+                    // don't extend the settle gate themselves, so nothing
+                    // here was ever waiting on THEM specifically), and the
+                    // firmware's 1024-byte UART RX ring buffer comfortably
+                    // absorbs a full ~300-350 byte batch arriving as one
+                    // burst before msp_loop_process() next drains it, with
+                    // nothing slow or blocking in msp_displayport_handle_msp()'s
+                    // own per-message work either. Still checked before
+                    // every single send so this never jumps ahead of a
+                    // genuine pending retune settle window from something
+                    // else -- if that gate closes mid-batch, whatever's
+                    // left just waits for the next tick, same as before.
+                    while link.can_send_now() {
+                        let Some(frame) = displayport_queue.pop_front() else { break };
+                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
+                            error!(target: "vtx", "failed to send DisplayPort frame: {e}");
+                            break;
                         }
                     }
                 } else if !displayport_queue.is_empty() {
