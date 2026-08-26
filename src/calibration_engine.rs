@@ -1587,7 +1587,37 @@ impl SweepEngine {
                             };
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
                                 st.vbias_mv);
-                            st.fine_bound_mv = Some(st.vbias_mv);
+                            // Pad the ceiling 25% beyond the exact overshoot
+                            // point, in the direction of more power (sign-aware
+                            // via `up`, so this works the same for both normal
+                            // and inverted boards) -- without this, Fine creep
+                            // is hard-bounded at the EXACT vbias_mv that
+                            // overshot during the coarse ramp, and a real run
+                            // showed that if the PA's response drifts (e.g.
+                            // thermal) between the coarse ramp's reading and
+                            // Fine creep's own approach, that same vbias_mv
+                            // sometimes no longer reaches target -- Fine creep
+                            // then walks all the way to this bound and still
+                            // falls short, bailing on a target that IS
+                            // reachable, just slightly further past where the
+                            // coarse ramp first saw it cross.
+                            //
+                            // 25% of the overshoot point's own value; falls
+                            // back to the current coarse step size if that
+                            // would be zero (an overshoot sitting exactly at
+                            // vbias_mv=0 would otherwise get no margin at all,
+                            // silently defeating this fix for exactly the
+                            // starting-point-adjacent case it's most likely to
+                            // matter for). Still clamped to (bound_lo,
+                            // bound_hi) -- this pads for drift, it doesn't
+                            // license exceeding the safe range.
+                            let margin_mv = {
+                                let m = st.vbias_mv.abs() * 25 / 100;
+                                if m == 0 { st.coarse_step_mv } else { m }
+                            };
+                            let padded_bound_mv = (st.vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)", st.vbias_mv);
+                            st.fine_bound_mv = Some(padded_bound_mv);
                             st.vbias_mv = fine_start;
                             st.phase = ScanPaPhase::Fine;
                             st.wait = None;
