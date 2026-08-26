@@ -115,6 +115,11 @@ pub enum LevelStatus {
     Aborted,
     Skipped,
     PaFailure,
+    /// ScanPaPhase::Settle never got a genuine below-target reading
+    /// within SETTLE_BELOW_TARGET_TIMEOUT of boost turning on -- see
+    /// ScanPaOutcome::NotSettled's own doc comment for why this is kept
+    /// distinct from PaFailure and Uncalibrated.
+    NotSettled,
 }
 
 /// Status of one (level, frequency) cell in the calibration/detector
@@ -158,6 +163,42 @@ pub enum CellStatus {
     /// investigating, not just a calibration search that didn't
     /// converge.
     PaFailure,
+    /// ScanPaPhase::Settle never got a genuine below-target reading
+    /// within SETTLE_BELOW_TARGET_TIMEOUT of boost turning on -- distinct
+    /// from both Uncalibrated (a search actually ran and failed to
+    /// converge -- this means no search ever ran, CoarseRamp's own
+    /// bailout fired on its very first check) and PaFailure (a
+    /// convergING search that then thermally rolled off -- this is the
+    /// PA never having finished warming up in the first place). See
+    /// ScanPaOutcome::NotSettled's own doc comment.
+    NotSettled,
+}
+
+/// Why a ScanPa step ended, for finish_scan_pa() -- determines both the
+/// cell/level status shown in the UI and whether ScanDetector runs at
+/// all for this (level, freq).
+enum ScanPaOutcome {
+    /// Found a value that reads at or below target -- ScanDetector runs
+    /// next, same (level, freq).
+    Success,
+    /// A search actually ran (a genuine below-target point was found and
+    /// stepped from) but never converged -- hit a bound, or similar.
+    /// ScanDetector still runs, since the failure is about vbias, not
+    /// about whether the PA responds usably at all.
+    Uncalibrated,
+    /// Fine creep's own rolling-average check caught the PA thermally
+    /// rolling off under sustained drive. ScanDetector skipped entirely
+    /// -- driving further for a detector search only makes this worse.
+    PaFailure,
+    /// ScanPaPhase::Settle never got a genuine below-target reading
+    /// within SETTLE_BELOW_TARGET_TIMEOUT of boost turning on -- distinct
+    /// from Uncalibrated: no search ever actually ran here (CoarseRamp's
+    /// own bailout fired on its very first check), so this isn't a
+    /// verdict on whether the target is reachable at all, just that the
+    /// PA hadn't finished its boost-enable transient in time.
+    /// ScanDetector skipped for the same reason as PaFailure -- there's
+    /// nothing stable for it to search against yet.
+    NotSettled,
 }
 
 /// Tracks "wait for `needed` new power readings since this was created".
@@ -252,8 +293,51 @@ const PA_FAILURE_GRACE_DURATION: Duration = Duration::from_secs(15);
 /// taken the instant boost turned on, read as an immediate false
 /// overshoot -- before the PA had any chance to actually stabilize.
 const BOOST_ENABLE_SETTLE_DELAY: Duration = Duration::from_secs(2);
+/// Default timeout for ScanPaPhase::Settle -- how long to actively wait
+/// for the PA's own boost-enable power spike to decay to or below
+/// target before giving up and proceeding to CoarseRamp anyway. A real
+/// run on a board with the OPAMP-buffered VBIAS circuit reinstated
+/// showed this transient (independent of DAC value -- manually holding
+/// the DAC completely fixed still showed power slowly decaying over
+/// several seconds after boost-on) still reading 14-21mW well past
+/// BOOST_ENABLE_SETTLE_DELAY's fixed 2s, for a 5mW target, at
+/// vbias_mv=0 -- exactly the situation CoarseRamp's own "starting point
+/// already at/above target" bailout exists to catch (see that match
+/// arm's own doc comment), but here the cause was this decaying
+/// transient, not a genuinely-unreachable target: the same board's own
+/// bench sweep (DAC held fixed, no PA) showed 5mW was easily reachable
+/// once the reading actually settled.
+///
+/// 15s was a first attempt and turned out not to be enough -- a real
+/// run showed the decay still clearly trending downward (16.6mW ->
+/// 14.5mW over that window, temperature still climbing throughout, no
+/// sign of leveling off) when the timeout hit, so CoarseRamp's own
+/// bailout fired on a transient that hadn't finished yet, not a
+/// genuinely unreachable target. This is worse at the low end of the
+/// power range (5mW), where the gap between "transient" and "target" is
+/// largest and takes longest to close. Confirmed safe to wait this long
+/// at vbias_mv=0 -- the OPAMP-buffered circuit is fine sitting there for
+/// 30-60+ seconds.
+const SETTLE_BELOW_TARGET_TIMEOUT: Duration = Duration::from_secs(60);
 
 enum ScanPaPhase {
+    /// Runs first, before CoarseRamp ever takes a step -- see
+    /// SETTLE_BELOW_TARGET_TIMEOUT's own doc comment for why. Holds
+    /// vbias_mv fixed at the coarse ramp's own starting point (set once
+    /// at entry, never touched by this phase) and just watches the
+    /// reading: once it's at or below target, hands off to CoarseRamp
+    /// exactly as if this phase had never run (same starting vbias_mv,
+    /// still-fresh coarse-ramp state). If the reading is already at or
+    /// below target the very first time this phase checks, there's
+    /// nothing to wait for -- hands off immediately, adding no delay to
+    /// the common case where this transient either doesn't apply or has
+    /// already decayed by the time this (level, freq) is reached (e.g.
+    /// every point after the first, since the PA stays on across the
+    /// whole sweep). Bounded by SETTLE_BELOW_TARGET_TIMEOUT -- if the
+    /// reading hasn't decayed to target by then, proceeds to CoarseRamp
+    /// anyway, which still has its own bailout logic as a backstop for
+    /// a starting point that's genuinely, not just transiently, too high.
+    Settle,
     CoarseRamp,
     Fine,
 }
@@ -262,6 +346,20 @@ struct ScanPaState {
     phase: ScanPaPhase,
     vbias_mv: i32,
     wait: Option<SampleWait>,
+    /// Wall-clock instant Settle phase began, for
+    /// SETTLE_BELOW_TARGET_TIMEOUT -- separate from fine_started_instant
+    /// below (a different phase's own timing). None once Settle has
+    /// handed off to CoarseRamp; never read again after that point.
+    settle_started_instant: Option<Instant>,
+    /// True only if THIS point's Settle phase resolved via
+    /// SETTLE_BELOW_TARGET_TIMEOUT rather than a genuine below-target
+    /// reading -- read once, by CoarseRamp's own "starting point already
+    /// at/above target" bail (see that match arm's doc comment), to
+    /// attribute that specific failure to ScanPaOutcome::NotSettled
+    /// instead of the generic Uncalibrated. False whenever Settle didn't
+    /// run at all for this point (pa_enable_settle_pending was already
+    /// consumed by an earlier point since the same boost-enable event).
+    settle_timed_out: bool,
     coarse_steps_taken: u32, // how many coarse-ramp steps so far -- drives sub_progress()
     /// Last CoarseRamp vbias_mv confirmed to read below target, remembered so
     /// that the moment CoarseRamp overshoots, Fine creep can start from
@@ -411,6 +509,13 @@ pub struct SweepResult {
     /// write (success already gates that correctly); it exists for
     /// logging/diagnostics.
     pub pa_failure: bool,
+    /// True only for a ScanPa result that bailed specifically because
+    /// ScanPaPhase::Settle timed out without ever seeing a below-target
+    /// reading (see CellStatus::NotSettled) -- always false when success
+    /// is true, and mutually exclusive with pa_failure. Same as
+    /// pa_failure: exists for logging/diagnostics, not needed for the
+    /// pa_table write.
+    pub not_settled: bool,
 }
 
 /// Describes whatever step is currently in progress, if any -- see
@@ -578,6 +683,23 @@ pub struct SweepEngine {
     /// needs this regardless of which phase happens to be running at the
     /// time.
     boost_settle_until: Option<Instant>,
+    /// Set on the same boost off->on transition as boost_settle_until
+    /// above, but consumed differently: the NEXT fresh (level, freq)
+    /// entry that sees this true starts in ScanPaPhase::Settle instead
+    /// of jumping straight to CoarseRamp, then clears this once Settle
+    /// resolves (either satisfied or timed out). Every subsequent entry
+    /// after that skips Settle entirely, until boost toggles off and
+    /// back on again.
+    ///
+    /// Deliberately engine-level and consumed-once rather than
+    /// re-armed on every fresh entry: a real run showed the PA's
+    /// boost-enable transient is a single, continuous physical event
+    /// (self-heating that took 30+ seconds to decay, still trending at
+    /// the end) that happens once when boost turns on and stays on for
+    /// the rest of the sweep -- re-running Settle's full wait at every
+    /// (level, freq) was re-discovering the same already-known decay
+    /// and paying its timeout repeatedly instead of once.
+    pa_enable_settle_pending: bool,
 }
 
 /// How long the VTX (or meter) can go completely silent while a sweep is
@@ -700,6 +822,7 @@ impl SweepEngine {
             boost_mode: BoostMode::Auto,
             last_boost_on: None,
             boost_settle_until: None,
+            pa_enable_settle_pending: false,
         }
     }
 
@@ -820,6 +943,7 @@ impl SweepEngine {
             detector_mv: Some(detector_mv),
             success: true,
             pa_failure: false,
+            not_settled: false,
         });
         Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Manual);
         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Manual);
@@ -1135,6 +1259,7 @@ impl SweepEngine {
                 if boost_on && self.last_boost_on != Some(true) {
                     debug!(target: "vtx", "[sweep] PA boost just enabled -- ignoring samples for {BOOST_ENABLE_SETTLE_DELAY:?}");
                     self.boost_settle_until = Some(Instant::now() + BOOST_ENABLE_SETTLE_DELAY);
+                    self.pa_enable_settle_pending = true;
                 }
                 self.last_boost_on = Some(boost_on);
             }
@@ -1240,15 +1365,24 @@ impl SweepEngine {
         let target_mw = *self.target_mw_by_level.get(&level).unwrap_or(&0) as f32;
 
         if self.step.is_none() {
-            // Entering a fresh (level, freq): start with ScanPa's coarse ramp,
-            // from the safe/low-power end of the range for THIS board's sign
-            // -- see coarse_ramp_start_vbias_mv()'s own doc comment.
+            // Entering a fresh (level, freq): starts in Settle only if
+            // boost has turned on since Settle last ran (see
+            // pa_enable_settle_pending's own doc comment) -- otherwise
+            // goes straight to CoarseRamp, since Settle's transient is a
+            // one-time event per boost-enable, not per (level, freq).
+            // Settle hands off to CoarseRamp once the reading is
+            // genuinely at or below target -- from the safe/low-power
+            // end of the range for THIS board's sign, see
+            // coarse_ramp_start_vbias_mv()'s own doc comment.
             let (bound_lo, bound_hi) = self.effective_bounds(level);
             let start_vbias_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
+            let needs_settle = self.pa_enable_settle_pending;
             self.step = Some(StepState::Pa(ScanPaState {
-                phase: ScanPaPhase::CoarseRamp,
+                phase: if needs_settle { ScanPaPhase::Settle } else { ScanPaPhase::CoarseRamp },
                 vbias_mv: start_vbias_mv,
                 wait: None,
+                settle_started_instant: if needs_settle { Some(Instant::now()) } else { None },
+                settle_timed_out: false,
                 coarse_steps_taken: 0,
                 last_below_target_mv: None,
                 coarse_step_mv: COARSE_RAMP_STEP_MV,
@@ -1258,10 +1392,15 @@ impl SweepEngine {
                 fine_settle_until: None,
                 fine_started_instant: None,
             }));
-            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa (coarse ramp) from vbias_mv={start_vbias_mv} (sign_inverted={})", self.sign_inverted);
+            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa ({}) from vbias_mv={start_vbias_mv} (sign_inverted={})",
+                if needs_settle { "settle, then coarse ramp" } else { "coarse ramp" }, self.sign_inverted);
             self.per_level_status.insert(
                 level,
-                LevelStatus::InProgress(format!("{} / coarse ramp @ {freq_mhz}MHz", SweepOp::ScanPa.label())),
+                LevelStatus::InProgress(format!(
+                    "{} / {} @ {freq_mhz}MHz",
+                    SweepOp::ScanPa.label(),
+                    if needs_settle { "settling" } else { "coarse ramp" }
+                )),
             );
             Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Current);
         }
@@ -1271,10 +1410,10 @@ impl SweepEngine {
 
         match self.step.take().unwrap() {
             StepState::Pa(mut st) => {
-                // PA-enable settle gate -- applies to CoarseRamp and Fine
-                // alike, since the PA can power up at the start of either
-                // (whichever phase happens to be running when the level/
-                // frequency's boost first turns on). See
+                // PA-enable settle gate -- applies to Settle, CoarseRamp,
+                // and Fine alike, since the PA can power up at the start
+                // of any of them (whichever phase happens to be running
+                // when the level/frequency's boost first turns on). See
                 // BOOST_ENABLE_SETTLE_DELAY's doc comment. Placed before
                 // `wait` is ever borrowed below, same reasoning as
                 // fine_settle_until's own placement.
@@ -1308,7 +1447,7 @@ impl SweepEngine {
                             match st.fine_highest_avg_mw {
                                 Some(peak) if !in_grace_period && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
                                     debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
-                                    self.finish_scan_pa(level, st.vbias_mv, false, true);
+                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::PaFailure);
                                     return Ok(false);
                                 }
                                 Some(peak) => st.fine_highest_avg_mw = Some(peak.max(rolling)),
@@ -1351,7 +1490,7 @@ impl SweepEngine {
                         self.last_send = Instant::now();
                         sent = true;
                         let (needed, skip) = match st.phase {
-                            ScanPaPhase::Fine | ScanPaPhase::CoarseRamp => (4, 0),
+                            ScanPaPhase::Fine | ScanPaPhase::CoarseRamp | ScanPaPhase::Settle => (4, 0),
                         };
                         st.wait = Some(SampleWait::new(now_seq, needed, skip));
                     }
@@ -1377,6 +1516,29 @@ impl SweepEngine {
                 debug!(target: "vtx", "[sweep] ScanPa level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW", st.vbias_mv);
 
                 match st.phase {
+                    ScanPaPhase::Settle => {
+                        if avg_mw <= target_mw {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) at or below target ({target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp", st.vbias_mv);
+                            st.phase = ScanPaPhase::CoarseRamp;
+                            st.settle_started_instant = None;
+                            st.wait = None;
+                            self.pa_enable_settle_pending = false;
+                        } else if st
+                            .settle_started_instant
+                            .map(|t| t.elapsed() >= SETTLE_BELOW_TARGET_TIMEOUT)
+                            .unwrap_or(true)
+                        {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase timed out after {SETTLE_BELOW_TARGET_TIMEOUT:?} without reading at or below target ({avg_mw:.4}mW > {target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp anyway (its own bailout logic is still the backstop)", st.vbias_mv);
+                            st.phase = ScanPaPhase::CoarseRamp;
+                            st.settle_started_instant = None;
+                            st.settle_timed_out = true;
+                            st.wait = None;
+                            self.pa_enable_settle_pending = false;
+                        } else {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) still above target ({target_mw}mW) at vbias_mv={}, waiting for it to decay", st.vbias_mv);
+                            st.wait = None; // take another fresh sample window at the same, unchanged vbias_mv
+                        }
+                    }
                     ScanPaPhase::CoarseRamp => {
                         // Always wait for a genuine, MEASURED overshoot
                         // (avg_mw >= target) before ever handing off to
@@ -1414,8 +1576,13 @@ impl SweepEngine {
                                 // the PA behaving differently than expected at
                                 // this frequency) that's worth the person
                                 // actually looking into.
-                                debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point already read at or above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- no below-target point was ever established, bailing this (level,freq) rather than reporting a false success", st.vbias_mv);
-                                self.finish_scan_pa(level, st.vbias_mv, false, false);
+                                if st.settle_timed_out {
+                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point still above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} right after settle phase timed out -- PA hadn't finished its boost-enable transient in time, not a genuinely unreachable target, skipping to the next frequency", st.vbias_mv);
+                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::NotSettled);
+                                } else {
+                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point already read at or above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- no below-target point was ever established, bailing this (level,freq) rather than reporting a false success", st.vbias_mv);
+                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
+                                }
                                 return Ok(false);
                             };
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
@@ -1443,7 +1610,7 @@ impl SweepEngine {
                                 // from a previous VTX power-loss on this level) without ever
                                 // overshooting -- bail this (level, freq) as best-effort.
                                 debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target -- bailing this (level,freq) as best-effort", st.vbias_mv);
-                                self.finish_scan_pa(level, st.vbias_mv, false, false);
+                                self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
                                 return Ok(false);
                             }
                             st.last_below_target_mv = Some(st.vbias_mv);
@@ -1465,11 +1632,11 @@ impl SweepEngine {
                         };
                         if avg_mw >= target_mw {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at vbias_mv={} ({avg_mw:.4}mW)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, true, false);
+                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Success);
                             return Ok(false);
                         } else if !(fine_lo..=fine_hi).contains(&(st.vbias_mv + up)) {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{fine_lo},{fine_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, false, false);
+                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
                             return Ok(false);
                         } else {
                             st.vbias_mv += up;
@@ -1484,6 +1651,7 @@ impl SweepEngine {
                         "{} / {} @ {freq_mhz}MHz vbias_mv={}",
                         SweepOp::ScanPa.label(),
                         match st.phase {
+                            ScanPaPhase::Settle => "settling",
                             ScanPaPhase::CoarseRamp => "coarse ramp",
                             ScanPaPhase::Fine => "fine",
                         },
@@ -1663,6 +1831,7 @@ impl SweepEngine {
         match &self.step {
             None => (0.0, ""),
             Some(StepState::Pa(st)) => match st.phase {
+                ScanPaPhase::Settle => (0.0, "ScanPa: settling"),
                 ScanPaPhase::CoarseRamp => {
                     let up = power_up_step(self.sign_inverted);
                     let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
@@ -1725,6 +1894,7 @@ impl SweepEngine {
         match &self.step {
             Some(StepState::Pa(st)) => {
                 let scan_phase = match st.phase {
+                    ScanPaPhase::Settle => "Settle",
                     ScanPaPhase::CoarseRamp => "Coarse",
                     ScanPaPhase::Fine => "Fine",
                 };
@@ -1986,8 +2156,11 @@ impl SweepEngine {
         Ok(())
     }
 
-    fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, success: bool, pa_failure: bool) {
+    fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, outcome: ScanPaOutcome) {
         self.completed_steps += 1;
+        let success = matches!(outcome, ScanPaOutcome::Success);
+        let pa_failure = matches!(outcome, ScanPaOutcome::PaFailure);
+        let not_settled = matches!(outcome, ScanPaOutcome::NotSettled);
         self.pending_result = Some(SweepResult {
             level,
             freq_idx: self.freq_idx,
@@ -1995,33 +2168,37 @@ impl SweepEngine {
             detector_mv: None,
             success,
             pa_failure,
+            not_settled,
         });
         Self::set_cell_status(
             &mut self.cal_cell_status,
             (level, self.freq_idx),
-            if pa_failure {
-                CellStatus::PaFailure
-            } else if success {
-                CellStatus::Calibrated
-            } else {
-                CellStatus::Uncalibrated
+            match outcome {
+                ScanPaOutcome::PaFailure => CellStatus::PaFailure,
+                ScanPaOutcome::NotSettled => CellStatus::NotSettled,
+                ScanPaOutcome::Success => CellStatus::Calibrated,
+                ScanPaOutcome::Uncalibrated => CellStatus::Uncalibrated,
             },
         );
 
-        if pa_failure {
+        if pa_failure || not_settled {
             // Skip ScanDetector entirely -- if the PA is thermally
-            // rolling off, driving it further for a detector search
-            // only makes that worse. Mark the detector cell the same
-            // way (no search ran there either) and account for BOTH
-            // steps (this ScanPa op plus the ScanDetector op that never
-            // ran) in completed_steps, same reasoning as
-            // skip_current() -- otherwise the progress bar would never
-            // reach 100%.
-            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::PaFailure);
+            // rolling off (PaFailure), or hadn't even finished its
+            // boost-enable transient (NotSettled), driving it further
+            // for a detector search only makes that worse, or searches
+            // against a target that hasn't stabilized yet. Mark the
+            // detector cell the same way (no search ran there either)
+            // and account for BOTH steps (this ScanPa op plus the
+            // ScanDetector op that never ran) in completed_steps, same
+            // reasoning as skip_current() -- otherwise the progress bar
+            // would never reach 100%.
+            let cell_status = if not_settled { CellStatus::NotSettled } else { CellStatus::PaFailure };
+            let level_status = if not_settled { LevelStatus::NotSettled } else { LevelStatus::PaFailure };
+            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), cell_status);
             self.completed_steps += 1;
             self.step = None;
             self.level_idx += 1;
-            self.per_level_status.insert(level, LevelStatus::PaFailure);
+            self.per_level_status.insert(level, level_status);
             return;
         }
 
@@ -2060,6 +2237,7 @@ impl SweepEngine {
             detector_mv: Some(detector_mv),
             success,
             pa_failure: false, // only a ScanPa result can trigger PA Failure -- see finish_scan_pa
+            not_settled: false, // only a ScanPa result can trigger NotSettled -- see finish_scan_pa
         });
         Self::set_cell_status(
             &mut self.det_cell_status,

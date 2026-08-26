@@ -95,6 +95,7 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
         CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
         CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),       // neutral grey -- deliberate, not a failure
         CellStatus::PaFailure => Some(egui::Color32::from_rgb(165, 80, 15)),    // distinct burnt orange -- hardware condition, not just a non-convergent search
+        CellStatus::NotSettled => Some(egui::Color32::from_rgb(140, 100, 20)),  // dark gold -- also a timing/hardware condition (PA hadn't finished its boost-enable transient), distinct from PaFailure's thermal-rolloff meaning
         CellStatus::Manual => Some(egui::Color32::from_rgb(80, 55, 100)),       // muted violet -- hand-set, distinct from an automatic Calibrated result
     }
 }
@@ -289,6 +290,7 @@ fn status_text(status: Option<&LevelStatus>) -> String {
         Some(LevelStatus::Aborted) => "Aborted".to_string(),
         Some(LevelStatus::Skipped) => "Skipped".to_string(),
         Some(LevelStatus::PaFailure) => "PA Failure".to_string(),
+        Some(LevelStatus::NotSettled) => "Not Settled".to_string(),
     }
 }
 
@@ -348,12 +350,7 @@ pub fn show(
         // a degenerate-safe [0,1] range when a series is empty or constant,
         // so this never divides by zero.
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
-        let (temp_lo, temp_hi) = if true {
-            // TODO make this fixed range / auto-range configurable from the UI.
-            (0.0, 125.0)
-        } else {
-            min_max_or(&temp_points_raw, 0.0, 1.0)
-        };
+        let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
         let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
         let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
         let temp_points_scaled: PlotPoints =
@@ -384,6 +381,10 @@ pub fn show(
             }
         });
         plot_response.response.context_menu(|ui| {
+            // No explicit close needed here -- context_menu()'s default
+            // PopupCloseBehavior is CloseOnClick (since egui 0.32's popup
+            // rewrite), so this button click already closes the menu on
+            // its own.
             if ui.button("Reset").clicked() {
                 page.plot_reset_requested = true;
             }
