@@ -260,6 +260,14 @@ pub enum Command {
     /// Commits whatever's currently in the VTX's RAM (including
     /// anything sent by SendCalTableToVtx) to EEPROM.
     SaveEeprom,
+    /// Resets every level's calibration[]/detector[] on the VTX back to
+    /// this target's own compiled-in defaults, and persists that
+    /// immediately (see vtx_msp_set_calibration_table()'s 1-byte reset
+    /// payload in vtx_msp.c -- this is NOT a value this tool invents;
+    /// what's "safe/uncalibrated" depends on the board's PA_DAC_SIGN and
+    /// only the firmware knows it). Independent of SaveEeprom -- this
+    /// already persists on its own, unlike SendCalTableToVtx.
+    EraseCalibration,
 }
 
 pub fn spawn(
@@ -750,6 +758,35 @@ pub fn spawn(
                             debug!(target: "vtx", "sent {sent} calibration table entries to VTX");
                         } else {
                             error!(target: "vtx", "SendCalTableToVtx requested while disconnected");
+                        }
+                    }
+
+                    Command::EraseCalibration => {
+                        if let Some(link) = vtx.as_mut() {
+                            // See vtx_msp_set_calibration_table()'s own doc
+                            // comment in vtx_msp.c -- a 1-byte payload of
+                            // exactly 0xFF resets every level back to this
+                            // target's own compiled-in defaults and persists
+                            // immediately. NOT a value this tool invents.
+                            match link.send_v2(function::SET_PACALTABLE, Some(&[0xFFu8])) {
+                                Ok(_) => {
+                                    debug!(target: "vtx", "sent calibration reset-to-defaults");
+                                    match read_pa_table(link) {
+                                        Ok(table) => {
+                                            debug!(target: "vtx", "PA table refreshed after erase: {} entries", table.len());
+                                            state.lock().unwrap().pa_table = table;
+                                            if let Some(engine) = sweep.lock().unwrap().as_mut() {
+                                                engine.clear_hard_limits();
+                                                engine.clear_cell_status();
+                                            }
+                                        }
+                                        Err(e) => error!(target: "vtx", "PA table read after erase failed: {e}"),
+                                    }
+                                }
+                                Err(e) => error!(target: "vtx", "failed to send calibration reset: {e}"),
+                            }
+                        } else {
+                            error!(target: "vtx", "EraseCalibration requested while disconnected");
                         }
                     }
 

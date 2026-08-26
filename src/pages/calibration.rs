@@ -53,6 +53,10 @@ pub struct CalibrationPageState {
     pub tolerance_pct: f32,
     pub checked: HashMap<u8, bool>,
     show_confirm_dialog: bool,
+    /// Set by "Erase Calibration" -- separate from show_confirm_dialog
+    /// (recalibration) since these are two different destructive
+    /// actions with two different confirmation messages.
+    show_erase_confirm_dialog: bool,
     /// Manual mode's "fine" checkbox: true = the DAC slider moves in
     /// 1mV steps, false = 25mV steps.
     fine_step: bool,
@@ -71,6 +75,7 @@ impl Default for CalibrationPageState {
             tolerance_pct: 10.0, // matches rf_calibration.py's own scanDetector default (max(0.1, mW*0.1))
             checked: HashMap::new(),
             show_confirm_dialog: false,
+            show_erase_confirm_dialog: false,
             fine_step: false,
             plot_reset_requested: false,
         }
@@ -806,5 +811,42 @@ pub fn show(
         if ui.button("Save EEPROM").clicked() {
             let _ = cmd_tx.send(Command::SaveEeprom);
         }
+
+        // Disabled during an active sweep -- same reasoning as Stop/Skip's
+        // own gating above: this writes to the same levels a sweep may
+        // currently be mid-write to.
+        if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
+            page.show_erase_confirm_dialog = true;
+        }
     });
+
+    if page.show_erase_confirm_dialog {
+        let mut open = true;
+        let mut confirmed = false;
+        egui::Window::new("Confirm Erase Calibration")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label("Reset EVERY level's calibration on the VTX back to its factory defaults?");
+                ui.label("This writes to EEPROM immediately and cannot be undone.");
+                ui.horizontal(|ui| {
+                    if ui.button("Yes, erase").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        page.show_erase_confirm_dialog = false;
+                    }
+                });
+            });
+        if !open {
+            // Closed via the window's own X -- default is Cancel, per spec.
+            page.show_erase_confirm_dialog = false;
+        }
+        if confirmed {
+            page.show_erase_confirm_dialog = false;
+            let _ = cmd_tx.send(Command::EraseCalibration);
+        }
+    }
 }
