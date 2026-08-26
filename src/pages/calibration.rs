@@ -348,7 +348,12 @@ pub fn show(
         // a degenerate-safe [0,1] range when a series is empty or constant,
         // so this never divides by zero.
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
-        let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
+        let (temp_lo, temp_hi) = if true {
+            // TODO make this fixed range / auto-range configurable from the UI.
+            (0.0, 125.0)
+        } else {
+            min_max_or(&temp_points_raw, 0.0, 1.0)
+        };
         let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
         let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
         let temp_points_scaled: PlotPoints =
