@@ -254,19 +254,18 @@ pub enum Command {
     /// SweepEngine::skip_current).
     SkipCurrent,
     /// Pushes the working pa_table's calibration[]/detector[] for every
-    /// real level (idx >= 1) to the VTX via SET_PACALTABLE. Independent
-    /// of SaveEeprom -- this only updates the VTX's RAM copy.
+    /// real level (idx >= 1) to the VTX via SET_PACALTABLE, which
+    /// persists to EEPROM immediately as part of processing each entry
+    /// (see vtx_msp_set_calibration_table()'s own rf_pa_write_eeprom()
+    /// call in vtx_msp.c) -- there's no separate "commit" step needed
+    /// after this.
     SendCalTableToVtx,
-    /// Commits whatever's currently in the VTX's RAM (including
-    /// anything sent by SendCalTableToVtx) to EEPROM.
-    SaveEeprom,
     /// Resets every level's calibration[]/detector[] on the VTX back to
     /// this target's own compiled-in defaults, and persists that
     /// immediately (see vtx_msp_set_calibration_table()'s 1-byte reset
     /// payload in vtx_msp.c -- this is NOT a value this tool invents;
     /// what's "safe/uncalibrated" depends on the board's PA_DAC_SIGN and
-    /// only the firmware knows it). Independent of SaveEeprom -- this
-    /// already persists on its own, unlike SendCalTableToVtx.
+    /// only the firmware knows it).
     EraseCalibration,
 }
 
@@ -725,7 +724,28 @@ pub fn spawn(
                         // sent directly: a VTX_CONFIG push landing immediately,
                         // with no wait, before the settle gate the engine itself
                         // was tracking ever got a say).
-                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                        //
+                        // Built from the sweep's own current frequency (queried
+                        // BEFORE skip_current() advances it), not vtx_table --
+                        // vtx_table is the Frequency panel's own, unrelated
+                        // setting (whatever it was at connect time), and using
+                        // it here meant every Skip briefly retuned the VTX away
+                        // to that frequency before the sweep's own next-point
+                        // retune arrived. Since pending_sends is always
+                        // processed before the engine's normal step logic, that
+                        // stale retune always won the race -- from the outside
+                        // it looked like Skip was permanently resetting the
+                        // frequency, not just transiently visiting the wrong
+                        // one on the way to the right one.
+                        let current_freq_mhz = sweep
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|engine| engine.current_frequency_mhz());
+                        let payload = match current_freq_mhz {
+                            Some(freq_mhz) => calibration_engine::safe_state_payload_at_frequency(&vtx_table.lock().unwrap(), freq_mhz),
+                            None => calibration_engine::safe_state_payload(&vtx_table.lock().unwrap()),
+                        };
                         let next_pos = {
                             let mut guard = sweep.lock().unwrap();
                             guard.as_mut().and_then(|engine| engine.skip_current(payload))
@@ -787,17 +807,6 @@ pub fn spawn(
                             }
                         } else {
                             error!(target: "vtx", "EraseCalibration requested while disconnected");
-                        }
-                    }
-
-                    Command::SaveEeprom => {
-                        if let Some(link) = vtx.as_mut() {
-                            match link.send_v1(function::EEPROM_WRITE as u8, &[]) {
-                                Ok(()) => debug!(target: "vtx", "sent EEPROM_WRITE"),
-                                Err(e) => error!(target: "vtx", "failed to send EEPROM_WRITE: {e}"),
-                            }
-                        } else {
-                            error!(target: "vtx", "SaveEeprom requested while disconnected");
                         }
                     }
                 }
