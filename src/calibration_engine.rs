@@ -1189,6 +1189,20 @@ impl SweepEngine {
         !matches!(self.state, EngineState::Idle)
     }
 
+    /// The frequency this sweep is currently on (both automatic and
+    /// manual mode), if the engine is active. Used by worker.rs to build
+    /// a skip-safe-state payload that preserves this frequency rather
+    /// than jumping to whatever's cached in vtx_table (the Frequency
+    /// panel's own, unrelated setting) -- see Command::SkipCurrent's own
+    /// comment in worker.rs for why that distinction matters.
+    pub fn current_frequency_mhz(&self) -> Option<u16> {
+        if self.is_active() {
+            self.frequencies.get(self.freq_idx).copied()
+        } else {
+            None
+        }
+    }
+
     /// True whenever Manual mode is the active sub-mode -- covers
     /// ManualActive itself plus its own AwaitingFreqConfirm/
     /// ConnectionLost pauses (in_manual_mode isn't cleared by either),
@@ -2338,5 +2352,23 @@ fn interpolate(target_mw: f32, below: (f32, u16), above: (f32, u16)) -> u16 {
 pub fn safe_state_payload(vtx_table: &VtxTableConfig) -> Vec<u8> {
     let mut cfg = vtx_table.clone();
     cfg.pitmode = true;
+    cfg.encode_vtx_config_response()
+}
+
+/// Same as safe_state_payload(), but overrides the frequency to
+/// `freq_mhz` (forcing frequency mode, selected_band=0) instead of
+/// using whatever's cached in vtx_table -- used for the safe-state-on-
+/// skip push (see worker.rs's Command::SkipCurrent), where the intent
+/// is "force pitmode on before this point is abandoned," NOT "jump to
+/// the Frequency panel's own, unrelated setting." vtx_table's other
+/// fields (bands/channels/power_levels list) are still needed to encode
+/// a well-formed response, just not its selected_band/selected_channel/
+/// selected_freq_mhz -- see that command's own comment in worker.rs for
+/// the failure this was written to fix.
+pub fn safe_state_payload_at_frequency(vtx_table: &VtxTableConfig, freq_mhz: u16) -> Vec<u8> {
+    let mut cfg = vtx_table.clone();
+    cfg.pitmode = true;
+    cfg.selected_band = 0;
+    cfg.selected_freq_mhz = freq_mhz;
     cfg.encode_vtx_config_response()
 }
