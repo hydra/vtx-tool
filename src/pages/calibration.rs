@@ -814,10 +814,6 @@ pub fn show(
             let _ = cmd_tx.send(Command::SendCalTableToVtx);
         }
 
-        if ui.button("Save EEPROM").clicked() {
-            let _ = cmd_tx.send(Command::SaveEeprom);
-        }
-
         // Disabled during an active sweep -- same reasoning as Stop/Skip's
         // own gating above: this writes to the same levels a sweep may
         // currently be mid-write to.
