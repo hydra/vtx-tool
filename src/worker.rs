@@ -519,7 +519,7 @@ pub fn spawn(
                             let resumed = {
                                 let mut guard = sweep.lock().unwrap();
                                 match guard.as_mut() {
-                                    Some(engine) if matches!(engine.state, calibration_engine::EngineState::ManualActive) => {
+                                    Some(engine) if matches!(&engine.state, calibration_engine::EngineState::Manual) => {
                                         engine.resume_automatic_from_current();
                                         true
                                     }

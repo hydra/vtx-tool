@@ -350,12 +350,7 @@ pub fn show(
         // a degenerate-safe [0,1] range when a series is empty or constant,
         // so this never divides by zero.
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
-        let (temp_lo, temp_hi) = if true {
-            // TODO make this fixed range / auto-range configurable from the UI.
-            (0.0, 125.0)
-        } else {
-            min_max_or(&temp_points_raw, 0.0, 1.0)
-        };
+        let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
         let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
         let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
         let temp_points_scaled: PlotPoints =
@@ -442,8 +437,8 @@ pub fn show(
     // ---- Frequency-change gate (manual-frequency meters) ---------------
     let awaiting_freq_mhz = {
         let g = sweep.lock().unwrap();
-        g.as_ref().and_then(|e| match e.state {
-            calibration_engine::EngineState::AwaitingFreqConfirm { freq_mhz } => Some(freq_mhz),
+        g.as_ref().and_then(|e| match &e.state {
+            calibration_engine::EngineState::AwaitingFreqConfirm { freq_mhz, .. } => Some(*freq_mhz),
             _ => None,
         })
     };
@@ -472,9 +467,9 @@ pub fn show(
     // ---- Connection error gate (VTX and/or meter lost communication) ----
     let connection_lost = {
         let g = sweep.lock().unwrap();
-        g.as_ref().and_then(|e| match e.state {
-            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason } => {
-                Some((level, freq_mhz, vbias_mv_at_loss, reason))
+        g.as_ref().and_then(|e| match &e.state {
+            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, .. } => {
+                Some((*level, *freq_mhz, *vbias_mv_at_loss, *reason))
             }
             _ => None,
         })
@@ -813,7 +808,8 @@ pub fn show(
         }
     }
 
-    // ---- Send to VTX / Save EEPROM (independent) -----------------------
+    // ---- Send to VTX (persists to EEPROM immediately, see
+    // Command::SendCalTableToVtx's own doc comment) / Erase Calibration --
     ui.horizontal(|ui| {
         if ui.button("Send to VTX").clicked() {
             let _ = cmd_tx.send(Command::SendCalTableToVtx);

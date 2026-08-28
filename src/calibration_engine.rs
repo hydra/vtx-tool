@@ -24,6 +24,24 @@
 //! entry (dac_sign_inverted, see msp.rs) rather than assumed -- every
 //! "step toward more power" in this file goes through power_up_step()
 //! rather than a hardcoded `+=`.
+//!
+//! STATE MACHINE SHAPE: the engine holds exactly ONE position
+//! (level_idx/freq_idx) regardless of which mode is driving it --
+//! Automatic and Manual both read and advance the SAME fields, through
+//! the SAME advance_position() function, rather than each mode tracking
+//! its own copy. Frequency retuning only ever happens from inside
+//! begin_frequency(), itself only ever called from start()/
+//! start_manual() (the very first frequency) and advance_position()
+//! (every frequency after that) -- there is exactly one place in this
+//! file that ever changes what frequency the VTX is tuned to.
+//!
+//! Which sub-mode is active is expressed entirely by which EngineState
+//! variant self.state currently holds (Automatic(..) or Manual) --
+//! there is no separate "in_manual_mode" flag traveling alongside it.
+//! AwaitingFreqConfirm and ConnectionLost, the two states reachable from
+//! either mode, carry a `resume: ResumeMode` field recording which one
+//! to return to, rather than relying on a flag that lives outside the
+//! state and has to be kept in sync with it by hand.
 
 use crate::msp::{self, function, MspCommandKind, MspLink};
 use crate::power_meter::{nearest_band, FrequencyCapability};
@@ -213,7 +231,7 @@ enum ScanPaOutcome {
 /// running past the 60s window). Now tracked against SharedState's
 /// reading_seq instead -- a plain counter incremented on every reading,
 /// which never plateaus.
-struct SampleWait {
+pub(crate) struct SampleWait {
     start_seq: u64,
     needed: usize,
     skip_first: usize, // for the bracket phase: skip this many, average the rest
@@ -319,8 +337,50 @@ const BOOST_ENABLE_SETTLE_DELAY: Duration = Duration::from_secs(2);
 /// at vbias_mv=0 -- the OPAMP-buffered circuit is fine sitting there for
 /// 30-60+ seconds.
 const SETTLE_BELOW_TARGET_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the VTX (or meter) can go completely silent while a sweep is
+/// active before it's treated as a lost connection.
+///
+/// TUNED DOWN from an initial 2s: the actual failure mode observed was
+/// that during the detection window, the sweep kept stepping mV further
+/// in the "more power" direction, because once the VTX dies the RF
+/// signal disappears and the power meter reads near-zero -- which the
+/// algorithm reads as "need more power, keep pushing" rather than "the
+/// device is gone". By the time ConnectionLost fired, vbias_mv_at_loss could
+/// already be well past the actual trip point, so backing off a small
+/// margin from THAT point wasn't actually safe -- the reported "sets a
+/// limit, trips again, sets a new limit" cycle is exactly what that
+/// looks like. Shortening this reduces (but for a genuinely fast
+/// hardware overcurrent trip, can't fully eliminate) how far the sweep
+/// can wander past the real limit before noticing.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
+/// How far to back off (in the safe/less-power direction) from the mV
+/// value that was active when the VTX went unresponsive, when setting
+/// the new hard limit for that level. Increased alongside the shorter
+/// HEARTBEAT_TIMEOUT above, as a second, independent margin of safety.
+const HEARTBEAT_BACKOFF_MV: i32 = 50;
+/// How many consecutive steps can get clamped at a bound (DAC range or
+/// a hard limit) without the reading ever reaching the target/tolerance
+/// band before giving up on that (level, freq) as unreachable. Without
+/// this, a target that's genuinely unreachable within a hard limit
+/// (confirmed by a real run: ScanDetector pinned at a limit for many
+/// minutes, since the target was never getting anywhere close) spins
+/// forever with no exit condition.
+const PINNED_LIMIT: u32 = 5;
+const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
 
-enum ScanPaPhase {
+/// Which sub-mode to return to once a shared, mode-agnostic pause
+/// (AwaitingFreqConfirm, ConnectionLost) resolves. Carried as DATA on
+/// those two state variants themselves, rather than a separate
+/// "in_manual_mode" flag living outside EngineState that every
+/// transition would otherwise have to remember to keep in sync by hand
+/// -- the state that needs the answer now always has it right there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    Automatic,
+    Manual,
+}
+
+pub(crate) enum ScanPaPhase {
     /// Runs first, before CoarseRamp ever takes a step -- see
     /// SETTLE_BELOW_TARGET_TIMEOUT's own doc comment for why. Holds
     /// vbias_mv fixed at the coarse ramp's own starting point (set once
@@ -342,7 +402,7 @@ enum ScanPaPhase {
     Fine,
 }
 
-struct ScanPaState {
+pub(crate) struct ScanPaState {
     phase: ScanPaPhase,
     vbias_mv: i32,
     wait: Option<SampleWait>,
@@ -404,12 +464,12 @@ struct ScanPaState {
     fine_started_instant: Option<Instant>,
 }
 
-enum ScanDetectorPhase {
+pub(crate) enum ScanDetectorPhase {
     Backoff,
     Bracket,
 }
 
-struct ScanDetectorState {
+pub(crate) struct ScanDetectorState {
     phase: ScanDetectorPhase,
     vbias_mv: i32, // DAC/calibration mV currently being tried -- NOT the detector reading itself
     wait: Option<SampleWait>,
@@ -433,14 +493,20 @@ struct ScanDetectorState {
     /// instead. None until a fresh reading arrives -- there is no
     /// synthetic/sentinel/zero fallback for this; every place that
     /// needs it either has a real, current reading or doesn't make the
-    /// decision yet (see the atomic-data gate in poll_inner()'s
-    /// Detector arm).
+    /// decision yet (see the atomic-data gate in poll_automatic()'s
+    /// ScanDetector arm).
     last_reading: Option<msp::PaCalibrationReading>,
 }
 
-enum StepState {
-    Pa(ScanPaState),
-    Detector(ScanDetectorState),
+/// The Automatic state's own sub-state -- see the module doc comment.
+/// EnteringPoint is an explicit state (not, as before, the absence of
+/// one) for exactly the (level, freq) currently named by
+/// self.level_idx/self.freq_idx: it decides whether ScanPa needs to run
+/// its Settle phase first, then hands off to ScanPa.
+pub(crate) enum AutomaticStep {
+    EnteringPoint,
+    ScanPa(ScanPaState),
+    ScanDetector(ScanDetectorState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,17 +524,22 @@ pub enum ConnectionLossReason {
     Both,
 }
 
-#[derive(Clone, Copy)]
 pub enum EngineState {
     Idle,
-    AwaitingFreqConfirm { freq_mhz: u16 },
-    Running,
+    /// Waiting for the operator to confirm they've retuned a manual-
+    /// frequency power meter (or, for a band-only meter, retuned to the
+    /// nearest band) -- see begin_frequency(). `resume` says which mode
+    /// to land in once confirm_frequency() is called.
+    AwaitingFreqConfirm { freq_mhz: u16, resume: ResumeMode },
+    /// Automatic sweep running -- see AutomaticStep for its own
+    /// sub-states (EnteringPoint, ScanPa, ScanDetector).
+    Automatic(AutomaticStep),
     /// Manual mode is active: the person is directly driving the DAC via
     /// a slider rather than an automatic search running. poll() takes a
     /// completely different path in this state (see poll_manual()) --
     /// no ScanPa/ScanDetector stepping, just sending whatever
     /// manual_dac_mv currently holds when it changes.
-    ManualActive,
+    Manual,
     /// No traffic from the VTX, or the power meter's connection lost/
     /// disconnected, for longer than a sweep in progress should ever go
     /// quiet. Paused here (not aborted) -- auto-resumes on its own once
@@ -476,12 +547,14 @@ pub enum EngineState {
     /// user action needed beyond an optional Abort. Captures where
     /// things were when it happened so a genuine VTX trip (reason
     /// includes Vtx) can back off to a safe point and set a hard
-    /// ceiling on `level` for the rest of the sweep.
+    /// ceiling on `level` for the rest of the sweep. `resume` says which
+    /// mode auto_resume() should return to.
     ConnectionLost {
         level: u8,
         freq_mhz: u16,
         vbias_mv_at_loss: i32,
         reason: ConnectionLossReason,
+        resume: ResumeMode,
     },
 }
 
@@ -499,8 +572,7 @@ pub struct SweepResult {
     /// band -- see CellStatus::Uncalibrated). worker.rs only commits the
     /// value into the working PA table when this is true -- a failed
     /// attempt's value is discarded, leaving the table's existing
-    /// (pre-calibration) value in place rather than overwriting it with
-    /// something that didn't actually meet target.
+    /// (possibly still-uncalibrated) entry alone.
     pub success: bool,
     /// True only for a ScanPa result that bailed specifically because
     /// Fine creep's thermal-rolloff check tripped (see
@@ -518,21 +590,8 @@ pub struct SweepResult {
     pub not_settled: bool,
 }
 
-/// Describes whatever step is currently in progress, if any -- see
-/// SweepEngine::current_step(). Used by the UI to show the LIVE value in
-/// the "Current" (blue) cell, rather than the table's last-saved value
-/// for that cell (which stays stale/default until the step actually
-/// finishes and pending_result is drained).
-///
-/// vbias_mv and detector_mv are mutually exclusive, never both Some: a
-/// ScanPa step is driving a DAC value (matching the VBIAS column), a
-/// ScanDetector step is reporting the detector's own ADC reading
-/// (matching the Detector column) -- NOT the DAC value ScanDetector
-/// happens to be driving to get there, which is a different number
-/// entirely. Two separate Option fields (rather than one value plus a
-/// bool saying which column it's for) so each column's rendering just
-/// asks for the field it cares about instead of having to decode a
-/// discriminant first.
+/// One (level, frequency) point currently in progress -- what the UI's
+/// sweep table needs to highlight/annotate the active cell.
 pub struct CurrentStep {
     pub level: u8,
     pub freq_idx: usize,
@@ -575,10 +634,15 @@ pub struct SweepEngine {
     pub target_mw_by_level: HashMap<u8, u16>,
     pub sweep_hz: f64, // what update_hz was set to for the sweep -- worker.rs restores the previous value on finish/abort
 
+    /// Which mode is active (Automatic vs Manual), and each mode's own
+    /// sub-state, all expressed by this one field -- see the module doc
+    /// comment. There is no separate flag anywhere in this struct for
+    /// "which mode is this".
     pub state: EngineState,
+    /// The ONE position both modes read and advance -- see the module
+    /// doc comment. Never duplicated per-mode.
     freq_idx: usize,
     level_idx: usize, // index into `levels`
-    step: Option<StepState>,
     last_send: Instant,
 
     pub per_level_status: HashMap<u8, LevelStatus>,
@@ -594,7 +658,7 @@ pub struct SweepEngine {
 
     pub pending_result: Option<SweepResult>, // set when a (level, freq) finishes; caller drains it into the working table
 
-    meter_capability: FrequencyCapability, // cached from start()'s argument, so poll()'s own frequency-advance logic can honor it too, not just the first frequency
+    meter_capability: FrequencyCapability, // cached from start()'s argument, so advance_position()'s own frequency-advance logic can honor it too, not just the first frequency
     /// For ManualBand: the last band value actually prompted for --
     /// consecutive VTX frequencies mapping to the same nearest band
     /// don't get a repeat prompt. Reset to None in start().
@@ -633,19 +697,11 @@ pub struct SweepEngine {
     /// was still supposed to be settling from a previous command).
     pending_sends: VecDeque<PendingSend>,
     /// First time this poll() saw the VTX and/or meter go quiet while
-    /// Running, or None if both are currently responsive. A SUSTAINED
+    /// active, or None if both are currently responsive. A SUSTAINED
     /// silence (not a single missed tick) is what actually triggers
     /// ConnectionLost -- see HEARTBEAT_TIMEOUT.
     unresponsive_since: Option<Instant>,
 
-    /// Whether begin_frequency()/confirm_frequency() should land in
-    /// ManualActive or Running once any AwaitingFreqConfirm prompt
-    /// clears -- both modes share that prompt (it's about the power
-    /// meter's own band, unrelated to which calibration mode is
-    /// active), so this is the one flag that decides which state comes
-    /// after it. Set by start_manual()/exit_manual()/
-    /// resume_automatic_from_current().
-    in_manual_mode: bool,
     /// Current DAC value Manual mode is tracking -- set by
     /// set_manual_dac() (the UI slider), read by poll_manual() to know
     /// what to send. Not itself gated by anything; only the actual send
@@ -702,36 +758,6 @@ pub struct SweepEngine {
     pa_enable_settle_pending: bool,
 }
 
-/// How long the VTX (or meter) can go completely silent while a sweep is
-/// Running before it's treated as a lost connection.
-///
-/// TUNED DOWN from an initial 2s: the actual failure mode observed was
-/// that during the detection window, the sweep kept stepping mV further
-/// in the "more power" direction, because once the VTX dies the RF
-/// signal disappears and the power meter reads near-zero -- which the
-/// algorithm reads as "need more power, keep pushing" rather than "the
-/// device is gone". By the time ConnectionLost fired, vbias_mv_at_loss could
-/// already be well past the actual trip point, so backing off a small
-/// margin from THAT point wasn't actually safe -- the reported "sets a
-/// limit, trips again, sets a new limit" cycle is exactly what that
-/// looks like. Shortening this reduces (but for a genuinely fast
-/// hardware overcurrent trip, can't fully eliminate) how far the sweep
-/// can wander past the real limit before noticing.
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
-/// How far to back off (in the safe/less-power direction) from the mV
-/// value that was active when the VTX went unresponsive, when setting
-/// the new hard limit for that level. Increased alongside the shorter
-/// HEARTBEAT_TIMEOUT above, as a second, independent margin of safety.
-const HEARTBEAT_BACKOFF_MV: i32 = 50;
-/// How many consecutive steps can get clamped at a bound (DAC range or
-/// a hard limit) without the reading ever reaching the target/tolerance
-/// band before giving up on that (level, freq) as unreachable. Without
-/// this, a target that's genuinely unreachable within a hard limit
-/// (confirmed by a real run: ScanDetector pinned at a limit for many
-/// minutes, since the target was never getting anywhere close) spins
-/// forever with no exit condition.
-const PINNED_LIMIT: u32 = 5;
-
 /// A send the engine owes but hasn't issued yet -- see pending_sends'
 /// doc comment on SweepEngine. Each variant carries everything poll()
 /// needs to actually issue it once link.can_send_now() allows.
@@ -774,8 +800,6 @@ impl BoostMode {
     }
 }
 
-const SEND_INTERVAL: Duration = Duration::from_millis(100); // throttles resends while waiting on a step, independent of the outer 10ms loop tick
-
 impl SweepEngine {
     pub fn new(
         levels: Vec<u8>,
@@ -800,7 +824,6 @@ impl SweepEngine {
             state: EngineState::Idle,
             freq_idx: 0,
             level_idx: 0,
-            step: None,
             last_send: Instant::now() - SEND_INTERVAL,
             per_level_status,
             cal_cell_status: HashMap::new(),
@@ -815,7 +838,6 @@ impl SweepEngine {
             hard_limits: HashMap::new(),
             pending_sends: VecDeque::new(),
             unresponsive_since: None,
-            in_manual_mode: false,
             manual_dac_mv: 0,
             manual_send_pending: false,
             session_active: false,
@@ -834,7 +856,7 @@ impl SweepEngine {
     }
 
     /// Call once to begin. See begin_frequency() for how `capability`
-    /// determines whether this starts Running immediately or pauses on
+    /// determines whether this starts Automatic immediately or pauses on
     /// AwaitingFreqConfirm.
     pub fn start(&mut self, capability: FrequencyCapability) {
         if self.levels.is_empty() || self.frequencies.is_empty() {
@@ -844,23 +866,21 @@ impl SweepEngine {
         }
         self.freq_idx = 0;
         self.level_idx = 0;
-        self.step = None;
         self.last_prompted_band = None;
         self.meter_capability = capability;
-        self.in_manual_mode = false;
         self.session_active = true;
         self.boost_mode = BoostMode::Auto;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
         self.pending_sends.push_back(PendingSend::CalibrationState);
         let first_freq = self.frequencies[0];
-        self.begin_frequency(first_freq);
+        self.begin_frequency(first_freq, ResumeMode::Automatic);
     }
 
     /// Starts Manual mode -- the "Manual" button's counterpart to
     /// start(). Same setup (first selected level/frequency, session
-    /// begin, initial retune), but lands in ManualActive once any
-    /// AwaitingFreqConfirm prompt clears, rather than Running.
+    /// begin, initial retune), but lands in Manual once any
+    /// AwaitingFreqConfirm prompt clears, rather than Automatic.
     ///
     /// This does NOT set manual_dac_mv -- the caller (worker.rs, which
     /// owns the PA table this engine doesn't) is expected to follow this
@@ -876,10 +896,8 @@ impl SweepEngine {
         }
         self.freq_idx = 0;
         self.level_idx = 0;
-        self.step = None;
         self.last_prompted_band = None;
         self.meter_capability = capability;
-        self.in_manual_mode = true;
         self.manual_send_pending = false;
         self.session_active = true;
         // PA must not be enabled when manual mode starts -- see
@@ -890,7 +908,7 @@ impl SweepEngine {
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.meter_capability);
         self.pending_sends.push_back(PendingSend::CalibrationState);
         let first_freq = self.frequencies[0];
-        self.begin_frequency(first_freq);
+        self.begin_frequency(first_freq, ResumeMode::Manual);
     }
 
     /// Manual mode's explicit PA-enable checkbox -- see
@@ -924,12 +942,13 @@ impl SweepEngine {
     /// value, in one step -- unlike automatic mode's two-phase ScanPa/
     /// ScanDetector, since the person already knows both simultaneously.
     /// Marks both cells CellStatus::Manual, then advances exactly like
-    /// automatic mode's own level/frequency rollover. Returns the new
+    /// automatic mode's own level/frequency rollover (same
+    /// advance_position(), see its own doc comment). Returns the new
     /// (level, freq_idx) position for the caller to reseed
     /// set_manual_dac() from the working table, or None if that was the
     /// last point (manual mode is now finished, session closed).
     pub fn manual_next(&mut self, detector_mv: u16) -> Option<(u8, usize)> {
-        if !matches!(self.state, EngineState::ManualActive) {
+        if !matches!(&self.state, EngineState::Manual) {
             return None;
         }
         let level = self.levels[self.level_idx];
@@ -948,35 +967,53 @@ impl SweepEngine {
         Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Manual);
         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Manual);
         self.per_level_status.insert(level, LevelStatus::Done);
-        self.advance_manual_position()
+        self.advance_position()
     }
 
-    /// Shared by manual_next() and skip_current()'s Manual-mode path --
-    /// advances level_idx/freq_idx exactly like automatic mode's own
-    /// rollover, EXCEPT Manual mode can't rely on poll()'s "if level_idx
-    /// >= levels.len()" check the way automatic's skip_current() does
-    /// (poll_manual() never runs that check -- it would index
-    /// self.levels[self.level_idx] directly and panic on overflow), so
-    /// this does the rollover itself, including retuning via
-    /// begin_frequency() when the frequency actually changes. Returns
-    /// the new (level, freq_idx), or None if that was the last point
-    /// (Manual mode is now finished, session closed).
-    fn advance_manual_position(&mut self) -> Option<(u8, usize)> {
+    /// The ONE place level_idx/freq_idx ever change, for EITHER mode --
+    /// see the module doc comment. Called by every "this point is done,
+    /// move on" site in this file: finish_scan_pa()'s failure paths,
+    /// finish_scan_detector(), manual_next(), and skip_current() (both
+    /// modes). Reads which mode is currently active from self.state
+    /// itself (no separate flag to pass in or keep in sync), and always
+    /// leaves self.state set to wherever that mode should be once this
+    /// returns -- the caller never needs its own follow-up state
+    /// assignment.
+    ///
+    /// Returns the new (level, freq_idx) if there's a next point, or
+    /// None if the sweep/manual session is now complete (session closed,
+    /// state set to Idle, right here -- not left for the caller to
+    /// notice separately, which is exactly the duplication this
+    /// replaces: before this, automatic mode's own "all frequencies
+    /// complete" handling and Manual mode's were two separately
+    /// hand-maintained copies of the same rollover logic).
+    fn advance_position(&mut self) -> Option<(u8, usize)> {
+        let resume = match &self.state {
+            EngineState::Manual => ResumeMode::Manual,
+            _ => ResumeMode::Automatic,
+        };
         self.level_idx += 1;
         if self.level_idx >= self.levels.len() {
             self.level_idx = 0;
             self.freq_idx += 1;
             if self.freq_idx >= self.frequencies.len() {
-                debug!(target: "vtx", "[sweep] manual mode: all frequencies complete");
+                debug!(target: "vtx", "[sweep] all frequencies complete");
                 self.state = EngineState::Idle;
-                self.in_manual_mode = false;
                 self.session_active = false;
                 self.boost_mode = BoostMode::Auto;
                 self.pending_sends.push_back(PendingSend::CalibrationState);
                 return None;
             }
             let next_freq = self.frequencies[self.freq_idx];
-            self.begin_frequency(next_freq);
+            self.begin_frequency(next_freq, resume); // may land on AwaitingFreqConfirm
+        } else {
+            // Same frequency, next level -- no retune needed, just
+            // return directly to whichever mode is active, ready for its
+            // next point.
+            self.state = match resume {
+                ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
+                ResumeMode::Manual => EngineState::Manual,
+            };
         }
         Some((self.levels[self.level_idx], self.freq_idx))
     }
@@ -989,8 +1026,6 @@ impl SweepEngine {
         debug!(target: "vtx", "[sweep] manual mode exited at level={:?} freq_idx={}",
             self.levels.get(self.level_idx), self.freq_idx);
         self.state = EngineState::Idle;
-        self.in_manual_mode = false;
-        self.step = None;
         self.pending_frequency_push = None;
         self.manual_send_pending = false;
         self.session_active = false;
@@ -1006,28 +1041,26 @@ impl SweepEngine {
     /// every earlier point Manual mode already committed via "Next" stays
     /// as its Manual result. The calibration session stays open throughout
     /// (it doesn't care which sub-mode is driving it), so no new
-    /// SessionBegin is queued here -- session_active just stays true.
+    /// SessionBegin is queued here -- session_active just stays true. No
+    /// retune here either -- the VTX is already on the right frequency,
+    /// this only changes which mode is driving it.
     pub fn resume_automatic_from_current(&mut self) {
         debug!(target: "vtx", "[sweep] resuming automatic mode from level={:?} freq_idx={}",
             self.levels.get(self.level_idx), self.freq_idx);
-        self.in_manual_mode = false;
-        self.step = None;
         self.manual_send_pending = false;
-        self.state = EngineState::Running;
+        self.state = EngineState::Automatic(AutomaticStep::EnteringPoint);
         // Clears Manual mode's PA boost override, if one was set, so
         // automatic mode's own ext_pa_enable-driven behavior (which the
         // very next retune will apply) takes back over rather than
-        // staying pinned at whatever the checkbox last said. session_active
-        // itself stays true -- the session doesn't end here, just the
-        // sub-mode driving it changes.
+        // staying pinned at whatever the checkbox last said.
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
     /// Decides what happens when the sweep is about to start working on
-    /// `freq_mhz`, based on the meter's capability -- shared by start()
-    /// (the first frequency) and poll()'s own advance-to-next-frequency
-    /// logic (every frequency after that), so both honor the same rules:
+    /// `freq_mhz`, based on the meter's capability -- shared by start()/
+    /// start_manual() (the first frequency) and advance_position() (every
+    /// frequency after that), so all three honor the same rules:
     ///   Manual: always prompt (no concept of "band" to consolidate by).
     ///   ManualBand: prompt with the nearest band, UNLESS it's the same
     ///     band as the last prompt (consecutive VTX frequencies that map
@@ -1038,11 +1071,16 @@ impl SweepEngine {
     ///     pending_meter_frequency.
     /// Either way, pending_frequency_push is always set, since the VTX
     /// itself needs retuning regardless of what the meter needs.
-    fn begin_frequency(&mut self, freq_mhz: u16) {
-        let not_confirming_state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
+    /// `resume` is which mode to land in once any prompt clears --
+    /// carried on AwaitingFreqConfirm itself when one is needed.
+    fn begin_frequency(&mut self, freq_mhz: u16, resume: ResumeMode) {
+        let not_confirming_state = match resume {
+            ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
+            ResumeMode::Manual => EngineState::Manual,
+        };
         match self.meter_capability.clone() {
             FrequencyCapability::Manual { .. } => {
-                self.state = EngineState::AwaitingFreqConfirm { freq_mhz };
+                self.state = EngineState::AwaitingFreqConfirm { freq_mhz, resume };
             }
             FrequencyCapability::ManualBand { bands_mhz } => {
                 let band = nearest_band(&bands_mhz, freq_mhz as u32);
@@ -1052,7 +1090,7 @@ impl SweepEngine {
                     self.pending_frequency_push = Some(freq_mhz);
                 } else {
                     self.last_prompted_band = Some(band);
-                    self.state = EngineState::AwaitingFreqConfirm { freq_mhz };
+                    self.state = EngineState::AwaitingFreqConfirm { freq_mhz, resume };
                 }
             }
             FrequencyCapability::ProgrammableBand { bands_mhz } => {
@@ -1073,9 +1111,13 @@ impl SweepEngine {
 
     /// UI calls this after the user confirms they've retuned the meter.
     pub fn confirm_frequency(&mut self) {
-        if let EngineState::AwaitingFreqConfirm { freq_mhz } = self.state {
+        if let EngineState::AwaitingFreqConfirm { freq_mhz, resume } = &self.state {
+            let (freq_mhz, resume) = (*freq_mhz, *resume);
             debug!(target: "vtx", "[sweep] frequency confirmed, resuming at {freq_mhz}MHz");
-            self.state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
+            self.state = match resume {
+                ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
+                ResumeMode::Manual => EngineState::Manual,
+            };
             self.pending_frequency_push = Some(freq_mhz);
         }
     }
@@ -1098,9 +1140,7 @@ impl SweepEngine {
             }
         }
         self.state = EngineState::Idle;
-        self.step = None;
         self.pending_frequency_push = None;
-        self.in_manual_mode = false;
         self.manual_send_pending = false;
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
@@ -1114,79 +1154,74 @@ impl SweepEngine {
     /// level at this same frequency, or the next frequency if this was
     /// the last selected level, exactly as if this point had finished
     /// normally (just marked Skipped instead of Calibrated/Uncalibrated).
-    ///
-    /// Named (and previously behaved) as "skip_frequency", but it never
-    /// actually skipped just a frequency: it unconditionally incremented
-    /// freq_idx regardless of whether other selected levels still had
-    /// work left at the CURRENT frequency (silently skipping all of
-    /// those too, not just the one point asked for), with no bounds
-    /// check against frequencies.len() -- which panicked outright on an
-    /// out-of-bounds index the next time poll() indexed
-    /// self.frequencies[self.freq_idx], if already on the last
-    /// frequency. Fixed here by only ever touching level_idx (mirroring
-    /// exactly what finish_scan_detector does on normal completion) and
-    /// letting poll()'s own "if level_idx >= levels.len()" check --
-    /// which already correctly advances freq_idx with proper bounds
-    /// checking, transitioning to Idle rather than panicking when the
-    /// sweep is genuinely done -- handle the rollover, rather than
-    /// duplicating (and getting wrong) that logic here.
+    /// Both modes now go through the exact same advance_position() --
+    /// see its own doc comment. Automatic mode used to just bump
+    /// level_idx and rely on poll()'s own top-of-tick rollover check to
+    /// notice the overflow next time around; that check no longer exists
+    /// (advance_position() does the whole rollover, including any
+    /// retune, immediately and eagerly, the same way Manual mode's side
+    /// always has).
     ///
     /// `safe_state_payload` (computed by the caller from vtx_table, same
     /// as abort()) is queued as a pitmode-safe VTX_CONFIG push, giving
     /// the VTX a defined safe point between the skipped point and
     /// whatever comes next, sent through the same gated mechanism as
     /// every other send in this file rather than directly.
+    ///
+    /// Returns the new (level, freq_idx) only for Manual mode (the UI
+    /// reseeds the DAC slider from it) -- automatic mode's own table
+    /// redraws from cell status instead, so it always returns None,
+    /// matching this function's previous behavior.
     pub fn skip_current(&mut self, safe_state_payload: Vec<u8>) -> Option<(u8, usize)> {
-        if matches!(self.state, EngineState::ManualActive) {
-            let level = self.levels[self.level_idx];
-            debug!(target: "vtx", "[sweep] manual: skipped level={level} freq_idx={}", self.freq_idx);
-            self.completed_steps += 2; // same accounting as manual_next()/automatic's own skip below
-            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-            self.per_level_status.insert(level, LevelStatus::Skipped);
-            let next_pos = self.advance_manual_position();
-            self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
-            return next_pos;
-        }
-
-        if !matches!(self.state, EngineState::Running) {
-            return None;
-        }
         let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
         debug!(target: "vtx", "[sweep] skipped level={level} freq_idx={} ({}/{} steps completed)",
             self.freq_idx, self.completed_steps, self.total_steps);
 
-        // Mark whichever cell(s) were still outstanding for this point.
-        // Mid-ScanPa: neither op for this point ever ran, so both the
-        // VBIAS cell (never converged) and the Detector cell (never even
-        // started) get marked, and both count toward completed_steps
-        // below. Mid-ScanDetector: ScanPa already finished normally
-        // (finish_scan_pa already counted its own completed_steps and
-        // set the VBIAS cell's real outcome) -- only the Detector cell
-        // and its one remaining op need accounting for here.
-        let skipped_ops = match &self.step {
-            Some(StepState::Pa(_)) => {
+        match &self.state {
+            EngineState::Manual => {
+                self.completed_steps += 2; // same accounting as manual_next()/automatic's own skip below
                 Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
                 Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                2
+                self.per_level_status.insert(level, LevelStatus::Skipped);
+                let next_pos = self.advance_position();
+                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+                next_pos
             }
-            Some(StepState::Detector(_)) => {
-                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                1
+            EngineState::Automatic(step) => {
+                // Mark whichever cell(s) were still outstanding for this
+                // point. Mid-ScanPa: neither op for this point ever ran,
+                // so both the VBIAS cell (never converged) and the
+                // Detector cell (never even started) get marked, and
+                // both count toward completed_steps below. Mid-
+                // ScanDetector: ScanPa already finished normally
+                // (finish_scan_pa already counted its own completed_steps
+                // and set the VBIAS cell's real outcome) -- only the
+                // Detector cell and its one remaining op need accounting
+                // for here.
+                let skipped_ops = match step {
+                    AutomaticStep::ScanPa(_) => {
+                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        2
+                    }
+                    AutomaticStep::ScanDetector(_) => {
+                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        1
+                    }
+                    AutomaticStep::EnteringPoint => 0,
+                };
+                self.completed_steps += skipped_ops;
+                self.per_level_status.insert(level, LevelStatus::Skipped);
+                self.advance_position();
+                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+                None
             }
-            None => 0,
-        };
-        self.completed_steps += skipped_ops;
-
-        self.step = None;
-        self.level_idx += 1;
-        self.per_level_status.insert(level, LevelStatus::Skipped);
-        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
-        None
+            _ => None, // not in a skippable state (Idle, AwaitingFreqConfirm, ConnectionLost)
+        }
     }
 
     pub fn is_active(&self) -> bool {
-        !matches!(self.state, EngineState::Idle)
+        !matches!(&self.state, EngineState::Idle)
     }
 
     /// The frequency this sweep is currently on (both automatic and
@@ -1204,19 +1239,29 @@ impl SweepEngine {
     }
 
     /// True whenever Manual mode is the active sub-mode -- covers
-    /// ManualActive itself plus its own AwaitingFreqConfirm/
-    /// ConnectionLost pauses (in_manual_mode isn't cleared by either),
-    /// false once Idle or switched to automatic. Used by the UI to
-    /// decide which of the Automatic/Manual buttons to disable, and
+    /// Manual itself plus its own AwaitingFreqConfirm/ConnectionLost
+    /// pauses (both carry `resume`, checked here rather than a separate
+    /// flag), false once Idle or switched to automatic. Used by the UI
+    /// to decide which of the Automatic/Manual buttons to disable, and
     /// whether the DAC slider/fine checkbox/PA checkbox are usable.
     pub fn is_manual_mode(&self) -> bool {
-        self.in_manual_mode
+        match &self.state {
+            EngineState::Manual => true,
+            EngineState::AwaitingFreqConfirm { resume, .. } => *resume == ResumeMode::Manual,
+            EngineState::ConnectionLost { resume, .. } => *resume == ResumeMode::Manual,
+            _ => false,
+        }
     }
 
     /// True whenever automatic scanning is the active sub-mode --
     /// active but NOT manual. See is_manual_mode()'s own doc comment.
     pub fn is_automatic_mode(&self) -> bool {
-        self.is_active() && !self.in_manual_mode
+        match &self.state {
+            EngineState::Automatic(_) => true,
+            EngineState::AwaitingFreqConfirm { resume, .. } => *resume == ResumeMode::Automatic,
+            EngineState::ConnectionLost { resume, .. } => *resume == ResumeMode::Automatic,
+            _ => false,
+        }
     }
 
     /// Advances the sweep by whatever's possible this tick. `link` is
@@ -1241,19 +1286,24 @@ impl SweepEngine {
         vtx_ready: bool,
         meter_ready: bool,
     ) -> anyhow::Result<bool> {
-        let result = self.poll_inner(link, history, reading_seq, latest_reading, vtx_ready, meter_ready);
+        let result = self.poll_dispatch(link, history, reading_seq, latest_reading.clone(), vtx_ready, meter_ready);
 
-        match &mut self.step {
-            Some(StepState::Detector(detector_state)) => {
-                if let Some(reading) = latest_reading {
-                    detector_state.last_reading = Some(reading);
-                }
+        if let EngineState::Automatic(AutomaticStep::ScanDetector(detector_state)) = &mut self.state {
+            if let Some(reading) = latest_reading {
+                detector_state.last_reading = Some(reading);
             }
-            _ => ()
         }
         result
     }
-    pub fn poll_inner(
+
+    /// Top-of-tick handling that applies regardless of which state is
+    /// active, then dispatches to whichever mode-specific poll function
+    /// self.state currently calls for. This is the ONE place that reads
+    /// self.state to decide "which mode's own poll function runs this
+    /// tick" -- poll_automatic()/poll_manual() themselves never need to
+    /// re-check which mode they're in, since the dispatcher only ever
+    /// calls the one that matches.
+    fn poll_dispatch(
         &mut self,
         link: &mut MspLink,
         history: &VecDeque<(f64, f32)>,
@@ -1309,21 +1359,45 @@ impl SweepEngine {
             return Ok(true);
         }
 
-        if let EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason } = self.state {
+        // Each check below borrows self.state only long enough to copy
+        // out what it needs (every field involved is Copy), so the
+        // borrow is fully released before any &mut self call that
+        // follows -- deliberately not one single match on self.state,
+        // since EngineState can no longer derive Copy (AutomaticStep
+        // holds ScanPa/ScanDetector search state that isn't) and a few
+        // of these arms need &mut self methods.
+        if let EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, .. } = &self.state {
+            let (level, freq_mhz, vbias_mv_at_loss, reason) = (*level, *freq_mhz, *vbias_mv_at_loss, *reason);
             if vtx_ready && meter_ready {
                 self.auto_resume(level, freq_mhz, vbias_mv_at_loss, reason);
             }
             return Ok(false);
         }
-
-        if matches!(self.state, EngineState::ManualActive) {
+        if matches!(&self.state, EngineState::Manual) {
             return self.poll_manual(link, vtx_ready, meter_ready);
         }
-
-        if !matches!(self.state, EngineState::Running) {
-            return Ok(false);
+        if matches!(&self.state, EngineState::Automatic(_)) {
+            return self.poll_automatic(link, history, reading_seq, vtx_ready, meter_ready);
         }
+        Ok(false) // Idle, AwaitingFreqConfirm -- nothing to do
+    }
 
+    /// poll_dispatch()'s target while EngineState::Automatic(_). Takes
+    /// the current AutomaticStep out of self.state (mirroring the old
+    /// self.step.take() pattern), handles EnteringPoint by constructing
+    /// a fresh ScanPaState and falling straight into the exact same
+    /// first tick ScanPa itself would get (see tick_scan_pa() -- no
+    /// wasted tick just for entering a point, matching this file's
+    /// original behavior), then dispatches ScanPa/ScanDetector to their
+    /// own tick functions.
+    fn poll_automatic(
+        &mut self,
+        link: &mut MspLink,
+        history: &VecDeque<(f64, f32)>,
+        reading_seq: u64,
+        vtx_ready: bool,
+        meter_ready: bool,
+    ) -> anyhow::Result<bool> {
         if !link.can_send_now() {
             // Waiting out a settle period from whatever was last sent.
             // Do nothing this tick, including the heartbeat check below
@@ -1332,39 +1406,26 @@ impl SweepEngine {
             return Ok(false);
         }
 
-        let vbias_mv_now = match &self.step {
-            Some(StepState::Pa(st)) => st.vbias_mv,
-            Some(StepState::Detector(st)) => st.vbias_mv,
-            None => 0,
+        let vbias_mv_now = match &self.state {
+            EngineState::Automatic(AutomaticStep::ScanPa(st)) => st.vbias_mv,
+            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => st.vbias_mv,
+            _ => 0,
         };
         if self.maybe_trip_connection_lost(vtx_ready, meter_ready, vbias_mv_now) {
             return Ok(false);
         }
 
-        if self.level_idx >= self.levels.len() {
-            // Finished this frequency's levels -- advance to the next frequency.
-            self.freq_idx += 1;
-            self.level_idx = 0;
-            self.step = None;
-            if self.freq_idx >= self.frequencies.len() {
-                self.state = EngineState::Idle; // whole sweep done
-                debug!(target: "vtx", "[sweep] all frequencies complete");
-                // Closes the session opened on start() -- queued, not sent
-                // directly, same as everything else: the very next poll()
-                // tick (once link.can_send_now() allows it) is what
-                // actually issues it.
-                self.session_active = false;
-                self.boost_mode = BoostMode::Auto;
-                self.pending_sends.push_back(PendingSend::CalibrationState);
-                return Ok(false);
-            }
-            let next_freq = self.frequencies[self.freq_idx];
-            debug!(target: "vtx", "[sweep] frequency {}/{} complete, next: {next_freq}MHz",
-                self.freq_idx, self.frequencies.len());
-            self.begin_frequency(next_freq);
-            return Ok(false);
-        }
-
+        // Frequency changes take priority over the regular per-step send,
+        // same as poll_manual()'s own handling -- begin_frequency() (called
+        // from start()/advance_position()) sets pending_frequency_push
+        // (and, for Manual/ManualBand meters, routes through
+        // AwaitingFreqConfirm first); this is what actually issues the
+        // VTX_CONFIG retune once that's ready. Without this check here,
+        // the engine's own level_idx/freq_idx (and therefore its log
+        // messages and the UI's status view) advance to the new
+        // frequency immediately, but the VTX itself is never actually
+        // retuned -- it silently stays on whatever frequency it was
+        // last tuned to.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
             let payload = build_vtx_config_frequency_payload(freq_mhz, level);
@@ -1377,488 +1438,533 @@ impl SweepEngine {
         let level = self.levels[self.level_idx];
         let freq_mhz = self.frequencies[self.freq_idx];
         let target_mw = *self.target_mw_by_level.get(&level).unwrap_or(&0) as f32;
-
-        if self.step.is_none() {
-            // Entering a fresh (level, freq): starts in Settle only if
-            // boost has turned on since Settle last ran (see
-            // pa_enable_settle_pending's own doc comment) -- otherwise
-            // goes straight to CoarseRamp, since Settle's transient is a
-            // one-time event per boost-enable, not per (level, freq).
-            // Settle hands off to CoarseRamp once the reading is
-            // genuinely at or below target -- from the safe/low-power
-            // end of the range for THIS board's sign, see
-            // coarse_ramp_start_vbias_mv()'s own doc comment.
-            let (bound_lo, bound_hi) = self.effective_bounds(level);
-            let start_vbias_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
-            let needs_settle = self.pa_enable_settle_pending;
-            self.step = Some(StepState::Pa(ScanPaState {
-                phase: if needs_settle { ScanPaPhase::Settle } else { ScanPaPhase::CoarseRamp },
-                vbias_mv: start_vbias_mv,
-                wait: None,
-                settle_started_instant: if needs_settle { Some(Instant::now()) } else { None },
-                settle_timed_out: false,
-                coarse_steps_taken: 0,
-                last_below_target_mv: None,
-                coarse_step_mv: COARSE_RAMP_STEP_MV,
-                fine_bound_mv: None,
-                fine_started_at_secs: None,
-                fine_highest_avg_mw: None,
-                fine_settle_until: None,
-                fine_started_instant: None,
-            }));
-            debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa ({}) from vbias_mv={start_vbias_mv} (sign_inverted={})",
-                if needs_settle { "settle, then coarse ramp" } else { "coarse ramp" }, self.sign_inverted);
-            self.per_level_status.insert(
-                level,
-                LevelStatus::InProgress(format!(
-                    "{} / {} @ {freq_mhz}MHz",
-                    SweepOp::ScanPa.label(),
-                    if needs_settle { "settling" } else { "coarse ramp" }
-                )),
-            );
-            Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Current);
-        }
-
         let now_seq = reading_seq;
         let throttled = self.last_send.elapsed() < SEND_INTERVAL;
 
-        match self.step.take().unwrap() {
-            StepState::Pa(mut st) => {
-                // PA-enable settle gate -- applies to Settle, CoarseRamp,
-                // and Fine alike, since the PA can power up at the start
-                // of any of them (whichever phase happens to be running
-                // when the level/frequency's boost first turns on). See
-                // BOOST_ENABLE_SETTLE_DELAY's doc comment. Placed before
-                // `wait` is ever borrowed below, same reasoning as
-                // fine_settle_until's own placement.
-                if let Some(settle_until) = self.boost_settle_until {
-                    if Instant::now() < settle_until {
-                        st.wait = None;
-                        let mut sent = false;
-                        if !throttled {
-                            self.send_calibration(link, level, st.vbias_mv)?;
-                            self.last_send = Instant::now();
-                            sent = true;
-                        }
-                        self.step = Some(StepState::Pa(st));
-                        return Ok(sent);
-                    }
-                    self.boost_settle_until = None; // settled -- proceed normally from here on
-                }
+        let step = match std::mem::replace(&mut self.state, EngineState::Idle) {
+            EngineState::Automatic(step) => step,
+            other => {
+                // Shouldn't happen -- poll_dispatch() only calls this
+                // function when self.state matched Automatic(_). Put
+                // whatever it actually was back rather than losing it.
+                self.state = other;
+                return Ok(false);
+            }
+        };
 
-                if matches!(st.phase, ScanPaPhase::Fine) {
-                    if let Some(started_at) = st.fine_started_at_secs {
-                        if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
-                            // Still tracked during the grace period (so once it
-                            // ends we have a real peak to compare against, not a
-                            // fresh start with no history) -- only the ABORT
-                            // itself is suppressed while still within
-                            // PA_FAILURE_GRACE_DURATION of Fine creep beginning.
-                            let in_grace_period = st
-                                .fine_started_instant
-                                .map(|t| t.elapsed() < PA_FAILURE_GRACE_DURATION)
-                                .unwrap_or(false);
-                            match st.fine_highest_avg_mw {
-                                Some(peak) if !in_grace_period && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
-                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
-                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::PaFailure);
-                                    return Ok(false);
-                                }
-                                Some(peak) => st.fine_highest_avg_mw = Some(peak.max(rolling)),
-                                None => st.fine_highest_avg_mw = Some(rolling),
-                            }
-                        }
-                    }
-
-                    // 1-second DAC-settle delay right after the CoarseRamp->Fine
-                    // handoff -- see FINE_SETTLE_DELAY's doc comment. Placed
-                    // before `wait` is ever borrowed below, so resetting
-                    // st.wait here can't run into any borrow-checker questions
-                    // about a still-live reference into the same field.
-                    if let Some(settle_until) = st.fine_settle_until {
-                        if Instant::now() < settle_until {
-                            // Still settling -- discard any samples collected so
-                            // far (SampleWait's own gate is purely count-based,
-                            // so it can fill well before the VBIAS circuit has
-                            // physically caught up) and resend (throttled) so
-                            // the DAC value is definitely in flight, but don't
-                            // start counting toward the convergence check yet.
-                            st.wait = None;
-                            let mut sent = false;
-                            if !throttled {
-                                self.send_calibration(link, level, st.vbias_mv)?;
-                                self.last_send = Instant::now();
-                                sent = true;
-                            }
-                            self.step = Some(StepState::Pa(st));
-                            return Ok(sent);
-                        }
-                        st.fine_settle_until = None; // settled -- proceed normally from here on
-                    }
-                }
-
-                if st.wait.is_none() {
-                    let mut sent = false;
-                    if !throttled {
-                        self.send_calibration(link, level, st.vbias_mv)?;
-                        self.last_send = Instant::now();
-                        sent = true;
-                        let (needed, skip) = match st.phase {
-                            ScanPaPhase::Fine | ScanPaPhase::CoarseRamp | ScanPaPhase::Settle => (4, 0),
-                        };
-                        st.wait = Some(SampleWait::new(now_seq, needed, skip));
-                    }
-                    self.step = Some(StepState::Pa(st));
-                    return Ok(sent);
-                }
-
-                let wait = st.wait.as_ref().unwrap();
-                if !wait.ready(now_seq) {
-                    let mut sent = false;
-                    if !throttled {
-                        self.send_calibration(link, level, st.vbias_mv)?;
-                        self.last_send = Instant::now();
-                        sent = true;
-                    }
-                    self.step = Some(StepState::Pa(st));
-                    return Ok(sent);
-                }
-
-                let avg_mw = wait.average(history);
-                let up = power_up_step(self.sign_inverted);
+        match step {
+            AutomaticStep::EnteringPoint => {
+                // Entering a fresh (level, freq): starts in Settle only if
+                // boost has turned on since Settle last ran (see
+                // pa_enable_settle_pending's own doc comment) -- otherwise
+                // goes straight to CoarseRamp, since Settle's transient is a
+                // one-time event per boost-enable, not per (level, freq).
+                // Settle hands off to CoarseRamp once the reading is
+                // genuinely at or below target -- from the safe/low-power
+                // end of the range for THIS board's sign, see
+                // coarse_ramp_start_vbias_mv()'s own doc comment.
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
-                debug!(target: "vtx", "[sweep] ScanPa level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW", st.vbias_mv);
-
-                match st.phase {
-                    ScanPaPhase::Settle => {
-                        if avg_mw <= target_mw {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) at or below target ({target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp", st.vbias_mv);
-                            st.phase = ScanPaPhase::CoarseRamp;
-                            st.settle_started_instant = None;
-                            st.wait = None;
-                            self.pa_enable_settle_pending = false;
-                        } else if st
-                            .settle_started_instant
-                            .map(|t| t.elapsed() >= SETTLE_BELOW_TARGET_TIMEOUT)
-                            .unwrap_or(true)
-                        {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase timed out after {SETTLE_BELOW_TARGET_TIMEOUT:?} without reading at or below target ({avg_mw:.4}mW > {target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp anyway (its own bailout logic is still the backstop)", st.vbias_mv);
-                            st.phase = ScanPaPhase::CoarseRamp;
-                            st.settle_started_instant = None;
-                            st.settle_timed_out = true;
-                            st.wait = None;
-                            self.pa_enable_settle_pending = false;
-                        } else {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) still above target ({target_mw}mW) at vbias_mv={}, waiting for it to decay", st.vbias_mv);
-                            st.wait = None; // take another fresh sample window at the same, unchanged vbias_mv
-                        }
-                    }
-                    ScanPaPhase::CoarseRamp => {
-                        // Always wait for a genuine, MEASURED overshoot
-                        // (avg_mw >= target) before ever handing off to
-                        // Fine -- never stop at a percentage-of-target
-                        // threshold on the assumption it'll overshoot.
-                        // Once within 10% of target, narrow in by
-                        // halving the step size (floor 1mV) for each
-                        // subsequent real coarse step, rather than
-                        // continuing at the full 25mV and risking a
-                        // large, unconfirmed overshoot -- but still
-                        // actually TAKE and MEASURE that narrower step,
-                        // same as any other coarse step, rather than
-                        // computing where it would probably land and
-                        // handing off on that guess.
-                        if avg_mw >= target_mw {
-                            let Some(fine_start) = st.last_below_target_mv else {
-                                // The STARTING point itself already overshot --
-                                // no coarse step has ever confirmed a genuine
-                                // below-target point yet, so there's nothing to
-                                // bracket Fine creep against. Handing off anyway
-                                // would collapse fine_start and fine_bound_mv to
-                                // this same vbias_mv, and Fine would trivially
-                                // "converge" on its very first sample at
-                                // whatever this overshoot value is -- reporting
-                                // success at a value that was never actually
-                                // approached from below or searched for at all.
-                                // A real run showed exactly this: the coarse
-                                // ramp's starting point read 58mW against a
-                                // 10mW target, and the point got marked
-                                // Calibrated at 53mW. Bail honestly instead --
-                                // this is worth surfacing, not working around,
-                                // since a starting point already this far above
-                                // target usually means something upstream
-                                // changed (residual state from a previous point,
-                                // the PA behaving differently than expected at
-                                // this frequency) that's worth the person
-                                // actually looking into.
-                                if st.settle_timed_out {
-                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point still above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} right after settle phase timed out -- PA hadn't finished its boost-enable transient in time, not a genuinely unreachable target, skipping to the next frequency", st.vbias_mv);
-                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::NotSettled);
-                                } else {
-                                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point already read at or above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- no below-target point was ever established, bailing this (level,freq) rather than reporting a false success", st.vbias_mv);
-                                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
-                                }
-                                return Ok(false);
-                            };
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
-                                st.vbias_mv);
-                            // Pad the ceiling 25% beyond the exact overshoot
-                            // point, in the direction of more power (sign-aware
-                            // via `up`, so this works the same for both normal
-                            // and inverted boards) -- without this, Fine creep
-                            // is hard-bounded at the EXACT vbias_mv that
-                            // overshot during the coarse ramp, and a real run
-                            // showed that if the PA's response drifts (e.g.
-                            // thermal) between the coarse ramp's reading and
-                            // Fine creep's own approach, that same vbias_mv
-                            // sometimes no longer reaches target -- Fine creep
-                            // then walks all the way to this bound and still
-                            // falls short, bailing on a target that IS
-                            // reachable, just slightly further past where the
-                            // coarse ramp first saw it cross.
-                            //
-                            // 25% of the overshoot point's own value; falls
-                            // back to the current coarse step size if that
-                            // would be zero (an overshoot sitting exactly at
-                            // vbias_mv=0 would otherwise get no margin at all,
-                            // silently defeating this fix for exactly the
-                            // starting-point-adjacent case it's most likely to
-                            // matter for). Still clamped to (bound_lo,
-                            // bound_hi) -- this pads for drift, it doesn't
-                            // license exceeding the safe range.
-                            let margin_mv = {
-                                let m = st.vbias_mv.abs() * 25 / 100;
-                                if m == 0 { st.coarse_step_mv } else { m }
-                            };
-                            let padded_bound_mv = (st.vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)", st.vbias_mv);
-                            st.fine_bound_mv = Some(padded_bound_mv);
-                            st.vbias_mv = fine_start;
-                            st.phase = ScanPaPhase::Fine;
-                            st.wait = None;
-                            st.fine_started_at_secs = history.back().map(|e| e.0);
-                            st.fine_highest_avg_mw = None;
-                            st.fine_settle_until = Some(Instant::now() + FINE_SETTLE_DELAY);
-                            st.fine_started_instant = Some(Instant::now());
-                        } else {
-                            let next_step_mv = if avg_mw >= target_mw * 0.90 {
-                                let halved = (st.coarse_step_mv / 2).max(1);
-                                debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp within 10% of target ({avg_mw:.4}mW >= {:.4}mW) at vbias_mv={} -- halving step to {halved}mV",
-                                    target_mw * 0.90, st.vbias_mv);
-                                st.coarse_step_mv = halved;
-                                halved
-                            } else {
-                                st.coarse_step_mv
-                            };
-                            if !(bound_lo..=bound_hi).contains(&(st.vbias_mv + up * next_step_mv)) {
-                                // Ran off the end of the allowed range (DAC bound, or a hard limit
-                                // from a previous VTX power-loss on this level) without ever
-                                // overshooting -- bail this (level, freq) as best-effort.
-                                debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target -- bailing this (level,freq) as best-effort", st.vbias_mv);
-                                self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
-                                return Ok(false);
-                            }
-                            st.last_below_target_mv = Some(st.vbias_mv);
-                            st.vbias_mv += up * next_step_mv;
-                            st.coarse_steps_taken += 1;
-                            st.wait = None;
-                        }
-                    }
-                    ScanPaPhase::Fine => {
-                        // Fine's own ceiling combines the tight bound handed off
-                        // from CoarseRamp with the global safety bound, taking
-                        // whichever is reached first -- fine_bound_mv should
-                        // always be the tighter of the two in normal operation,
-                        // but a concurrently-set hard limit is still respected.
-                        let (fine_lo, fine_hi) = match st.fine_bound_mv {
-                            Some(b) if up > 0 => (bound_lo, bound_hi.min(b)),
-                            Some(b) => (bound_lo.max(b), bound_hi),
-                            None => (bound_lo, bound_hi),
-                        };
-                        if avg_mw >= target_mw {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at vbias_mv={} ({avg_mw:.4}mW)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Success);
-                            return Ok(false);
-                        } else if !(fine_lo..=fine_hi).contains(&(st.vbias_mv + up)) {
-                            debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{fine_lo},{fine_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
-                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
-                            return Ok(false);
-                        } else {
-                            st.vbias_mv += up;
-                            st.wait = None;
-                        }
-                    }
-                }
-
+                let start_vbias_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
+                let needs_settle = self.pa_enable_settle_pending;
+                let st = ScanPaState {
+                    phase: if needs_settle { ScanPaPhase::Settle } else { ScanPaPhase::CoarseRamp },
+                    vbias_mv: start_vbias_mv,
+                    wait: None,
+                    settle_started_instant: if needs_settle { Some(Instant::now()) } else { None },
+                    settle_timed_out: false,
+                    coarse_steps_taken: 0,
+                    last_below_target_mv: None,
+                    coarse_step_mv: COARSE_RAMP_STEP_MV,
+                    fine_bound_mv: None,
+                    fine_started_at_secs: None,
+                    fine_highest_avg_mw: None,
+                    fine_settle_until: None,
+                    fine_started_instant: None,
+                };
+                debug!(target: "vtx", "[sweep] level={level} freq={freq_mhz}MHz target={target_mw}mW: starting ScanPa ({}) from vbias_mv={start_vbias_mv} (sign_inverted={})",
+                    if needs_settle { "settle, then coarse ramp" } else { "coarse ramp" }, self.sign_inverted);
                 self.per_level_status.insert(
                     level,
                     LevelStatus::InProgress(format!(
-                        "{} / {} @ {freq_mhz}MHz vbias_mv={}",
+                        "{} / {} @ {freq_mhz}MHz",
                         SweepOp::ScanPa.label(),
-                        match st.phase {
-                            ScanPaPhase::Settle => "settling",
-                            ScanPaPhase::CoarseRamp => "coarse ramp",
-                            ScanPaPhase::Fine => "fine",
-                        },
-                        st.vbias_mv
+                        if needs_settle { "settling" } else { "coarse ramp" }
                     )),
                 );
-                self.step = Some(StepState::Pa(st));
+                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Current);
+                self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st)
+            }
+            AutomaticStep::ScanPa(st) => self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st),
+            AutomaticStep::ScanDetector(st) => self.tick_scan_detector(link, history, now_seq, throttled, level, freq_mhz, target_mw, st),
+        }
+    }
+
+    /// One tick of ScanPa (whichever of Settle/CoarseRamp/Fine is
+    /// active) -- see the module's own diagrams for the full internal
+    /// flow of each phase. Sends/resends as needed, evaluates once
+    /// enough fresh samples exist, and either steps within the current
+    /// phase, hands off to the next phase, or finishes via
+    /// finish_scan_pa() (success or failure -- see ScanPaOutcome).
+    fn tick_scan_pa(
+        &mut self,
+        link: &mut MspLink,
+        history: &VecDeque<(f64, f32)>,
+        now_seq: u64,
+        throttled: bool,
+        level: u8,
+        freq_mhz: u16,
+        target_mw: f32,
+        mut st: ScanPaState,
+    ) -> anyhow::Result<bool> {
+        // PA-enable settle gate -- applies to Settle, CoarseRamp,
+        // and Fine alike, since the PA can power up at the start
+        // of any of them (whichever phase happens to be running
+        // when the level/frequency's boost first turns on). See
+        // BOOST_ENABLE_SETTLE_DELAY's doc comment. Placed before
+        // `wait` is ever borrowed below, same reasoning as
+        // fine_settle_until's own placement.
+        if let Some(settle_until) = self.boost_settle_until {
+            if Instant::now() < settle_until {
+                st.wait = None;
+                let mut sent = false;
+                if !throttled {
+                    self.send_calibration(link, level, st.vbias_mv)?;
+                    self.last_send = Instant::now();
+                    sent = true;
+                }
+                self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
+                return Ok(sent);
+            }
+            self.boost_settle_until = None; // settled -- proceed normally from here on
+        }
+
+        if matches!(st.phase, ScanPaPhase::Fine) {
+            if let Some(started_at) = st.fine_started_at_secs {
+                if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
+                    // Still tracked during the grace period (so once it
+                    // ends we have a real peak to compare against, not a
+                    // fresh start with no history) -- only the ABORT
+                    // itself is suppressed while still within
+                    // PA_FAILURE_GRACE_DURATION of Fine creep beginning.
+                    let in_grace_period = st
+                        .fine_started_instant
+                        .map(|t| t.elapsed() < PA_FAILURE_GRACE_DURATION)
+                        .unwrap_or(false);
+                    match st.fine_highest_avg_mw {
+                        Some(peak) if !in_grace_period && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
+                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::PaFailure);
+                            return Ok(false);
+                        }
+                        Some(peak) => st.fine_highest_avg_mw = Some(peak.max(rolling)),
+                        None => st.fine_highest_avg_mw = Some(rolling),
+                    }
+                }
             }
 
-            StepState::Detector(mut st) => {
-                // PA-enable settle gate -- see the same check at the top
-                // of the Pa arm above for why this needs to cover
-                // ScanDetector too, not just ScanPa.
-                if let Some(settle_until) = self.boost_settle_until {
-                    if Instant::now() < settle_until {
-                        st.wait = None;
-                        let mut sent = false;
-                        if !throttled {
-                            self.send_calibration(link, level, st.vbias_mv)?;
-                            self.last_send = Instant::now();
-                            sent = true;
-                        }
-                        self.step = Some(StepState::Detector(st));
-                        return Ok(sent);
-                    }
-                    self.boost_settle_until = None; // settled -- proceed normally from here on
-                }
-
-                if st.wait.is_none() {
-                    let mut sent = false;
-                    if !throttled {
-                        self.send_calibration(link, level, st.vbias_mv)?;
-                        self.last_send = Instant::now();
-                        sent = true;
-                        let (needed, skip) = match st.phase {
-                            ScanDetectorPhase::Backoff => (1, 0),
-                            ScanDetectorPhase::Bracket => (20, 10),
-                        };
-                        st.wait = Some(SampleWait::new(now_seq, needed, skip));
-                    }
-                    self.step = Some(StepState::Detector(st));
-                    return Ok(sent);
-                }
-
-                let wait = st.wait.as_ref().unwrap();
-                if !wait.ready(now_seq) {
+            // 1-second DAC-settle delay right after the CoarseRamp->Fine
+            // handoff -- see FINE_SETTLE_DELAY's doc comment. Placed
+            // before `wait` is ever borrowed below, so resetting
+            // st.wait here can't run into any borrow-checker questions
+            // about a still-live reference into the same field.
+            if let Some(settle_until) = st.fine_settle_until {
+                if Instant::now() < settle_until {
+                    // Still settling -- discard any samples collected so
+                    // far (SampleWait's own gate is purely count-based,
+                    // so it can fill well before the VBIAS circuit has
+                    // physically caught up) and resend (throttled) so
+                    // the DAC value is definitely in flight, but don't
+                    // start counting toward the convergence check yet.
+                    st.wait = None;
                     let mut sent = false;
                     if !throttled {
                         self.send_calibration(link, level, st.vbias_mv)?;
                         self.last_send = Instant::now();
                         sent = true;
                     }
-                    self.step = Some(StepState::Detector(st));
+                    self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
                     return Ok(sent);
                 }
-
-                // Atomic-data gate: no decision below runs without a real
-                // VTX status reply that postdates the current vbias_mv --
-                // see last_reading's own doc comment. wait.ready() only
-                // means the METER has enough fresh samples; it says
-                // nothing about whether the VTX's own reported state has
-                // arrived yet, since the meter and the VTX are two
-                // independent, asynchronously-polled data sources.
-                let Some(reading) = st.last_reading else {
-                    let mut sent = false;
-                    if !throttled {
-                        self.send_calibration(link, level, st.vbias_mv)?;
-                        self.last_send = Instant::now();
-                        sent = true;
-                    }
-                    self.step = Some(StepState::Detector(st));
-                    return Ok(sent);
-                };
-
-                let avg_mw = wait.average(history);
-                let up = power_up_step(self.sign_inverted);
-                let (bound_lo, bound_hi) = self.effective_bounds(level);
-
-                debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={}", reading.vref_mv, reading.detector_mv);
-
-                match st.phase {
-                    ScanDetectorPhase::Backoff => {
-                        if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at vbias_mv={}, entering bracket search", reading.vref_mv);
-                            st.phase = ScanDetectorPhase::Bracket;
-                            st.wait = None;
-                            st.last_reading = None;
-                            st.pinned_count = 0;
-                        } else {
-                            let desired = st.vbias_mv - up;
-                            let clamped = desired.clamp(bound_lo, bound_hi);
-                            st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
-                            st.vbias_mv = clamped;
-                            st.wait = None;
-                            st.last_reading = None;
-                            if st.pinned_count >= PINNED_LIMIT {
-                                debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
-                                self.finish_scan_detector(level, reading.detector_mv, false);
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    ScanDetectorPhase::Bracket => {
-                        let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
-                        let desired = if avg_mw < target_mw - dev {
-                            st.vbias_mv + up * 2
-                        } else if avg_mw > target_mw + dev {
-                            st.vbias_mv - up * 2
-                        } else if avg_mw < target_mw {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
-                            st.below = Some((avg_mw, reading.detector_mv));
-                            st.vbias_mv + up
-                        } else {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
-                            st.above = Some((avg_mw, reading.detector_mv));
-                            st.vbias_mv - up
-                        };
-                        let clamped = desired.clamp(bound_lo, bound_hi);
-                        // The critical case this closes: with a hard limit active,
-                        // the target can be genuinely unreachable within the safe
-                        // range (confirmed by a real run: this got clamped at the
-                        // same bound for the whole rest of the scan, since the
-                        // reading was nowhere near target and never could be).
-                        // Without counting consecutive clamps, that has no exit
-                        // condition and spins forever.
-                        st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
-                        st.vbias_mv = clamped;
-                        st.wait = None;
-                        st.last_reading = None;
-
-                        if st.pinned_count >= PINNED_LIMIT {
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={} as a rough (not interpolated) fallback",
-                                st.pinned_count, reading.detector_mv);
-                            self.finish_scan_detector(level, reading.detector_mv, false);
-                            return Ok(false);
-                        }
-
-                        if let (Some(below), Some(above)) = (st.below, st.above) {
-                            let detector = interpolate(target_mw, below, above);
-                            debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
-                            self.finish_scan_detector(level, detector, true);
-                            return Ok(false);
-                        }
-                    }
-                }
-
-                self.per_level_status.insert(
-                    level,
-                    LevelStatus::InProgress(format!(
-                        "{} / {} @ {freq_mhz}MHz vbias_mv={}",
-                        SweepOp::ScanDetector.label(),
-                        match st.phase {
-                            ScanDetectorPhase::Backoff => "backoff",
-                            ScanDetectorPhase::Bracket => "bracket",
-                        },
-                        st.vbias_mv
-                    )),
-                );
-
-                self.step = Some(StepState::Detector(st));
+                st.fine_settle_until = None; // settled -- proceed normally from here on
             }
         }
 
+        if st.wait.is_none() {
+            let mut sent = false;
+            if !throttled {
+                self.send_calibration(link, level, st.vbias_mv)?;
+                self.last_send = Instant::now();
+                sent = true;
+                let (needed, skip) = match st.phase {
+                    ScanPaPhase::Fine | ScanPaPhase::CoarseRamp | ScanPaPhase::Settle => (4, 0),
+                };
+                st.wait = Some(SampleWait::new(now_seq, needed, skip));
+            }
+            self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
+            return Ok(sent);
+        }
+
+        let wait = st.wait.as_ref().unwrap();
+        if !wait.ready(now_seq) {
+            let mut sent = false;
+            if !throttled {
+                self.send_calibration(link, level, st.vbias_mv)?;
+                self.last_send = Instant::now();
+                sent = true;
+            }
+            self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
+            return Ok(sent);
+        }
+
+        let avg_mw = wait.average(history);
+        let up = power_up_step(self.sign_inverted);
+        let (bound_lo, bound_hi) = self.effective_bounds(level);
+        debug!(target: "vtx", "[sweep] ScanPa level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW", st.vbias_mv);
+
+        match st.phase {
+            ScanPaPhase::Settle => {
+                if avg_mw <= target_mw {
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) at or below target ({target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp", st.vbias_mv);
+                    st.phase = ScanPaPhase::CoarseRamp;
+                    st.settle_started_instant = None;
+                    st.wait = None;
+                    self.pa_enable_settle_pending = false;
+                } else if st
+                    .settle_started_instant
+                    .map(|t| t.elapsed() >= SETTLE_BELOW_TARGET_TIMEOUT)
+                    .unwrap_or(true)
+                {
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase timed out after {SETTLE_BELOW_TARGET_TIMEOUT:?} without reading at or below target ({avg_mw:.4}mW > {target_mw}mW) at vbias_mv={} -- proceeding to coarse ramp anyway (its own bailout logic is still the backstop)", st.vbias_mv);
+                    st.phase = ScanPaPhase::CoarseRamp;
+                    st.settle_started_instant = None;
+                    st.settle_timed_out = true;
+                    st.wait = None;
+                    self.pa_enable_settle_pending = false;
+                } else {
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: settle phase -- reading ({avg_mw:.4}mW) still above target ({target_mw}mW) at vbias_mv={}, waiting for it to decay", st.vbias_mv);
+                    st.wait = None; // take another fresh sample window at the same, unchanged vbias_mv
+                }
+            }
+            ScanPaPhase::CoarseRamp => {
+                // Always wait for a genuine, MEASURED overshoot
+                // (avg_mw >= target) before ever handing off to
+                // Fine -- never stop at a percentage-of-target
+                // threshold on the assumption it'll overshoot.
+                // Once within 10% of target, narrow in by
+                // halving the step size (floor 1mV) for each
+                // subsequent real coarse step, rather than
+                // continuing at the full 25mV and risking a
+                // large, unconfirmed overshoot -- but still
+                // actually TAKE and MEASURE that narrower step,
+                // same as any other coarse step, rather than
+                // computing where it would probably land and
+                // handing off on that guess.
+                if avg_mw >= target_mw {
+                    let Some(fine_start) = st.last_below_target_mv else {
+                        // The STARTING point itself already overshot --
+                        // no coarse step has ever confirmed a genuine
+                        // below-target point yet, so there's nothing to
+                        // bracket Fine creep against. Handing off anyway
+                        // would collapse fine_start and fine_bound_mv to
+                        // this same vbias_mv, and Fine would trivially
+                        // "converge" on its very first sample at
+                        // whatever this overshoot value is -- reporting
+                        // success at a value that was never actually
+                        // approached from below or searched for at all.
+                        // A real run showed exactly this: the coarse
+                        // ramp's starting point read 58mW against a
+                        // 10mW target, and the point got marked
+                        // Calibrated at 53mW. Bail honestly instead --
+                        // this is worth surfacing, not working around,
+                        // since a starting point already this far above
+                        // target usually means something upstream
+                        // changed (residual state from a previous point,
+                        // the PA behaving differently than expected at
+                        // this frequency) that's worth the person
+                        // actually looking into.
+                        if st.settle_timed_out {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point still above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} right after settle phase timed out -- PA hadn't finished its boost-enable transient in time, not a genuinely unreachable target, skipping to the next frequency", st.vbias_mv);
+                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::NotSettled);
+                        } else {
+                            debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point already read at or above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- no below-target point was ever established, bailing this (level,freq) rather than reporting a false success", st.vbias_mv);
+                            self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
+                        }
+                        return Ok(false);
+                    };
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
+                        st.vbias_mv);
+                    // Pad the ceiling 25% beyond the exact overshoot
+                    // point, in the direction of more power (sign-aware
+                    // via `up`, so this works the same for both normal
+                    // and inverted boards) -- without this, Fine creep
+                    // is hard-bounded at the EXACT vbias_mv that
+                    // overshot during the coarse ramp, and a real run
+                    // showed that if the PA's response drifts (e.g.
+                    // thermal) between the coarse ramp's reading and
+                    // Fine creep's own approach, that same vbias_mv
+                    // sometimes no longer reaches target -- Fine creep
+                    // then walks all the way to this bound and still
+                    // falls short, bailing on a target that IS
+                    // reachable, just slightly further past where the
+                    // coarse ramp first saw it cross.
+                    //
+                    // 25% of the overshoot point's own value; falls
+                    // back to the current coarse step size if that
+                    // would be zero (an overshoot sitting exactly at
+                    // vbias_mv=0 would otherwise get no margin at all,
+                    // silently defeating this fix for exactly the
+                    // starting-point-adjacent case it's most likely to
+                    // matter for). Still clamped to (bound_lo,
+                    // bound_hi) -- this pads for drift, it doesn't
+                    // license exceeding the safe range.
+                    let margin_mv = {
+                        let m = st.vbias_mv.abs() * 25 / 100;
+                        if m == 0 { st.coarse_step_mv } else { m }
+                    };
+                    let padded_bound_mv = (st.vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)", st.vbias_mv);
+                    st.fine_bound_mv = Some(padded_bound_mv);
+                    st.vbias_mv = fine_start;
+                    st.phase = ScanPaPhase::Fine;
+                    st.wait = None;
+                    st.fine_started_at_secs = history.back().map(|e| e.0);
+                    st.fine_highest_avg_mw = None;
+                    st.fine_settle_until = Some(Instant::now() + FINE_SETTLE_DELAY);
+                    st.fine_started_instant = Some(Instant::now());
+                } else {
+                    let next_step_mv = if avg_mw >= target_mw * 0.90 {
+                        let halved = (st.coarse_step_mv / 2).max(1);
+                        debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp within 10% of target ({avg_mw:.4}mW >= {:.4}mW) at vbias_mv={} -- halving step to {halved}mV",
+                            target_mw * 0.90, st.vbias_mv);
+                        st.coarse_step_mv = halved;
+                        halved
+                    } else {
+                        st.coarse_step_mv
+                    };
+                    if !(bound_lo..=bound_hi).contains(&(st.vbias_mv + up * next_step_mv)) {
+                        // Ran off the end of the allowed range (DAC bound, or a hard limit
+                        // from a previous VTX power-loss on this level) without ever
+                        // overshooting -- bail this (level, freq) as best-effort.
+                        debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp hit bound [{bound_lo},{bound_hi}] at vbias_mv={} without reaching target -- bailing this (level,freq) as best-effort", st.vbias_mv);
+                        self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
+                        return Ok(false);
+                    }
+                    st.last_below_target_mv = Some(st.vbias_mv);
+                    st.vbias_mv += up * next_step_mv;
+                    st.coarse_steps_taken += 1;
+                    st.wait = None;
+                }
+            }
+            ScanPaPhase::Fine => {
+                // Fine's own ceiling combines the tight bound handed off
+                // from CoarseRamp with the global safety bound, taking
+                // whichever is reached first -- fine_bound_mv should
+                // always be the tighter of the two in normal operation,
+                // but a concurrently-set hard limit is still respected.
+                let (fine_lo, fine_hi) = match st.fine_bound_mv {
+                    Some(b) if up > 0 => (bound_lo, bound_hi.min(b)),
+                    Some(b) => (bound_lo.max(b), bound_hi),
+                    None => (bound_lo, bound_hi),
+                };
+                if avg_mw >= target_mw {
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep converged at vbias_mv={} ({avg_mw:.4}mW)", st.vbias_mv);
+                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Success);
+                    return Ok(false);
+                } else if !(fine_lo..=fine_hi).contains(&(st.vbias_mv + up)) {
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep hit bound [{fine_lo},{fine_hi}] at vbias_mv={} without reaching target ({avg_mw:.4}mW < {target_mw}mW) -- bailing this (level,freq)", st.vbias_mv);
+                    self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
+                    return Ok(false);
+                } else {
+                    st.vbias_mv += up;
+                    st.wait = None;
+                }
+            }
+        }
+
+        self.per_level_status.insert(
+            level,
+            LevelStatus::InProgress(format!(
+                "{} / {} @ {freq_mhz}MHz vbias_mv={}",
+                SweepOp::ScanPa.label(),
+                match st.phase {
+                    ScanPaPhase::Settle => "settling",
+                    ScanPaPhase::CoarseRamp => "coarse ramp",
+                    ScanPaPhase::Fine => "fine",
+                },
+                st.vbias_mv
+            )),
+        );
+        self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
+        Ok(false)
+    }
+
+    /// One tick of ScanDetector (Backoff or Bracket) -- see the
+    /// module's own diagrams for the full internal flow. Same
+    /// send/wait/evaluate shape as tick_scan_pa(), plus an extra atomic-
+    /// data gate: no decision here runs without a real VTX status reply
+    /// that postdates the current vbias_mv (see ScanDetectorState's own
+    /// last_reading doc comment).
+    fn tick_scan_detector(
+        &mut self,
+        link: &mut MspLink,
+        history: &VecDeque<(f64, f32)>,
+        now_seq: u64,
+        throttled: bool,
+        level: u8,
+        freq_mhz: u16,
+        target_mw: f32,
+        mut st: ScanDetectorState,
+    ) -> anyhow::Result<bool> {
+        // PA-enable settle gate -- see the same check at the top
+        // of tick_scan_pa() for why this needs to cover
+        // ScanDetector too, not just ScanPa.
+        if let Some(settle_until) = self.boost_settle_until {
+            if Instant::now() < settle_until {
+                st.wait = None;
+                let mut sent = false;
+                if !throttled {
+                    self.send_calibration(link, level, st.vbias_mv)?;
+                    self.last_send = Instant::now();
+                    sent = true;
+                }
+                self.state = EngineState::Automatic(AutomaticStep::ScanDetector(st));
+                return Ok(sent);
+            }
+            self.boost_settle_until = None; // settled -- proceed normally from here on
+        }
+
+        if st.wait.is_none() {
+            let mut sent = false;
+            if !throttled {
+                self.send_calibration(link, level, st.vbias_mv)?;
+                self.last_send = Instant::now();
+                sent = true;
+                let (needed, skip) = match st.phase {
+                    ScanDetectorPhase::Backoff => (1, 0),
+                    ScanDetectorPhase::Bracket => (20, 10),
+                };
+                st.wait = Some(SampleWait::new(now_seq, needed, skip));
+            }
+            self.state = EngineState::Automatic(AutomaticStep::ScanDetector(st));
+            return Ok(sent);
+        }
+
+        let wait = st.wait.as_ref().unwrap();
+        if !wait.ready(now_seq) {
+            let mut sent = false;
+            if !throttled {
+                self.send_calibration(link, level, st.vbias_mv)?;
+                self.last_send = Instant::now();
+                sent = true;
+            }
+            self.state = EngineState::Automatic(AutomaticStep::ScanDetector(st));
+            return Ok(sent);
+        }
+
+        // Atomic-data gate: no decision below runs without a real
+        // VTX status reply that postdates the current vbias_mv --
+        // see last_reading's own doc comment. wait.ready() only
+        // means the METER has enough fresh samples; it says
+        // nothing about whether the VTX's own reported state has
+        // arrived yet, since the meter and the VTX are two
+        // independent, asynchronously-polled data sources.
+        let Some(reading) = st.last_reading else {
+            let mut sent = false;
+            if !throttled {
+                self.send_calibration(link, level, st.vbias_mv)?;
+                self.last_send = Instant::now();
+                sent = true;
+            }
+            self.state = EngineState::Automatic(AutomaticStep::ScanDetector(st));
+            return Ok(sent);
+        };
+
+        let avg_mw = wait.average(history);
+        let up = power_up_step(self.sign_inverted);
+        let (bound_lo, bound_hi) = self.effective_bounds(level);
+
+        debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz vbias_mv={} avg={avg_mw:.4}mW target={target_mw}mW detector={}", reading.vref_mv, reading.detector_mv);
+
+        match st.phase {
+            ScanDetectorPhase::Backoff => {
+                if avg_mw < target_mw {
+                    debug!(target: "vtx", "[sweep] ScanDetector level={level}: backoff crossed below target at vbias_mv={}, entering bracket search", reading.vref_mv);
+                    st.phase = ScanDetectorPhase::Bracket;
+                    st.wait = None;
+                    st.last_reading = None;
+                    st.pinned_count = 0;
+                } else {
+                    let desired = st.vbias_mv - up;
+                    let clamped = desired.clamp(bound_lo, bound_hi);
+                    st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                    st.vbias_mv = clamped;
+                    st.wait = None;
+                    st.last_reading = None;
+                    if st.pinned_count >= PINNED_LIMIT {
+                        debug!(target: "vtx", "[sweep] ScanDetector level={level}: pinned at bound [{bound_lo},{bound_hi}] during backoff without crossing below target -- bailing this (level,freq)");
+                        self.finish_scan_detector(level, reading.detector_mv, false);
+                        return Ok(false);
+                    }
+                }
+            }
+            ScanDetectorPhase::Bracket => {
+                let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
+                let desired = if avg_mw < target_mw - dev {
+                    st.vbias_mv + up * 2
+                } else if avg_mw > target_mw + dev {
+                    st.vbias_mv - up * 2
+                } else if avg_mw < target_mw {
+                    debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
+                    st.below = Some((avg_mw, reading.detector_mv));
+                    st.vbias_mv + up
+                } else {
+                    debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
+                    st.above = Some((avg_mw, reading.detector_mv));
+                    st.vbias_mv - up
+                };
+                let clamped = desired.clamp(bound_lo, bound_hi);
+                // The critical case this closes: with a hard limit active,
+                // the target can be genuinely unreachable within the safe
+                // range (confirmed by a real run: this got clamped at the
+                // same bound for the whole rest of the scan, since the
+                // reading was nowhere near target and never could be).
+                // Without counting consecutive clamps, that has no exit
+                // condition and spins forever.
+                st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                st.vbias_mv = clamped;
+                st.wait = None;
+                st.last_reading = None;
+
+                if st.pinned_count >= PINNED_LIMIT {
+                    debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={} as a rough (not interpolated) fallback",
+                            st.pinned_count, reading.detector_mv);
+                    self.finish_scan_detector(level, reading.detector_mv, false);
+                    return Ok(false);
+                }
+
+                if let (Some(below), Some(above)) = (st.below, st.above) {
+                    let detector = interpolate(target_mw, below, above);
+                    debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
+                    self.finish_scan_detector(level, detector, true);
+                    return Ok(false);
+                }
+            }
+        }
+
+        self.per_level_status.insert(
+            level,
+            LevelStatus::InProgress(format!(
+                "{} / {} @ {freq_mhz}MHz vbias_mv={}",
+                SweepOp::ScanDetector.label(),
+                match st.phase {
+                    ScanDetectorPhase::Backoff => "backoff",
+                    ScanDetectorPhase::Bracket => "bracket",
+                },
+                st.vbias_mv
+            )),
+        );
+
+        self.state = EngineState::Automatic(AutomaticStep::ScanDetector(st));
         Ok(false)
     }
 
@@ -1872,9 +1978,8 @@ impl SweepEngine {
     /// rather than a static placeholder. Returns (0.0, "") when nothing
     /// is in progress.
     pub fn sub_progress(&self) -> (f32, &'static str) {
-        match &self.step {
-            None => (0.0, ""),
-            Some(StepState::Pa(st)) => match st.phase {
+        match &self.state {
+            EngineState::Automatic(AutomaticStep::ScanPa(st)) => match st.phase {
                 ScanPaPhase::Settle => (0.0, "ScanPa: settling"),
                 ScanPaPhase::CoarseRamp => {
                     let up = power_up_step(self.sign_inverted);
@@ -1890,7 +1995,7 @@ impl SweepEngine {
                 }
                 ScanPaPhase::Fine => (0.8, "ScanPa: fine creep"),
             },
-            Some(StepState::Detector(st)) => match st.phase {
+            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => match st.phase {
                 ScanDetectorPhase::Backoff => (0.20, "ScanDetector: backoff"),
                 ScanDetectorPhase::Bracket => {
                     // A little extra resolution within Bracket: having
@@ -1903,40 +2008,41 @@ impl SweepEngine {
                     (0.45 + extra, "ScanDetector: bracket search")
                 }
             },
+            _ => (0.0, ""),
         }
     }
 
     pub fn current_step(&self) -> Option<CurrentStep> {
         let level = self.levels.get(self.level_idx).copied()?;
-        if matches!(self.state, EngineState::ManualActive) {
-            // Manual mode never uses StepState -- report the slider's
+        if matches!(&self.state, EngineState::Manual) {
+            // Manual mode never uses AutomaticStep -- report the slider's
             // live value directly instead. Detector isn't reported here;
             // the VTX Status panel's own live detector_mv already covers
             // that (Manual mode doesn't run its own search against it).
             return Some(CurrentStep { level, freq_idx: self.freq_idx, vbias_mv: Some(self.manual_dac_mv), detector_mv: None });
         }
-        match &self.step {
-            Some(StepState::Pa(st)) => Some(CurrentStep {
+        match &self.state {
+            EngineState::Automatic(AutomaticStep::ScanPa(st)) => Some(CurrentStep {
                 level,
                 freq_idx: self.freq_idx,
                 vbias_mv: Some(st.vbias_mv),
                 detector_mv: None,
             }),
-            Some(StepState::Detector(st)) => Some(CurrentStep {
+            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => Some(CurrentStep {
                 level,
                 freq_idx: self.freq_idx,
                 vbias_mv: None,
                 detector_mv: st.last_reading.map(|r| r.detector_mv as i32),
             }),
-            None => None,
+            _ => None,
         }
     }
 
     /// Diagnostic snapshot of the engine's internal ScanPa/ScanDetector
     /// step state, for the UI's debug indicators under the progress bar.
     pub fn debug_state(&self) -> StepDebugInfo {
-        match &self.step {
-            Some(StepState::Pa(st)) => {
+        match &self.state {
+            EngineState::Automatic(AutomaticStep::ScanPa(st)) => {
                 let scan_phase = match st.phase {
                     ScanPaPhase::Settle => "Settle",
                     ScanPaPhase::CoarseRamp => "Coarse",
@@ -1955,7 +2061,7 @@ impl SweepEngine {
                     detector: None,
                 }
             }
-            Some(StepState::Detector(st)) => StepDebugInfo {
+            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => StepDebugInfo {
                 scan_phase: "Inactive",
                 drop_detector_active: false,
                 fine_bound_mv: None,
@@ -1970,7 +2076,7 @@ impl SweepEngine {
                     pinned_count: st.pinned_count,
                 }),
             },
-            None => StepDebugInfo {
+            _ => StepDebugInfo {
                 scan_phase: "Inactive",
                 drop_detector_active: false,
                 fine_bound_mv: None,
@@ -2008,38 +2114,42 @@ impl SweepEngine {
     /// necessary if it did (a reboot needs retuning and level reselection
     /// from scratch).
     fn auto_resume(&mut self, level: u8, freq_mhz: u16, vbias_mv_at_loss: i32, reason: ConnectionLossReason) {
-        debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz manual={}",
-            self.in_manual_mode);
+        let resume = match &self.state {
+            EngineState::ConnectionLost { resume, .. } => *resume,
+            _ => ResumeMode::Automatic, // shouldn't happen -- called only from the ConnectionLost arm
+        };
+        debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz resume={resume:?}");
         if matches!(reason, ConnectionLossReason::Vtx | ConnectionLossReason::Both) {
             let up = power_up_step(self.sign_inverted);
             let safe_vbias_mv = (vbias_mv_at_loss - up * HEARTBEAT_BACKOFF_MV).clamp(0, 3300);
             self.hard_limits.insert(level, safe_vbias_mv);
             debug!(target: "vtx", "[sweep] hard limit set to {safe_vbias_mv}mV (backed off {HEARTBEAT_BACKOFF_MV}mV from trip point {vbias_mv_at_loss}mV)");
-            match &mut self.step {
-                Some(StepState::Pa(st)) => {
-                    st.vbias_mv = safe_vbias_mv;
-                    st.wait = None;
+            match resume {
+                ResumeMode::Manual => {
+                    // Same backed-off value the slider will show on resume --
+                    // the person can always push it back up manually, but
+                    // resuming AT the value that just caused a trip would be
+                    // exactly the wrong default.
+                    self.manual_dac_mv = safe_vbias_mv;
+                    self.manual_send_pending = true;
                 }
-                Some(StepState::Detector(st)) => {
-                    st.vbias_mv = safe_vbias_mv;
-                    st.wait = None;
-                    st.last_reading = None;
-                }
-                None => {}
-            }
-            if self.in_manual_mode {
-                // Same backed-off value the slider will show on resume --
-                // the person can always push it back up manually, but
-                // resuming AT the value that just caused a trip would be
-                // exactly the wrong default.
-                self.manual_dac_mv = safe_vbias_mv;
-                self.manual_send_pending = true;
+                ResumeMode::Automatic => {}
             }
         } else {
             debug!(target: "vtx", "[sweep] meter-only dropout -- resuming without changing mV or setting a hard limit");
         }
         self.unresponsive_since = None;
-        self.state = if self.in_manual_mode { EngineState::ManualActive } else { EngineState::Running };
+        self.state = match resume {
+            ResumeMode::Automatic => {
+                // Whatever ScanPa/ScanDetector state was active when the
+                // connection dropped is gone (ConnectionLost carried none
+                // of it) -- resuming re-enters this (level, freq) fresh,
+                // same as any other point, rather than trying to
+                // reconstruct exactly where the search was.
+                EngineState::Automatic(AutomaticStep::EnteringPoint)
+            }
+            ResumeMode::Manual => EngineState::Manual,
+        };
         self.pending_frequency_push = Some(freq_mhz);
     }
 
@@ -2047,36 +2157,39 @@ impl SweepEngine {
     /// reach: a hard I/O error on the VTX link drops it to None in
     /// worker.rs, and poll() is only ever called with a live
     /// `&mut MspLink` -- so without this, the engine's state would just
-    /// freeze at Running forever (poll() never called again to notice
+    /// freeze at Automatic forever (poll() never called again to notice
     /// anything), never surfacing the "Connection error" dialog for a
     /// scenario that's just as real as the heartbeat-timeout one poll()
-    /// does catch. Only meaningful while actively Running (silently a
-    /// no-op otherwise -- e.g. already paused, or not sweeping at all).
+    /// does catch. Only meaningful while actively Automatic (silently a
+    /// no-op otherwise -- e.g. already paused, Manual mode, or not
+    /// sweeping at all) -- preserved exactly as before this refactor;
+    /// Manual mode never called this, which may be worth a separate look
+    /// but isn't something this restructuring changes.
     pub fn force_connection_lost(&mut self, reason: ConnectionLossReason) {
-        if !matches!(self.state, EngineState::Running) {
+        if !matches!(&self.state, EngineState::Automatic(_)) {
             return;
         }
-        let vbias_mv_at_loss = match &self.step {
-            Some(StepState::Pa(st)) => st.vbias_mv,
-            Some(StepState::Detector(st)) => st.vbias_mv,
-            None => 0,
+        let vbias_mv_at_loss = match &self.state {
+            EngineState::Automatic(AutomaticStep::ScanPa(st)) => st.vbias_mv,
+            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => st.vbias_mv,
+            _ => 0,
         };
         let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
         let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(0);
         debug!(target: "vtx", "[sweep] connection forcibly lost ({reason:?}): level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_at_loss}");
         if !matches!(reason, ConnectionLossReason::Meter) {
-            match &self.step {
-                Some(StepState::Pa(_)) => {
+            match &self.state {
+                EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
                     Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
                 }
-                Some(StepState::Detector(_)) => {
+                EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
                     Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
                 }
-                None => {}
+                _ => {}
             }
         }
         self.unresponsive_since = None;
-        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason };
+        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, resume: ResumeMode::Automatic };
     }
 
     /// Discards any hard limits discovered so far -- called when the PA
@@ -2107,20 +2220,21 @@ impl SweepEngine {
         map.insert(key, status);
     }
 
-    /// Shared heartbeat tracking for both automatic (poll()) and Manual
-    /// (poll_manual()) modes -- if the VTX and/or meter have been silent
-    /// for longer than HEARTBEAT_TIMEOUT, transitions to ConnectionLost.
-    /// Manual mode gets the exact same "Connection error" dialog and
-    /// auto-resume behavior automatic mode already has (see
-    /// auto_resume(), which resumes back into whichever mode was active
-    /// when the trip happened) -- the person needs to know their PA just
-    /// went quiet regardless of which mode was driving it.
-    /// `vbias_mv_now` is whatever DAC value was in play when this is
-    /// called (automatic mode reads it from the active step, Manual mode
-    /// from manual_dac_mv) -- captured as evidence a hard limit may sit
-    /// near this value if the VTX itself is what went quiet. Returns
-    /// true if it just transitioned to ConnectionLost this call (the
-    /// caller should do nothing else this tick).
+    /// Shared heartbeat tracking for both automatic (poll_automatic())
+    /// and Manual (poll_manual()) modes -- if the VTX and/or meter have
+    /// been silent for longer than HEARTBEAT_TIMEOUT, transitions to
+    /// ConnectionLost. Manual mode gets the exact same "Connection
+    /// error" dialog and auto-resume behavior automatic mode already has
+    /// (see auto_resume(), which resumes back into whichever mode was
+    /// active when the trip happened, via the `resume` this stores) --
+    /// the person needs to know their PA just went quiet regardless of
+    /// which mode was driving it. `vbias_mv_now` is whatever DAC value
+    /// was in play when this is called (automatic mode reads it from
+    /// the active step, Manual mode from manual_dac_mv) -- captured as
+    /// evidence a hard limit may sit near this value if the VTX itself
+    /// is what went quiet. Returns true if it just transitioned to
+    /// ConnectionLost this call (the caller should do nothing else this
+    /// tick).
     fn maybe_trip_connection_lost(&mut self, vtx_ready: bool, meter_ready: bool, vbias_mv_now: i32) -> bool {
         if vtx_ready && meter_ready {
             self.unresponsive_since = None;
@@ -2138,39 +2252,41 @@ impl SweepEngine {
             (true, false) => ConnectionLossReason::Meter,
             (true, true) => unreachable!("only reached when at least one is false"),
         };
-        debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_now}, manual={})",
-            since.elapsed(), self.in_manual_mode);
+        let resume = if matches!(&self.state, EngineState::Manual) { ResumeMode::Manual } else { ResumeMode::Automatic };
+        debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_now}, resume={resume:?})",
+            since.elapsed());
         // Only mark the cell as the trip point (red, sticky) when the VTX
         // itself was actually involved -- a pure meter dropout says
         // nothing about whether this mV value was dangerous, so marking
         // it here would be misleading.
         if !matches!(reason, ConnectionLossReason::Meter) {
-            if matches!(self.state, EngineState::ManualActive) {
+            if matches!(&self.state, EngineState::Manual) {
                 Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
             } else {
-                match &self.step {
-                    Some(StepState::Pa(_)) => {
+                match &self.state {
+                    EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
                         Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
                     }
-                    Some(StepState::Detector(_)) => {
+                    EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
                         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
                     }
-                    None => {}
+                    _ => {}
                 }
             }
         }
-        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss: vbias_mv_now, reason };
+        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss: vbias_mv_now, reason, resume };
         true
     }
 
-    /// poll()'s dispatch target while ManualActive. Sends manual_dac_mv
-    /// if it's changed since the last send, throttled by SEND_INTERVAL
-    /// the same way every other send in this file is. Deliberately does
-    /// NOT clamp to effective_bounds() the way send_calibration() does
-    /// for automatic mode -- Manual mode is meant to reach the DAC's
-    /// full raw range, not the same safety-narrowed bounds automatic
-    /// searches respect. Heartbeat/ConnectionLost tracking is the same
-    /// as automatic mode's own (see maybe_trip_connection_lost).
+    /// poll_dispatch()'s target while EngineState::Manual. Sends
+    /// manual_dac_mv if it's changed since the last send, throttled by
+    /// SEND_INTERVAL the same way every other send in this file is.
+    /// Deliberately does NOT clamp to effective_bounds() the way
+    /// send_calibration() does for automatic mode -- Manual mode is
+    /// meant to reach the DAC's full raw range, not the same safety-
+    /// narrowed bounds automatic searches respect. Heartbeat/
+    /// ConnectionLost tracking is the same as automatic mode's own (see
+    /// maybe_trip_connection_lost).
     fn poll_manual(&mut self, link: &mut MspLink, vtx_ready: bool, meter_ready: bool) -> anyhow::Result<bool> {
         if !link.can_send_now() {
             return Ok(false);
@@ -2179,9 +2295,11 @@ impl SweepEngine {
             return Ok(false);
         }
         // Frequency changes take priority over the regular per-step DAC
-        // send, same as poll_inner()'s own handling for automatic mode --
-        // see this function's own doc comment for why this check has to
-        // be here at all.
+        // send, same as poll_automatic()'s own handling -- start_manual()
+        // and advance_position() both call begin_frequency() correctly,
+        // which sets pending_frequency_push (and, for Manual/ManualBand
+        // meters, routes through AwaitingFreqConfirm first); this is what
+        // actually issues the VTX_CONFIG retune once that's ready.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
             let payload = build_vtx_config_frequency_payload(freq_mhz, level);
@@ -2212,6 +2330,12 @@ impl SweepEngine {
         Ok(())
     }
 
+    /// Why a ScanPa step ended -- see ScanPaOutcome. Records the result,
+    /// sets cell status, and either hands off to ScanDetector (Success)
+    /// or skips it entirely and advances past this point (PaFailure,
+    /// NotSettled) or advances past it after still recording the
+    /// attempt (Uncalibrated is handled the same way as PaFailure/
+    /// NotSettled here -- see below).
     fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, outcome: ScanPaOutcome) {
         self.completed_steps += 1;
         let success = matches!(outcome, ScanPaOutcome::Success);
@@ -2252,13 +2376,19 @@ impl SweepEngine {
             let level_status = if not_settled { LevelStatus::NotSettled } else { LevelStatus::PaFailure };
             Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), cell_status);
             self.completed_steps += 1;
-            self.step = None;
-            self.level_idx += 1;
             self.per_level_status.insert(level, level_status);
+            self.advance_position();
             return;
         }
 
-        // ScanDetector runs immediately after ScanPa for the same (level, freq).
+        // ScanDetector runs immediately after ScanPa for the same (level,
+        // freq) -- including on ScanPaOutcome::Uncalibrated (success ==
+        // false but neither pa_failure nor not_settled): the search
+        // still produced a vbias_mv, it just never confirmed it reaches
+        // target, so ScanDetector still runs against it (see
+        // ScanPaOutcome::Uncalibrated's own doc comment -- "the failure
+        // is about vbias, not about whether the PA responds usably at
+        // all").
         // Starting point is a small step toward LESS power from the just-found
         // calibration value (matches the original script's intent: start
         // slightly on the safe side before searching for where the reading
@@ -2273,7 +2403,7 @@ impl SweepEngine {
         let (bound_lo, bound_hi) = self.effective_bounds(level);
         let detector_start_vbias_mv = (vbias_mv - up * 5).clamp(bound_lo, bound_hi);
         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Current);
-        self.step = Some(StepState::Detector(ScanDetectorState {
+        self.state = EngineState::Automatic(AutomaticStep::ScanDetector(ScanDetectorState {
             phase: ScanDetectorPhase::Backoff,
             vbias_mv: detector_start_vbias_mv,
             wait: None,
@@ -2300,9 +2430,8 @@ impl SweepEngine {
             (level, self.freq_idx),
             if success { CellStatus::Calibrated } else { CellStatus::Uncalibrated },
         );
-        self.step = None;
-        self.level_idx += 1;
         self.per_level_status.insert(level, LevelStatus::Done);
+        self.advance_position();
     }
 }
 
