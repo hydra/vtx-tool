@@ -697,15 +697,15 @@ pub fn spawn(
                     Command::AbortSweep => {
                         // No direct sends here anymore -- only the engine sends
                         // commands (see pending_sends' doc comment on
-                        // SweepEngine). This computes the payload (it needs
-                        // vtx_table, which the engine doesn't own) and hands it
-                        // to abort(), which queues it -- and a session-end right
-                        // behind it -- for poll()'s own next eligible tick to
-                        // actually issue, through the exact same
+                        // SweepEngine). abort() computes its own pitmode-forced
+                        // payload internally now, from the engine's own current
+                        // (level, freq) -- see its own doc comment for why this
+                        // no longer goes through vtx_table -- and queues it (plus
+                        // a session-end right behind it) for poll()'s own next
+                        // eligible tick to actually issue, through the exact same
                         // link.can_send_now() gate as every other send.
-                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
                         if let Some(engine) = sweep.lock().unwrap().as_mut() {
-                            engine.abort(payload);
+                            engine.abort();
                         }
                         let mut s = state.lock().unwrap();
                         if let Some(prev) = s.pre_sweep_update_hz.take() {
@@ -714,9 +714,11 @@ pub fn spawn(
                     }
                     Command::SkipCurrent => {
                         // No direct send here anymore -- only the engine sends
-                        // commands. skip_current() queues the safe-state push
-                        // (this computes the payload, since the engine doesn't
-                        // own vtx_table) for poll()'s own next eligible tick to
+                        // commands. skip_current() computes its own pitmode-
+                        // forced payload internally now, from the engine's own
+                        // current (level, freq) -- see its own doc comment for
+                        // why this no longer goes through vtx_table -- and
+                        // queues it for poll()'s own next eligible tick to
                         // issue, same gated mechanism as every other send in
                         // this file -- so it's structurally impossible for this
                         // to land ahead of, or without, the settle window a
@@ -724,31 +726,9 @@ pub fn spawn(
                         // sent directly: a VTX_CONFIG push landing immediately,
                         // with no wait, before the settle gate the engine itself
                         // was tracking ever got a say).
-                        //
-                        // Built from the sweep's own current frequency (queried
-                        // BEFORE skip_current() advances it), not vtx_table --
-                        // vtx_table is the Frequency panel's own, unrelated
-                        // setting (whatever it was at connect time), and using
-                        // it here meant every Skip briefly retuned the VTX away
-                        // to that frequency before the sweep's own next-point
-                        // retune arrived. Since pending_sends is always
-                        // processed before the engine's normal step logic, that
-                        // stale retune always won the race -- from the outside
-                        // it looked like Skip was permanently resetting the
-                        // frequency, not just transiently visiting the wrong
-                        // one on the way to the right one.
-                        let current_freq_mhz = sweep
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|engine| engine.current_frequency_mhz());
-                        let payload = match current_freq_mhz {
-                            Some(freq_mhz) => calibration_engine::safe_state_payload_at_frequency(&vtx_table.lock().unwrap(), freq_mhz),
-                            None => calibration_engine::safe_state_payload(&vtx_table.lock().unwrap()),
-                        };
                         let next_pos = {
                             let mut guard = sweep.lock().unwrap();
-                            guard.as_mut().and_then(|engine| engine.skip_current(payload))
+                            guard.as_mut().and_then(|engine| engine.skip_current())
                         };
                         // Only Some() when Manual mode's own skip advanced the
                         // position -- reseed the slider from the new cell's

@@ -992,12 +992,26 @@ impl SweepEngine {
             EngineState::Manual => ResumeMode::Manual,
             _ => ResumeMode::Automatic,
         };
+        // Captured before either index moves -- this is the point that
+        // just finished, which is what a safe-state push (if this turns
+        // out to be the last point) needs to preserve. See
+        // safe_state_payload_at_current_point()'s own doc comment.
+        let safe_state_payload = self.safe_state_payload_at_current_point();
         self.level_idx += 1;
         if self.level_idx >= self.levels.len() {
             self.level_idx = 0;
             self.freq_idx += 1;
             if self.freq_idx >= self.frequencies.len() {
                 debug!(target: "vtx", "[sweep] all frequencies complete");
+                // Force pitmode on at the last-used frequency -- without
+                // this, a sweep/manual session that runs all the way to
+                // completion (as opposed to being Abort-ed) left the VTX
+                // live, PA on, at whatever the last point happened to
+                // be. session_active/boost_mode below only affect the
+                // firmware's OWN closed-loop behavior; they don't touch
+                // pitmode at all, which lives on a completely separate
+                // VTX_CONFIG field.
+                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
                 self.state = EngineState::Idle;
                 self.session_active = false;
                 self.boost_mode = BoostMode::Auto;
@@ -1021,15 +1035,20 @@ impl SweepEngine {
     /// Exits Manual mode via the "Manual" button pressed a second time.
     /// The current, not-yet-confirmed point is left exactly as it was --
     /// no result written, no cell status touched -- matching "Next"
-    /// being the only thing that commits a point.
+    /// being the only thing that commits a point. Forces pitmode on at
+    /// the last-used frequency (see safe_state_payload_at_current_point()'s
+    /// own doc comment) -- this is also a way calibration ends, same as
+    /// abort() and advance_position()'s own completion branch.
     pub fn exit_manual(&mut self) {
         debug!(target: "vtx", "[sweep] manual mode exited at level={:?} freq_idx={}",
             self.levels.get(self.level_idx), self.freq_idx);
+        let safe_state_payload = self.safe_state_payload_at_current_point();
         self.state = EngineState::Idle;
         self.pending_frequency_push = None;
         self.manual_send_pending = false;
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
+        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
         self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
@@ -1122,18 +1141,21 @@ impl SweepEngine {
         }
     }
 
-    /// Begins a safe-state abort. `safe_state_payload` is a pitmode-
-    /// forced VTX_CONFIG payload the caller (worker.rs, which owns
-    /// vtx_table) computed -- queued here rather than sent directly, so
-    /// it goes out through the exact same gated mechanism as every other
-    /// send in this file (see pending_sends' doc comment on
-    /// SweepEngine). Clears anything already queued or pending (e.g. a
-    /// skip's own not-yet-sent safe-state push) and any pending retune,
-    /// since abort takes absolute precedence over whatever the sweep was
-    /// about to do next.
-    pub fn abort(&mut self, safe_state_payload: Vec<u8>) {
+    /// Begins a safe-state abort -- forces pitmode on at whatever
+    /// (level, freq) this engine was actually working on (see
+    /// safe_state_payload_at_current_point()'s own doc comment; this
+    /// deliberately does NOT use vtx_table's own cached frequency, which
+    /// is the Frequency panel's separate, unrelated setting). Queued
+    /// rather than sent directly, so it goes out through the exact same
+    /// gated mechanism as every other send in this file (see
+    /// pending_sends' doc comment on SweepEngine). Clears anything
+    /// already queued or pending (e.g. a skip's own not-yet-sent
+    /// safe-state push) and any pending retune, since abort takes
+    /// absolute precedence over whatever the sweep was about to do next.
+    pub fn abort(&mut self) {
         debug!(target: "vtx", "[sweep] aborted at level={:?} freq_idx={} ({}/{} steps completed)",
             self.levels.get(self.level_idx), self.freq_idx, self.completed_steps, self.total_steps);
+        let safe_state_payload = self.safe_state_payload_at_current_point();
         for status in self.per_level_status.values_mut() {
             if !matches!(status, LevelStatus::Done) {
                 *status = LevelStatus::Aborted;
@@ -1162,20 +1184,26 @@ impl SweepEngine {
     /// retune, immediately and eagerly, the same way Manual mode's side
     /// always has).
     ///
-    /// `safe_state_payload` (computed by the caller from vtx_table, same
-    /// as abort()) is queued as a pitmode-safe VTX_CONFIG push, giving
-    /// the VTX a defined safe point between the skipped point and
-    /// whatever comes next, sent through the same gated mechanism as
-    /// every other send in this file rather than directly.
+    /// `safe_state_payload_at_current_point()` is queued as a
+    /// pitmode-safe VTX_CONFIG push, giving the VTX a defined safe point
+    /// between the skipped point and whatever comes next, sent through
+    /// the same gated mechanism as every other send in this file rather
+    /// than directly. Computed here (not by the caller from vtx_table --
+    /// see that function's own doc comment for why) before
+    /// advance_position() runs below, though advance_position() would
+    /// compute the identical payload itself anyway if this happens to be
+    /// the last remaining point -- sending the same safe pitmode state
+    /// twice in a row is harmless.
     ///
     /// Returns the new (level, freq_idx) only for Manual mode (the UI
     /// reseeds the DAC slider from it) -- automatic mode's own table
     /// redraws from cell status instead, so it always returns None,
     /// matching this function's previous behavior.
-    pub fn skip_current(&mut self, safe_state_payload: Vec<u8>) -> Option<(u8, usize)> {
+    pub fn skip_current(&mut self) -> Option<(u8, usize)> {
         let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
         debug!(target: "vtx", "[sweep] skipped level={level} freq_idx={} ({}/{} steps completed)",
             self.freq_idx, self.completed_steps, self.total_steps);
+        let safe_state_payload = self.safe_state_payload_at_current_point();
 
         match &self.state {
             EngineState::Manual => {
@@ -1222,20 +1250,6 @@ impl SweepEngine {
 
     pub fn is_active(&self) -> bool {
         !matches!(&self.state, EngineState::Idle)
-    }
-
-    /// The frequency this sweep is currently on (both automatic and
-    /// manual mode), if the engine is active. Used by worker.rs to build
-    /// a skip-safe-state payload that preserves this frequency rather
-    /// than jumping to whatever's cached in vtx_table (the Frequency
-    /// panel's own, unrelated setting) -- see Command::SkipCurrent's own
-    /// comment in worker.rs for why that distinction matters.
-    pub fn current_frequency_mhz(&self) -> Option<u16> {
-        if self.is_active() {
-            self.frequencies.get(self.freq_idx).copied()
-        } else {
-            None
-        }
     }
 
     /// True whenever Manual mode is the active sub-mode -- covers
@@ -1428,7 +1442,7 @@ impl SweepEngine {
         // last tuned to.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
-            let payload = build_vtx_config_frequency_payload(freq_mhz, level);
+            let payload = build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
@@ -2102,6 +2116,27 @@ impl SweepEngine {
         (lo, hi)
     }
 
+    /// Builds a pitmode-forced VTX_CONFIG payload at whatever (level,
+    /// freq) this engine itself is CURRENTLY (or, if just past the last
+    /// point, was MOST RECENTLY) working on -- level_idx/freq_idx are
+    /// never reset by abort()/skip_current(), and advance_position()'s
+    /// own completion branch captures them before either index moves,
+    /// so this is always the right point in every case that calls it.
+    ///
+    /// Deliberately self-contained (no vtx_table involved) -- every
+    /// place calibration ends (Abort, Skip/Next past the last point,
+    /// exiting Manual mode) needs to force pitmode WITHOUT changing
+    /// which frequency the VTX is left on, and vtx_table is the
+    /// Frequency panel's own, unrelated setting (see
+    /// Command::SkipCurrent's own comment in worker.rs for the exact
+    /// failure that caused when this used vtx_table's cached frequency
+    /// instead of the sweep's own).
+    fn safe_state_payload_at_current_point(&self) -> Vec<u8> {
+        let level = self.levels.get(self.level_idx).copied().unwrap_or(1);
+        let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(5800);
+        build_vtx_config_frequency_payload(freq_mhz, level, true)
+    }
+
     /// Called by poll() once both vtx_ready and meter_ready are true
     /// again while in ConnectionLost -- no external "Continue" command
     /// needed. Only when the VTX itself was actually involved (reason is
@@ -2302,7 +2337,7 @@ impl SweepEngine {
         // actually issues the VTX_CONFIG retune once that's ready.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
-            let payload = build_vtx_config_frequency_payload(freq_mhz, level);
+            let payload = build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] manual: pushed frequency change to {freq_mhz}MHz (power={level})");
@@ -2443,13 +2478,13 @@ impl SweepEngine {
 /// SET_PACALIBRATION calls that immediately follow set the real level
 /// and DAC value regardless (and re-set the RTC6705 register too, via
 /// vtx_msp_set_calibration()), so this doesn't need to be exact.
-fn build_vtx_config_frequency_payload(freq_mhz: u16, power: u8) -> Vec<u8> {
+fn build_vtx_config_frequency_payload(freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
     let mut p = vec![0u8; 15];
     p[0] = 5; // VTXDEV_MSP
     p[1] = 0; // band=0 -> use the raw frequency field directly
     p[2] = 0; // channel (unused when band=0)
     p[3] = power;
-    p[4] = 0; // pitmode=false, matches rf_calibration.py's own convention throughout scanPa/scanDetector
+    p[4] = pitmode as u8;
     p[5] = (freq_mhz & 0xff) as u8;
     p[6] = (freq_mhz >> 8) as u8;
     p[7] = 1; // device_ready
@@ -2477,27 +2512,16 @@ fn interpolate(target_mw: f32, below: (f32, u16), above: (f32, u16)) -> u16 {
 
 /// Builds a one-off MSP_VTX_CONFIG payload with pitmode forced on,
 /// without mutating the stored VtxTableConfig -- used for the
-/// safe-state-on-abort push (see worker.rs's Command::AbortSweep).
+/// safe-state-on-connect and safe-state-on-reconnect pushes (see
+/// worker.rs), where there's no active sweep whose frequency needs
+/// preserving, so vtx_table's own cached selection is exactly what's
+/// wanted. NOT used for abort()/skip_current()/exit_manual() -- those
+/// compute their own payload internally now (see
+/// SweepEngine::safe_state_payload_at_current_point()), since a sweep in
+/// progress needs to preserve its OWN last-used frequency, not revert to
+/// vtx_table's separate, unrelated setting.
 pub fn safe_state_payload(vtx_table: &VtxTableConfig) -> Vec<u8> {
     let mut cfg = vtx_table.clone();
     cfg.pitmode = true;
-    cfg.encode_vtx_config_response()
-}
-
-/// Same as safe_state_payload(), but overrides the frequency to
-/// `freq_mhz` (forcing frequency mode, selected_band=0) instead of
-/// using whatever's cached in vtx_table -- used for the safe-state-on-
-/// skip push (see worker.rs's Command::SkipCurrent), where the intent
-/// is "force pitmode on before this point is abandoned," NOT "jump to
-/// the Frequency panel's own, unrelated setting." vtx_table's other
-/// fields (bands/channels/power_levels list) are still needed to encode
-/// a well-formed response, just not its selected_band/selected_channel/
-/// selected_freq_mhz -- see that command's own comment in worker.rs for
-/// the failure this was written to fix.
-pub fn safe_state_payload_at_frequency(vtx_table: &VtxTableConfig, freq_mhz: u16) -> Vec<u8> {
-    let mut cfg = vtx_table.clone();
-    cfg.pitmode = true;
-    cfg.selected_band = 0;
-    cfg.selected_freq_mhz = freq_mhz;
     cfg.encode_vtx_config_response()
 }
