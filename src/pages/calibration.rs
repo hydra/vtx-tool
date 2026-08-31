@@ -15,6 +15,7 @@ use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use egui::SliderClamping;
 use egui_table::AutoSizeMode;
 
@@ -67,6 +68,22 @@ pub struct CalibrationPageState {
     /// itself returns) can only ever take effect starting the frame
     /// after it's clicked, not the same one. Cleared once applied.
     plot_reset_requested: bool,
+    /// How many times "Skip >" has been pressed since the debounce
+    /// window last expired -- see skip_debounce_until's own doc comment.
+    /// 0 means no Skip is currently pending.
+    pending_skip_count: u32,
+    /// Deadline for the Skip debounce -- every "Skip >" press sets this
+    /// to now+500ms (resetting it if one's already pending) rather than
+    /// sending Command::SkipMultiple immediately. Once a frame runs
+    /// where this has passed, the accumulated pending_skip_count is sent
+    /// as one single SkipMultiple and this is cleared. This is what
+    /// turns "pressed Skip 4 times in under a second" into one combined
+    /// engine-side transition instead of 4 separate ones -- see
+    /// SweepEngine::skip_multiple()'s own doc comment for why that
+    /// matters (each of the 4 used to be its own real, settle-gated MSP
+    /// round-trip, visibly cycling the VTX through every intermediate
+    /// point along the way).
+    skip_debounce_until: Option<Instant>,
 }
 
 impl Default for CalibrationPageState {
@@ -78,9 +95,13 @@ impl Default for CalibrationPageState {
             show_erase_confirm_dialog: false,
             fine_step: false,
             plot_reset_requested: false,
+            pending_skip_count: 0,
+            skip_debounce_until: None,
         }
     }
 }
+
+const SKIP_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// All four status colors share the same muted character (similar
 /// darkness/saturation, only the hue changes) so none of them stand out
@@ -111,6 +132,14 @@ fn cell_color(status: CellStatus) -> Option<egui::Color32> {
 fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
     if let Some(color) = cell_color(status) {
         ui.painter().rect_filled(ui.max_rect(), 0.0, color);
+    }
+    if status == CellStatus::Current {
+        // Accent-colored box around whatever's actively being worked on
+        // right now -- separate from (and more visible at a glance than)
+        // the muted-blue fill above, since the fill alone is easy to
+        // miss while the sweep is moving quickly cell to cell.
+        let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+        ui.painter().rect_stroke(ui.max_rect(), 0.0, stroke, egui::StrokeKind::Inside);
     }
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     ui.centered_and_justified(|ui| ui.label(text));
@@ -736,7 +765,25 @@ pub fn show(
             let _ = cmd_tx.send(Command::AbortSweep);
         }
         if ui.add_enabled(sweep_active, egui::Button::new("Skip >")).clicked() {
-            let _ = cmd_tx.send(Command::SkipCurrent);
+            page.pending_skip_count += 1;
+            page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
+        }
+        if let Some(deadline) = page.skip_debounce_until {
+            let now = Instant::now();
+            if now >= deadline {
+                let count = page.pending_skip_count;
+                page.pending_skip_count = 0;
+                page.skip_debounce_until = None;
+                if count > 0 {
+                    let _ = cmd_tx.send(Command::SkipMultiple { count });
+                }
+            } else {
+                // Still waiting to see if another press arrives -- make
+                // sure this page actually redraws once the deadline
+                // passes even with no further input, since egui is
+                // immediate-mode and won't otherwise wake up on its own.
+                ui.ctx().request_repaint_after(deadline - now);
+            }
         }
 
         if any_checked && !overall_ready {
