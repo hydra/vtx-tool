@@ -26,7 +26,7 @@ use power_meter::PowerMeterKind;
 use settings::AppSettings;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use vtxtable::VtxTableConfig;
+use vtxtable::{VtxSelectionState, VtxTableConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "rf-cal", about = "RF PA calibration + VTX table tool")]
@@ -112,6 +112,12 @@ fn main() -> eframe::Result<()> {
         VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)).unwrap_or_default()
     };
     let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
+    // Not loaded from vtx_table_path (or anywhere else) -- this is the
+    // Frequency panel's own current selection, ephemeral UI state kept
+    // separate from the table definition (see vtxtable.rs's own module
+    // doc comment for why). Starts at VtxSelectionState::default() every
+    // launch, same as other UI-only state elsewhere in this app.
+    let vtx_selection = Arc::new(Mutex::new(VtxSelectionState::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();
 
@@ -122,7 +128,7 @@ fn main() -> eframe::Result<()> {
         "RF Calibration",
         native_options,
         Box::new(move |cc| {
-            worker::spawn(state.clone(), vtx_table.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
+            worker::spawn(state.clone(), vtx_table.clone(), vtx_selection.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
 
             if auto_connect {
                 let _ = cmd_tx.send(worker::Command::ConnectVtx { port: initial_settings.vtx_port.clone() });
@@ -135,6 +141,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(
                 state.clone(),
                 vtx_table.clone(),
+                vtx_selection.clone(),
                 sweep.clone(),
                 cmd_tx.clone(),
                 logs,

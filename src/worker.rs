@@ -19,7 +19,7 @@ use crate::calibration_engine::{self, SweepEngine};
 use crate::conn_status::PortState;
 use crate::msp::{self, function, MspLink};
 use crate::power_meter::{PowerMeter, PowerMeterKind};
-use crate::vtxtable::VtxTableConfig;
+use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
 use anyhow::Result;
 use log::{debug, error};
 use std::collections::VecDeque;
@@ -210,7 +210,7 @@ pub enum Command {
     DisconnectMeter,
     RefreshCalTable,
     RefreshVtxConfig,
-    /// Actively sends the current VtxTableConfig selection (band/channel/
+    /// Actively sends the current VtxSelectionState (band/channel/
     /// frequency/pitmode/power) to the VTX, unprompted -- unlike the
     /// passive auto-responder (which only answers the VTX's own empty
     /// MSP_VTX_CONFIG query), this pushes the same 15-byte payload as a
@@ -272,6 +272,7 @@ pub enum Command {
 pub fn spawn(
     state: Arc<Mutex<SharedState>>,
     vtx_table: Arc<Mutex<VtxTableConfig>>,
+    vtx_selection: Arc<Mutex<VtxSelectionState>>,
     sweep: SharedSweep,
     cmd_rx: Receiver<Command>,
     ctx: eframe::egui::Context,
@@ -344,7 +345,7 @@ pub fn spawn(
                                     // closed loop. This guarantees a known-clean starting point
                                     // every time, independent of how the previous session ended.
                                     if let Some(link) = vtx.as_mut() {
-                                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap(), &vtx_selection.lock().unwrap());
                                         match link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                             Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
                                             Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
@@ -491,7 +492,9 @@ pub fn spawn(
 
                     Command::PushVtxConfig => {
                         if let Some(link) = vtx.as_mut() {
-                            let payload = vtx_table.lock().unwrap().encode_vtx_config_response();
+                            let table = vtx_table.lock().unwrap();
+                            let payload = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
+                            drop(table);
                             match link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                 Ok(()) => debug!(target: "vtx", "pushed VTX_CONFIG (Save)"),
                                 Err(e) => error!(target: "vtx", "failed to push VTX_CONFIG: {e}"),
@@ -867,7 +870,9 @@ pub fn spawn(
                         vtx_last_seen = Some(Instant::now());
                         state.lock().unwrap().vtx_last_seen_at = Some(format_time_hms());
                         if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
-                            let response = vtx_table.lock().unwrap().encode_vtx_config_response();
+                            let table = vtx_table.lock().unwrap();
+                            let response = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
+                            drop(table);
                             match link.send_v1(function::VTX_CONFIG as u8, &response) {
                                 Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
                                 Err(e) => {
@@ -890,13 +895,13 @@ pub fn spawn(
                             // or otherwise not apply it.
                             match msp::decode_vtx_config(&frame.payload) {
                                 Ok(cfg) => {
-                                    let mut vt = vtx_table.lock().unwrap();
-                                    vt.selected_band = cfg.band;
-                                    vt.selected_channel = cfg.channel;
-                                    vt.selected_power = cfg.power;
-                                    vt.selected_freq_mhz = cfg.frequency_mhz;
-                                    vt.pitmode = cfg.pitmode;
-                                    drop(vt);
+                                    let mut sel = vtx_selection.lock().unwrap();
+                                    sel.selected_band = cfg.band;
+                                    sel.selected_channel = cfg.channel;
+                                    sel.selected_power = cfg.power;
+                                    sel.selected_freq_mhz = cfg.frequency_mhz;
+                                    sel.pitmode = cfg.pitmode;
+                                    drop(sel);
                                     debug!(target: "vtx", "VTX_CONFIG reply: band={} channel={} power={} freq={}MHz pitmode={}",
                                         cfg.band, cfg.channel, cfg.power, cfg.frequency_mhz, cfg.pitmode);
                                     ctx.request_repaint();
@@ -1031,7 +1036,7 @@ pub fn spawn(
                                 vtx_last_seen = None;
                                 state.lock().unwrap().vtx_port_state = PortState::Ready;
                                 if let Some(link) = vtx.as_mut() {
-                                    let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap());
+                                    let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap(), &vtx_selection.lock().unwrap());
                                     if let Err(e) = link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                         error!(target: "vtx", "failed to push safe-state VTX_CONFIG after reconnect: {e}");
                                     }

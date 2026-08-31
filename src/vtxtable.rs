@@ -10,6 +10,16 @@
 //! saved JSON file, or import a Betaflight CLI `vtxtable` dump (paste
 //! the output of Betaflight's `diff` / `dump` CLI command, or just the
 //! vtxtable lines).
+//!
+//! Deliberately split into two structs:
+//! - VtxTableConfig: the table DEFINITION -- which bands, channels, and
+//!   power levels the VTX supports. This is what gets saved/loaded to a
+//!   JSON file or imported from a Betaflight CLI dump; it changes rarely,
+//!   only when the actual VTX hardware's capabilities do.
+//! - VtxSelectionState: which entry from that table (plus pitmode) is
+//!   CURRENTLY chosen -- this is UI state the person changes constantly
+//!   via the Frequency panel, tracked independently and not tied to any
+//!   particular table file.
 
 use crate::msp::{VtxBand, VtxPowerLevel};
 use anyhow::Result;
@@ -21,16 +31,6 @@ pub struct VtxTableConfig {
     pub channels: u8,
     pub bands: Vec<VtxBand>,
     pub power_levels: Vec<VtxPowerLevel>,
-
-    /// What this tool currently reports as "selected" when the VTX asks
-    /// -- the direct analogue of Betaflight's own currently-armed
-    /// band/channel/power/frequency state. Edited in the "Selected"
-    /// section of the VTX Table page.
-    pub selected_band: u8,      // 1-based; 0 = frequency mode (use selected_freq_mhz directly)
-    pub selected_channel: u8,   // 1-based
-    pub selected_power: u8,     // 1-based, index into power_levels
-    pub selected_freq_mhz: u16, // used when selected_band == 0
-    pub pitmode: bool,
 }
 
 impl Default for VtxTableConfig {
@@ -39,11 +39,6 @@ impl Default for VtxTableConfig {
             channels: 8,
             bands: Vec::new(),
             power_levels: Vec::new(),
-            selected_band: 1,
-            selected_channel: 1,
-            selected_power: 1,
-            selected_freq_mhz: 5800,
-            pitmode: false,
         }
     }
 }
@@ -58,46 +53,6 @@ impl VtxTableConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&text)?)
-    }
-
-    /// Resolves selected_band/selected_channel/selected_freq_mhz into an
-    /// actual frequency (MHz) -- band=0 means "use selected_freq_mhz
-    /// directly", matching MSP_VTX_CONFIG's own band==0 convention.
-    pub fn selected_frequency_mhz(&self) -> u16 {
-        if self.selected_band == 0 {
-            return self.selected_freq_mhz;
-        }
-        self.bands
-            .iter()
-            .find(|b| b.index == self.selected_band)
-            .and_then(|b| b.freqs_mhz.get((self.selected_channel as usize).saturating_sub(1)))
-            .copied()
-            .unwrap_or(self.selected_freq_mhz)
-    }
-
-    /// Encodes the current selection as an MSP_VTX_CONFIG response
-    /// payload (15 bytes) -- same layout as vtx_msp.c's own
-    /// vtx_msp_push_vtx_config(), since it's the same message type
-    /// regardless of which side initiated the exchange.
-    pub fn encode_vtx_config_response(&self) -> Vec<u8> {
-        let freq = self.selected_frequency_mhz();
-        let mut p = vec![0u8; 15];
-        p[0] = 5; // VTXDEV_MSP
-        p[1] = self.selected_band;
-        p[2] = self.selected_channel;
-        p[3] = self.selected_power;
-        p[4] = self.pitmode as u8;
-        p[5] = (freq & 0xff) as u8;
-        p[6] = (freq >> 8) as u8;
-        p[7] = 1; // device_ready
-        p[8] = 0; // low_power_disarm
-        p[9] = 0;
-        p[10] = 0; // pit_mode_freq
-        p[11] = 1; // vtx_table_available
-        p[12] = self.bands.len() as u8;
-        p[13] = self.channels;
-        p[14] = self.power_levels.len() as u8;
-        p
     }
 
     /// Parses Betaflight CLI `vtxtable` lines (e.g. from `diff` or
@@ -184,5 +139,79 @@ impl VtxTableConfig {
         }
 
         Ok(cfg)
+    }
+}
+
+/// What this tool currently reports as "selected" when the VTX asks --
+/// the direct analogue of Betaflight's own currently-armed
+/// band/channel/power/frequency state. Edited in the Frequency panel
+/// (app.rs). Tracked independently of VtxTableConfig (see this module's
+/// own doc comment for why) -- an index here (selected_band,
+/// selected_power) is only meaningful alongside a specific
+/// VtxTableConfig to resolve it against, which is why
+/// frequency_mhz()/encode_vtx_config_response() below both take one as
+/// a parameter rather than owning a copy of the table themselves.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VtxSelectionState {
+    pub selected_band: u8,      // 1-based; 0 = frequency mode (use selected_freq_mhz directly)
+    pub selected_channel: u8,   // 1-based
+    pub selected_power: u8,     // 1-based, index into a VtxTableConfig's power_levels
+    pub selected_freq_mhz: u16, // used when selected_band == 0
+    pub pitmode: bool,
+}
+
+impl Default for VtxSelectionState {
+    fn default() -> Self {
+        Self {
+            selected_band: 1,
+            selected_channel: 1,
+            selected_power: 1,
+            selected_freq_mhz: 5800,
+            pitmode: false,
+        }
+    }
+}
+
+impl VtxSelectionState {
+    /// Resolves selected_band/selected_channel/selected_freq_mhz into an
+    /// actual frequency (MHz) against `table` -- band=0 means "use
+    /// selected_freq_mhz directly", matching MSP_VTX_CONFIG's own
+    /// band==0 convention.
+    pub fn frequency_mhz(&self, table: &VtxTableConfig) -> u16 {
+        if self.selected_band == 0 {
+            return self.selected_freq_mhz;
+        }
+        table
+            .bands
+            .iter()
+            .find(|b| b.index == self.selected_band)
+            .and_then(|b| b.freqs_mhz.get((self.selected_channel as usize).saturating_sub(1)))
+            .copied()
+            .unwrap_or(self.selected_freq_mhz)
+    }
+
+    /// Encodes this selection (resolved against `table`) as an
+    /// MSP_VTX_CONFIG response payload (15 bytes) -- same layout as
+    /// vtx_msp.c's own vtx_msp_push_vtx_config(), since it's the same
+    /// message type regardless of which side initiated the exchange.
+    pub fn encode_vtx_config_response(&self, table: &VtxTableConfig) -> Vec<u8> {
+        let freq = self.frequency_mhz(table);
+        let mut p = vec![0u8; 15];
+        p[0] = 5; // VTXDEV_MSP
+        p[1] = self.selected_band;
+        p[2] = self.selected_channel;
+        p[3] = self.selected_power;
+        p[4] = self.pitmode as u8;
+        p[5] = (freq & 0xff) as u8;
+        p[6] = (freq >> 8) as u8;
+        p[7] = 1; // device_ready
+        p[8] = 0; // low_power_disarm
+        p[9] = 0;
+        p[10] = 0; // pit_mode_freq
+        p[11] = 1; // vtx_table_available
+        p[12] = table.bands.len() as u8;
+        p[13] = table.channels;
+        p[14] = table.power_levels.len() as u8;
+        p
     }
 }

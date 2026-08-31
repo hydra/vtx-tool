@@ -45,7 +45,7 @@
 
 use crate::msp::{self, function, MspCommandKind, MspLink};
 use crate::power_meter::{nearest_band, FrequencyCapability};
-use crate::vtxtable::VtxTableConfig;
+use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
 use log::debug;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -626,24 +626,6 @@ pub struct DetectorDebugInfo {
     pub pinned_count: u32,
 }
 
-/// Snapshot of a single VTX_CONFIG frequency/pitmode push this engine
-/// just made (see SweepEngine::build_vtx_config_frequency_payload() --
-/// every call sets SweepEngine::pending_vtx_config_update to one of
-/// these). worker.rs takes it after every poll() (same one-shot
-/// take()-and-clear pattern as pending_result/pending_meter_frequency)
-/// and updates its own vtx_table cache to match, which is what the
-/// Frequency panel's UI actually displays -- without this file needing
-/// to know vtx_table (or the UI) exists at all. Purely informational;
-/// nothing in this file ever reads it back, and no MSP traffic is added
-/// or changed by its existence -- it just reports what the
-/// payload-building step already decided to send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PushedVtxConfig {
-    pub freq_mhz: u16,
-    pub power: u8,
-    pub pitmode: bool,
-}
-
 pub struct SweepEngine {
     pub levels: Vec<u8>,       // selected levels, ascending
     pub frequencies: Vec<u16>, // from PA table idx=0's value[] (frequency breakpoints)
@@ -689,16 +671,6 @@ pub struct SweepEngine {
     /// a power level + DAC vbias_mv), never actually retuned the VTX, so it
     /// stayed on whatever frequency it was last configured to.
     pending_frequency_push: Option<u16>,
-    /// One-shot notification of a push just made -- see PushedVtxConfig's
-    /// own doc comment. worker.rs takes() this (same pattern as
-    /// pending_result/pending_meter_frequency above), so it's only ever
-    /// applied once per actual push, never re-applied on a later tick
-    /// where nothing new happened (which would otherwise mean the sweep's
-    /// last state kept overwriting the Frequency panel forever, even long
-    /// after the sweep ended and the person had gone on to edit it by
-    /// hand). pub so worker.rs can take() it; nothing in this file ever
-    /// reads it back.
-    pub pending_vtx_config_update: Option<PushedVtxConfig>,
     /// Set whenever a ProgrammableBand/FullyProgrammable meter needs its
     /// own frequency changed too -- worker.rs drains this and calls
     /// PowerMeter::set_frequency(), then clears it. Unlike
@@ -790,9 +762,10 @@ pub struct SweepEngine {
 /// doc comment on SweepEngine. Each variant carries everything poll()
 /// needs to actually issue it once link.can_send_now() allows.
 enum PendingSend {
-    /// A pitmode-safe VTX_CONFIG push -- from skip_current()/abort().
-    /// The payload is computed by the caller (worker.rs, which owns
-    /// vtx_table) and just carried here for poll() to send.
+    /// A pitmode-safe VTX_CONFIG push -- from abort()/skip_current()/
+    /// exit_manual()/advance_position()'s own completion branch, all via
+    /// safe_state_payload_at_current_point(), which computes this
+    /// engine-internally now (see that function's own doc comment).
     SafeState(Vec<u8>),
     /// A calibration-state-only push -- establishes/updates
     /// session_active and/or boost_mode (both fields on SweepEngine
@@ -804,7 +777,22 @@ enum PendingSend {
     /// holds at send time -- there's no separate command for this, so a
     /// state-only push still has to go out as a SET_PACALIBRATION.
     CalibrationState,
+    /// An empty-payload MSP_VTX_CONFIG query -- queued after every
+    /// frequency/pitmode push (see
+    /// SweepEngine::build_vtx_config_frequency_payload()). The firmware
+    /// already replies to an empty-payload MSP_VTX_CONFIG with its own
+    /// actual, current state (vtx_msp_handle_msp()'s data_size==0
+    /// branch, via vtx_msp_push_vtx_config() -- see vtx_msp.c), the
+    /// exact same mechanism worker.rs's own read_vtx_config() already
+    /// uses at startup, just non-blocking here since it goes through
+    /// this queue instead. worker.rs's own frame-read loop picks up the
+    /// reply (a non-empty VTX_CONFIG frame) and updates the Frequency
+    /// panel's UI from it -- deliberately NOT from what we assumed we
+    /// pushed, since the VTX may reject, ignore, or otherwise not apply
+    /// it; this only reflects what the VTX itself actually reports back.
+    RequestVtxConfig,
 }
+
 
 /// The wire-level meaning of SET_PACALIBRATION's trailing boost byte --
 /// see vtx_msp_set_calibration()'s doc comment in vtx_msp.c.
@@ -862,7 +850,6 @@ impl SweepEngine {
             meter_capability: FrequencyCapability::Manual { min_mhz: 0, max_mhz: 0 }, // set for real in start()
             last_prompted_band: None,
             pending_frequency_push: None,
-            pending_vtx_config_update: None,
             pending_meter_frequency: None,
             hard_limits: HashMap::new(),
             pending_sends: VecDeque::new(),
@@ -1390,6 +1377,7 @@ impl SweepEngine {
                     link.send_v1(function::VTX_CONFIG as u8, &payload)?;
                     link.note_sent(MspCommandKind::Retune);
                     debug!(target: "vtx", "[sweep] pitmode-safe state sent");
+                    self.pending_sends.push_back(PendingSend::RequestVtxConfig);
                 }
                 PendingSend::CalibrationState => {
                     let payload = msp::encode_pa_calibration_request(0, None, self.session_active, self.boost_mode.wire_byte());
@@ -1397,6 +1385,11 @@ impl SweepEngine {
                     link.note_sent(MspCommandKind::Other);
                     debug!(target: "vtx", "[sweep] calibration state pushed: session_active={} boost_mode={:?}",
                         self.session_active, self.boost_mode);
+                }
+                PendingSend::RequestVtxConfig => {
+                    link.send_v1(function::VTX_CONFIG as u8, &[])?;
+                    link.note_sent(MspCommandKind::Other);
+                    debug!(target: "vtx", "[sweep] requested current VTX_CONFIG (to confirm the last push actually landed)");
                 }
             }
             return Ok(true);
@@ -1475,6 +1468,7 @@ impl SweepEngine {
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
+            self.pending_sends.push_back(PendingSend::RequestVtxConfig);
             return Ok(true); // next tick will wait out the settle gate before sending anything else
         }
 
@@ -2160,7 +2154,7 @@ impl SweepEngine {
     /// Command::SkipCurrent's own comment in worker.rs for the exact
     /// failure that caused when this used vtx_table's cached frequency
     /// instead of the sweep's own).
-    fn safe_state_payload_at_current_point(&mut self) -> Vec<u8> {
+    fn safe_state_payload_at_current_point(&self) -> Vec<u8> {
         let level = self.levels.get(self.level_idx).copied().unwrap_or(1);
         let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(5800);
         self.build_vtx_config_frequency_payload(freq_mhz, level, true)
@@ -2370,6 +2364,7 @@ impl SweepEngine {
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] manual: pushed frequency change to {freq_mhz}MHz (power={level})");
+            self.pending_sends.push_back(PendingSend::RequestVtxConfig);
             return Ok(true); // next tick will wait out the settle gate before sending anything else
         }
         if !self.manual_send_pending || self.last_send.elapsed() < SEND_INTERVAL {
@@ -2500,8 +2495,8 @@ impl SweepEngine {
 
     /// Builds an MSP_VTX_CONFIG payload that retunes the VTX to
     /// `freq_mhz` directly (band=0) -- independent of the stored
-    /// VtxTableConfig's "Selected" state (a separate, user-facing
-    /// concept this file has no access to and doesn't directly touch).
+    /// VtxSelectionState (a separate, user-facing concept this file has
+    /// no access to and doesn't directly touch).
     /// `power` just needs to be a valid level index so vtx_apply_hw()
     /// picks a sensible RTC6705 register while retuning; the
     /// SET_PACALIBRATION calls that immediately follow set the real
@@ -2509,13 +2504,11 @@ impl SweepEngine {
     /// too, via vtx_msp_set_calibration()), so this doesn't need to be
     /// exact.
     ///
-    /// Every call records what it built into pending_vtx_config_update
-    /// (see that field's own doc comment) -- this doesn't add or change
-    /// any MSP traffic, it's purely bookkeeping so worker.rs can mirror
-    /// what actually got pushed into its own vtx_table, and therefore
-    /// the Frequency panel's UI.
-    fn build_vtx_config_frequency_payload(&mut self, freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
-        self.pending_vtx_config_update = Some(PushedVtxConfig { freq_mhz, power, pitmode });
+    /// Every actual send of this payload is followed by queuing
+    /// PendingSend::RequestVtxConfig (see its own doc comment) -- this
+    /// function itself only builds bytes, it doesn't send or track
+    /// anything.
+    fn build_vtx_config_frequency_payload(&self, freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
         let mut p = vec![0u8; 15];
         p[0] = 5; // VTXDEV_MSP
         p[1] = 0; // band=0 -> use the raw frequency field directly
@@ -2549,17 +2542,17 @@ fn interpolate(target_mw: f32, below: (f32, u16), above: (f32, u16)) -> u16 {
 }
 
 /// Builds a one-off MSP_VTX_CONFIG payload with pitmode forced on,
-/// without mutating the stored VtxTableConfig -- used for the
+/// without mutating the stored VtxSelectionState -- used for the
 /// safe-state-on-connect and safe-state-on-reconnect pushes (see
 /// worker.rs), where there's no active sweep whose frequency needs
-/// preserving, so vtx_table's own cached selection is exactly what's
-/// wanted. NOT used for abort()/skip_current()/exit_manual() -- those
-/// compute their own payload internally now (see
+/// preserving, so the current selection (resolved against `table`) is
+/// exactly what's wanted. NOT used for abort()/skip_current()/
+/// exit_manual() -- those compute their own payload internally now (see
 /// SweepEngine::safe_state_payload_at_current_point()), since a sweep in
 /// progress needs to preserve its OWN last-used frequency, not revert to
-/// vtx_table's separate, unrelated setting.
-pub fn safe_state_payload(vtx_table: &VtxTableConfig) -> Vec<u8> {
-    let mut cfg = vtx_table.clone();
-    cfg.pitmode = true;
-    cfg.encode_vtx_config_response()
+/// the separate, unrelated Frequency-panel selection.
+pub fn safe_state_payload(table: &VtxTableConfig, selection: &VtxSelectionState) -> Vec<u8> {
+    let mut sel = *selection; // Copy -- cheap, no clone() needed
+    sel.pitmode = true;
+    sel.encode_vtx_config_response(table)
 }
