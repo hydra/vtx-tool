@@ -1,4 +1,3 @@
-//! Home page: placeholder landing content.
 
 use eframe::egui;
 

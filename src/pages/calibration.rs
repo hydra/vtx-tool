@@ -1,8 +1,3 @@
-//! Calibration page: live power meter reading (with a rolling plot), the
-//! PA calibration table (now with per-level checkboxes, boost/RTC6705
-//! display columns, and a live calibration-status column), and the
-//! Automatic/Manual sweep controls (see calibration_engine.rs for the actual sweep
-//! state machine this drives).
 
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
@@ -19,14 +14,6 @@ use std::time::{Duration, Instant};
 use egui::SliderClamping;
 use egui_table::AutoSizeMode;
 
-/// Candidate update rates, always shown -- entries exceeding the
-/// connected meter's max_update_hz() are disabled (not hidden), so the
-/// available range is visible even before a rate becomes selectable.
-/// Hardcoded (hz, label) pairs rather than a formatting function: with
-/// only five fixed values, direct control over exact wording ("1 second"
-/// singular vs "2 seconds" plural, "ms" vs "second(s)") is simpler and
-/// less error-prone than generic period-formatting logic for such a
-/// small, fixed set.
 const CANDIDATE_HZ: &[(f64, &str)] = &[
     (20.0, "20 Hz (50ms)"),
     (10.0, "10 Hz (100ms)"),
@@ -35,11 +22,6 @@ const CANDIDATE_HZ: &[(f64, &str)] = &[
     (0.5, "0.5 Hz (2 seconds)"),
 ];
 
-/// Formats a power reading with unit scaling (uW/mW/W) rather than a
-/// fixed "X.XXX mW" -- at typical calibration-sweep low-power readings
-/// (tens of uW), a fixed 3-decimal mW display just rounds to 0.000,
-/// which is what "always reads 0.000 mW" actually was: not a wrong
-/// value, an unusable display precision for the range this tool covers.
 fn format_power(mw: f32) -> String {
     if mw >= 1000.0 {
         format!("{:.3} W", mw / 1000.0)
@@ -54,42 +36,17 @@ pub struct CalibrationPageState {
     pub tolerance_pct: f32,
     pub checked: HashMap<u8, bool>,
     show_confirm_dialog: bool,
-    /// Set by "Erase Calibration" -- separate from show_confirm_dialog
-    /// (recalibration) since these are two different destructive
-    /// actions with two different confirmation messages.
     show_erase_confirm_dialog: bool,
-    /// Manual mode's "fine" checkbox: true = the DAC slider moves in
-    /// 1mV steps, false = 25mV steps.
     fine_step: bool,
-    /// Set by the plot's own right-click "Reset" context menu item, on
-    /// the frame it's clicked -- egui_plot's Plot::reset() has to be
-    /// called on the builder BEFORE that same frame's show(), so a
-    /// context-menu click (only detectable from the response show()
-    /// itself returns) can only ever take effect starting the frame
-    /// after it's clicked, not the same one. Cleared once applied.
     plot_reset_requested: bool,
-    /// How many times "Skip >" has been pressed since the debounce
-    /// window last expired -- see skip_debounce_until's own doc comment.
-    /// 0 means no Skip is currently pending.
     pending_skip_count: u32,
-    /// Deadline for the Skip debounce -- every "Skip >" press sets this
-    /// to now+500ms (resetting it if one's already pending) rather than
-    /// sending Command::SkipMultiple immediately. Once a frame runs
-    /// where this has passed, the accumulated pending_skip_count is sent
-    /// as one single SkipMultiple and this is cleared. This is what
-    /// turns "pressed Skip 4 times in under a second" into one combined
-    /// engine-side transition instead of 4 separate ones -- see
-    /// SweepEngine::skip_multiple()'s own doc comment for why that
-    /// matters (each of the 4 used to be its own real, settle-gated MSP
-    /// round-trip, visibly cycling the VTX through every intermediate
-    /// point along the way).
     skip_debounce_until: Option<Instant>,
 }
 
 impl Default for CalibrationPageState {
     fn default() -> Self {
         Self {
-            tolerance_pct: 10.0, // matches rf_calibration.py's own scanDetector default (max(0.1, mW*0.1))
+            tolerance_pct: 10.0,
             checked: HashMap::new(),
             show_confirm_dialog: false,
             show_erase_confirm_dialog: false,
@@ -103,41 +60,25 @@ impl Default for CalibrationPageState {
 
 const SKIP_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// All four status colors share the same muted character (similar
-/// darkness/saturation, only the hue changes) so none of them stand out
-/// as harsher or harder to read than the others against default (light)
-/// cell text -- the earlier bright orange was the main offender.
 fn cell_color(status: CellStatus) -> Option<egui::Color32> {
     match status {
         CellStatus::Default => None,
-        CellStatus::Calibrated => Some(egui::Color32::from_rgb(45, 85, 55)),    // muted green
-        CellStatus::Current => Some(egui::Color32::from_rgb(45, 70, 100)),      // muted blue
-        CellStatus::LimitHit => Some(egui::Color32::from_rgb(100, 45, 45)),     // muted red
-        CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)), // muted amber
-        CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),       // neutral grey -- deliberate, not a failure
-        CellStatus::PaFailure => Some(egui::Color32::from_rgb(165, 80, 15)),    // distinct burnt orange -- hardware condition, not just a non-convergent search
-        CellStatus::NotSettled => Some(egui::Color32::from_rgb(140, 100, 20)),  // dark gold -- also a timing/hardware condition (PA hadn't finished its boost-enable transient), distinct from PaFailure's thermal-rolloff meaning
-        CellStatus::Manual => Some(egui::Color32::from_rgb(80, 55, 100)),       // muted violet -- hand-set, distinct from an automatic Calibrated result
+        CellStatus::Calibrated => Some(egui::Color32::from_rgb(45, 85, 55)),
+        CellStatus::Current => Some(egui::Color32::from_rgb(45, 70, 100)),
+        CellStatus::LimitHit => Some(egui::Color32::from_rgb(100, 45, 45)),
+        CellStatus::Uncalibrated => Some(egui::Color32::from_rgb(100, 78, 40)),
+        CellStatus::Skipped => Some(egui::Color32::from_rgb(70, 70, 75)),
+        CellStatus::PaFailure => Some(egui::Color32::from_rgb(165, 80, 15)),
+        CellStatus::NotSettled => Some(egui::Color32::from_rgb(140, 100, 20)),
+        CellStatus::Manual => Some(egui::Color32::from_rgb(80, 55, 100)),
     }
 }
 
-/// Renders one calibration/detector value cell inside an egui_table
-/// column, filling the ENTIRE cell rect with its status color (painted
-/// first, full width/height) rather than just tinting behind the text --
-/// RichText::background_color only covers the glyphs' own bounding box,
-/// which is what this replaces. Also forces no-wrap (Truncate, matching
-/// the pattern egui_table's own demo uses for a long cell) -- without
-/// it, a narrow column wraps text one character per line rather than
-/// clipping it.
 fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
     if let Some(color) = cell_color(status) {
         ui.painter().rect_filled(ui.max_rect(), 0.0, color);
     }
     if status == CellStatus::Current {
-        // Accent-colored box around whatever's actively being worked on
-        // right now -- separate from (and more visible at a glance than)
-        // the muted-blue fill above, since the fill alone is easy to
-        // miss while the sweep is moving quickly cell to cell.
         let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
         ui.painter().rect_stroke(ui.max_rect(), 0.0, stroke, egui::StrokeKind::Inside);
     }
@@ -145,28 +86,18 @@ fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
     ui.centered_and_justified(|ui| ui.label(text));
 }
 
-/// Column widths, in the same 21-column order used throughout: checkbox,
-/// idx, mW, 7 calibration columns, 7 detector columns, Boost, RTC6705,
-/// Limit, Status. Fixed/explicit (not content-driven), which is what
-/// actually stops any column from growing to fit a header label.
 const COL_WIDTHS: [f32; 21] = [
-    24.0, 28.0, 40.0, // checkbox, idx, mW
-    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, // calibration x7
-    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, // detector x7
-    45.0, 65.0, 70.0, 160.0, // Boost, RTC6705, Limit, Status
+    24.0, 28.0, 40.0,
+    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0,
+    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0,
+    45.0, 65.0, 70.0, 160.0,
 ];
 const GROUP_ROW_HEIGHT: f32 = 18.0;
 const HEADER_ROW_HEIGHT: f32 = 18.0;
 const DATA_ROW_HEIGHT: f32 = 20.0;
 
-/// egui_table::TableDelegate implementation for the PA calibration
-/// table. Unlike egui_extras::TableBuilder's closures (which directly
-/// capture surrounding variables), egui_table's Table::show() drives a
-/// delegate object across possibly-multiple frames/prefetch passes, so
-/// state it needs has to be gathered up front into an owned/borrowed
-/// struct rather than closed over ad hoc.
 struct PaTableDelegate<'a> {
-    entries: Vec<msp::PaCalibration>, // owned, filtered to idx > 0
+    entries: Vec<msp::PaCalibration>,
     frequencies: [u16; 7],
     checked: &'a mut HashMap<u8, bool>,
     sweep_active: bool,
@@ -174,11 +105,6 @@ struct PaTableDelegate<'a> {
     det_status: Vec<[CellStatus; 7]>,
     level_status: Vec<Option<LevelStatus>>,
     limits: Vec<Option<i32>>,
-    /// Whatever's actively being tested right now, if anything -- see
-    /// calibration_engine.rs's SweepEngine::current_step(). Used so the
-    /// Current (blue) cell shows the LIVE value being tried, not the
-    /// table's last-saved value for that cell, which stays stale/default
-    /// until the step actually finishes.
     current: Option<calibration_engine::CurrentStep>,
     row_height: f32,
 }
@@ -202,8 +128,6 @@ impl PaTableDelegate<'_> {
 
 impl egui_table::TableDelegate for PaTableDelegate<'_> {
     fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {
-        // Nothing to lazily load -- everything's already gathered up
-        // front into owned Vecs before the Table is constructed.
     }
 
     fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell_inf: &egui_table::HeaderCellInfo) {
@@ -211,10 +135,6 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         match row_nr {
             0 => {
-                // Group band row. group_index here is the GROUP's own index
-                // (0..4, matching the `groups` Vec passed to HeaderRow), not
-                // a column index. Groups 1/2 are Calibration/Detector;
-                // 0 and 3 are the unlabeled surrounding columns.
                 let text = match group_index {
                     1 => "VBIAS (mV)",
                     2 => "Detector (mV)",
@@ -227,9 +147,6 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
                 }
             }
             1 => {
-                // Second header row has no explicit `groups`, so
-                // egui_table gives each column its own trivial group --
-                // group_index here IS the column index directly.
                 ui.strong(self.column_label(*group_index));
             }
             _ => {}
@@ -237,8 +154,6 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
     }
 
     fn row_ui(&mut self, _ui: &mut egui::Ui, _row_nr: u64) {
-        // No special per-row interaction/highlight needed beyond what
-        // cell_ui already paints.
     }
 
     fn cell_ui(&mut self, ui: &mut egui::Ui, cell_info: &egui_table::CellInfo) {
@@ -251,13 +166,6 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
 
         match col_nr {
             0 => {
-                // Default-checked: levels that engage the boost stage
-                // (ext_pa_enable) -- those are what scanPa/scanDetector's
-                // detector-based closed loop is meant for; the RTC6705-alone
-                // levels are simple/structural and were never really
-                // candidates for this procedure. Only applies the FIRST
-                // time a given idx is seen -- a user's manual (un)check is
-                // never overwritten by this, including across Refreshes.
                 let checked = self.checked.entry(entry.idx).or_insert(entry.ext_pa_enable);
                 ui.add_enabled(!self.sweep_active, egui::Checkbox::new(checked, ""));
             }
@@ -306,7 +214,7 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
     }
 
     fn row_top_offset(&self, _ctx: &egui::Context, _table_id: egui::Id, row_nr: u64) -> f32 {
-        row_nr as f32 * self.row_height // uniform row height, no per-row expand/collapse
+        row_nr as f32 * self.row_height
     }
 }
 
@@ -323,10 +231,6 @@ fn status_text(status: Option<&LevelStatus>) -> String {
     }
 }
 
-/// Y-value range across `points`, or `(default_lo, default_hi)` if the
-/// series is empty OR constant (min == max) -- the latter would
-/// otherwise hand show()'s temp_to_power()/power_to_temp() closures a
-/// zero-width range to divide by.
 fn min_max_or(points: &[[f64; 2]], default_lo: f64, default_hi: f64) -> (f64, f64) {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
@@ -367,17 +271,6 @@ pub fn show(
         let temp_points_raw: Vec<[f64; 2]> = state.temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
         let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0);
 
-        // egui_plot has no true independent y-scale per line -- custom_y_axes
-        // draws multiple axis labels/formatters over ONE shared coordinate
-        // transform, it doesn't give each line its own range. So the
-        // temperature series is linearly remapped into the power series'
-        // own numeric range before plotting (temp_to_power below), and the
-        // right axis's formatter applies the inverse map to whatever tick
-        // value it's handed, so it still displays real °C numbers. Computed
-        // fresh from this frame's own data (not last frame's plot bounds,
-        // which would lag a frame and is unnecessary here) -- falls back to
-        // a degenerate-safe [0,1] range when a series is empty or constant,
-        // so this never divides by zero.
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
         let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
         let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
@@ -410,10 +303,6 @@ pub fn show(
             }
         });
         plot_response.response.context_menu(|ui| {
-            // No explicit close needed here -- context_menu()'s default
-            // PopupCloseBehavior is CloseOnClick (since egui 0.32's popup
-            // rewrite), so this button click already closes the menu on
-            // its own.
             if ui.button("Reset").clicked() {
                 page.plot_reset_requested = true;
             }
@@ -441,17 +330,12 @@ pub fn show(
         ui.separator();
         ui.label("Attenuation:");
         let mut atten_db = shared.lock().unwrap().attenuation_db;
-        // Added to every raw reading from the meter (see worker.rs) --
-        // e.g. an external attenuator fitted ahead of the meter that its
-        // own display already accounts for but the raw serial readings
-        // don't. Range allows negative too, for the inverse case (a
-        // pre-amp ahead of the meter rather than an attenuator).
         let response = ui.add(egui::DragValue::new(&mut atten_db).suffix(" dB").range(-50.0..=100.0).speed(0.1));
         if response.changed() {
             shared.lock().unwrap().attenuation_db = atten_db;
             let mut settings = AppSettings::load();
             settings.attenuation_db = atten_db;
-            let _ = settings.save(); // best-effort -- same pattern as the port fields
+            let _ = settings.save();
         }
     });
 
@@ -463,7 +347,6 @@ pub fn show(
 
     let sweep_active = sweep.lock().unwrap().as_ref().map(|e| e.is_active()).unwrap_or(false);
 
-    // ---- Frequency-change gate (manual-frequency meters) ---------------
     let awaiting_freq_mhz = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match &e.state {
@@ -493,7 +376,6 @@ pub fn show(
             });
     }
 
-    // ---- Connection error gate (VTX and/or meter lost communication) ----
     let connection_lost = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match &e.state {
@@ -537,7 +419,6 @@ pub fn show(
             });
     }
 
-    // ---- Table -----------------------------------------------------------
     let pa_table = shared.lock().unwrap().pa_table.clone();
     let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
     let entries: Vec<msp::PaCalibration> = pa_table.iter().filter(|e| e.idx > 0).cloned().collect();
@@ -577,11 +458,6 @@ pub fn show(
         row_height: DATA_ROW_HEIGHT,
     };
 
-    // range(w..=w) is the actual fix here, not resizable(false) alone --
-    // without an explicit range, columns were auto-shrinking to fit
-    // whatever width was available (confirmed by the group header text
-    // truncating despite 7*55=385px of nominal span width) instead of
-    // the table scrolling horizontally when content exceeds the viewport.
     let columns: Vec<egui_table::Column> =
         COL_WIDTHS.iter().enumerate().map(|(index, &w)| {
 
@@ -599,13 +475,6 @@ pub fn show(
         })
             .collect();
     let num_rows = delegate.entries.len() as f32;
-    // egui_table::Table is built for virtualized scrolling of potentially
-    // huge datasets, so its scroll region defaults to filling whatever
-    // vertical space the parent ui hands it -- for our handful of rows
-    // that left a large empty gap below the real content. Constraining
-    // the allocation to the table's actual content height (both header
-    // rows + N data rows, plus a little slack) fixes that; it'll still
-    // scroll internally if a future table genuinely has more rows than fit.
     let table_height = GROUP_ROW_HEIGHT + HEADER_ROW_HEIGHT + num_rows * DATA_ROW_HEIGHT + 4.0;
     ui.allocate_ui(egui::vec2(ui.available_width(), table_height), |ui| {
         egui_table::Table::new()
@@ -615,11 +484,6 @@ pub fn show(
             .columns(columns)
             .num_sticky_cols(0)
             .headers([
-                // Row 0: group band -- spans verified against egui_table's own
-                // demo (rerun-io/egui_table, demo/src/table_demo.rs), which is
-                // the actual mechanism for this (egui::Grid/egui_extras::Table
-                // have no equivalent). Groups don't need to cover every column;
-                // 0..3 and 17..21 are left as trivial/unlabeled groups.
                 egui_table::HeaderRow {
                     height: GROUP_ROW_HEIGHT,
                     groups: vec![0..3, 3..10, 10..17, 17..21],
@@ -629,7 +493,6 @@ pub fn show(
             .show(ui, &mut delegate);
     });
 
-    // ---- Progress bars (always shown) -----------------------------------
     {
         let g = sweep.lock().unwrap();
         let (overall, sub_val, sub_label) = match g.as_ref() {
@@ -643,7 +506,6 @@ pub fn show(
         ui.add(egui::ProgressBar::new(sub_val).text(if sub_label.is_empty() { "Idle" } else { sub_label }));
     }
 
-    // ---- Debug/diagnostic indicators (always shown) -----------------------
     {
         let debug = {
             let g = sweep.lock().unwrap();
@@ -703,7 +565,6 @@ pub fn show(
         });
     }
 
-    // ---- Tolerance + Automatic/Manual/Stop/Skip -------------------------
     let (automatic_mode, manual_mode, manual_dac_mv) = {
         let g = sweep.lock().unwrap();
         match g.as_ref() {
@@ -711,8 +572,6 @@ pub fn show(
             None => (false, false, 0),
         }
     };
-    // boost_on comes from live VTX telemetry (SharedState), not the engine --
-    // it's the actual GPIO state reported back, not just what was last requested.
     let pa_boost_on = {
         let s = shared.lock().unwrap();
         s.vtx_status.as_ref().and_then(|v| v.boost_on)
@@ -732,12 +591,6 @@ pub fn show(
                 .speed(0.1),
         );
 
-        // Automatic: starts fresh from Idle (with a confirm dialog), or
-        // resumes in place if Manual mode is currently active (see
-        // resume_automatic_from_current()) -- disabled only while
-        // automatic is already the active mode; the extra !manual_mode-
-        // aware "any_checked" requirement only applies to the fresh-start
-        // case, since resuming doesn't need a fresh level selection.
         let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
         if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
             if manual_mode {
@@ -749,11 +602,6 @@ pub fn show(
             }
         }
 
-        // Manual: only usable from Idle -- deliberately also disabled
-        // while automatic is running (not just while already manual),
-        // since starting Manual mode replaces the engine outright and
-        // doing that mid-automatic-run would abruptly end it without a
-        // proper abort/session-end.
         let manual_enabled = !automatic_mode && !manual_mode && overall_ready && any_checked;
         if ui.add_enabled(manual_enabled, egui::Button::new("Manual")).clicked() {
             let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
@@ -778,10 +626,6 @@ pub fn show(
                     let _ = cmd_tx.send(Command::SkipMultiple { count });
                 }
             } else {
-                // Still waiting to see if another press arrives -- make
-                // sure this page actually redraws once the deadline
-                // passes even with no further input, since egui is
-                // immediate-mode and won't otherwise wake up on its own.
                 ui.ctx().request_repaint_after(deadline - now);
             }
         }
@@ -795,7 +639,6 @@ pub fn show(
         }
     });
 
-    // ---- Manual mode controls (always shown, disabled outside Manual) ---
     ui.horizontal(|ui| {
         ui.add_enabled_ui(manual_mode, |ui| {
             let mut current_mv = manual_dac_mv;
@@ -844,27 +687,21 @@ pub fn show(
                 });
             });
         if !open {
-            // Closed via the window's own X -- default is No, per spec.
             page.show_confirm_dialog = false;
         }
         if confirmed {
             page.show_confirm_dialog = false;
             let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-            levels.sort_unstable(); // HashMap iteration order is arbitrary -- without this, the sweep ran the selected rows in a random order instead of top-to-bottom
+            levels.sort_unstable();
             let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
         }
     }
 
-    // ---- Send to VTX (persists to EEPROM immediately, see
-    // Command::SendCalTableToVtx's own doc comment) / Erase Calibration --
     ui.horizontal(|ui| {
         if ui.button("Send to VTX").clicked() {
             let _ = cmd_tx.send(Command::SendCalTableToVtx);
         }
 
-        // Disabled during an active sweep -- same reasoning as Stop/Skip's
-        // own gating above: this writes to the same levels a sweep may
-        // currently be mid-write to.
         if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
             page.show_erase_confirm_dialog = true;
         }
@@ -891,7 +728,6 @@ pub fn show(
                 });
             });
         if !open {
-            // Closed via the window's own X -- default is Cancel, per spec.
             page.show_erase_confirm_dialog = false;
         }
         if confirmed {
