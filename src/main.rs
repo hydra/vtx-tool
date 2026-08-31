@@ -1,13 +1,3 @@
-//! rf-cal: PA calibration + VTX table tool.
-//!
-//! Connection is manual by default (Connect button in the left panel);
-//! auto-connects at startup only if ALL THREE of --vtx-port,
-//! --meter-port, and --meter-kind are given on the command line (the
-//! meter kind determines the serial protocol/baud used to open the
-//! meter port, so it's just as required as the ports themselves for an
-//! actually-working auto-connect, not optional). Last-used ports are
-//! remembered (settings.rs) and pre-filled in the port fields regardless
-//! of whether auto-connect fires.
 
 mod app;
 mod calibration_engine;
@@ -31,45 +21,21 @@ use vtxtable::{VtxSelectionState, VtxTableConfig};
 #[derive(Parser, Debug)]
 #[command(name = "rf-cal", about = "RF PA calibration + VTX table tool")]
 struct Args {
-    /// Serial port for the VTX's MSP interface (e.g. /dev/ttyACM0, COM5).
-    /// If omitted, the app starts disconnected -- use the Connect button.
     #[arg(long)]
     vtx_port: Option<String>,
 
-    /// Serial port for the power meter. Auto-connect only fires if this,
-    /// --vtx-port, AND --meter-kind are all given.
     #[arg(long)]
     meter_port: Option<String>,
 
-    /// Power meter model, e.g. immersionrc-v1. Determines the serial
-    /// protocol/baud used to talk to it -- required (alongside the two
-    /// ports) for auto-connect, since there's no correct way to open the
-    /// meter port without knowing this.
-    ///
-    /// Parsed via power_meter::parse_cli, a plain function, rather than
-    /// clap's ValueEnum -- see power_meter.rs's PowerMeterKind::cli_name()
-    /// doc comment for why. The field type is still the real
-    /// PowerMeterKind enum either way, just not going through
-    /// #[arg(value_enum)]'s trait-based codegen path.
     #[arg(long, value_parser = power_meter::parse_cli)]
     meter_kind: Option<PowerMeterKind>,
 
-    /// Power meter attenuation correction in dB, added to every reading
-    /// received from the meter (e.g. if you've fitted an external 30dB
-    /// attenuator ahead of the meter, its display already accounts for
-    /// that, but the raw serial readings the meter reports don't -- this
-    /// corrects for the difference). If omitted, uses whatever's saved
-    /// in settings.json (default 30dB if that's never been set either).
     #[arg(long)]
     attenuation: Option<f32>,
 
-    /// Minimum log level to record (error, warn, info, debug, trace)
     #[arg(long, default_value = "debug")]
     log_level: LevelFilter,
 
-    /// Path to a VTX table JSON file to load at startup. Optional --
-    /// if omitted, the last loaded/saved path (settings.json) is used
-    /// instead, if any.
     #[arg(long)]
     vtx_table: Option<String>,
 }
@@ -100,23 +66,12 @@ fn main() -> eframe::Result<()> {
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
     state.lock().unwrap().meter_kind = initial_meter_kind;
     state.lock().unwrap().attenuation_db = initial_settings.attenuation_db;
-    // Auto-loaded from settings.json (or --vtx-table) if a path is set --
-    // falls back to VtxTableConfig::default() (an empty table) the same
-    // way it always has if the path is empty, or the load fails (a
-    // missing/corrupt file at a remembered path shouldn't prevent the
-    // app from starting; the VTX Table page's own file field still
-    // shows the path, and the user can fix it or Load again from there).
     let initial_vtx_table = if initial_settings.vtx_table_path.is_empty() {
         VtxTableConfig::default()
     } else {
         VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)).unwrap_or_default()
     };
     let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
-    // Not loaded from vtx_table_path (or anywhere else) -- this is the
-    // Frequency panel's own current selection, ephemeral UI state kept
-    // separate from the table definition (see vtxtable.rs's own module
-    // doc comment for why). Starts at VtxSelectionState::default() every
-    // launch, same as other UI-only state elsewhere in this app.
     let vtx_selection = Arc::new(Mutex::new(VtxSelectionState::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();

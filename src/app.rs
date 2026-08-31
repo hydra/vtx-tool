@@ -1,20 +1,3 @@
-//! App shell: left nav panel (page list + connection controls) + center
-//! egui_dock tab area + bottom panel split 50/50 between the VTX and
-//! power-meter logs.
-//!
-//! Pinned to eframe/egui 0.36.1 + egui_dock 0.21.1 (confirmed as a real,
-//! resolving combination from a build log) -- NOT 0.34.0 as originally
-//! specified. egui_dock 0.21.1 depends on egui 0.36.1 internally; keeping
-//! our own eframe/egui at 0.34.0 put two different copies of the egui
-//! crate in the dependency graph, which caused the earlier Ui/WidgetText
-//! type-mismatch errors.
-//!
-//! Connection lifecycle: ports are opened/closed on demand via
-//! Command::Connect/Disconnect (see worker.rs), not automatically at
-//! startup unless both were given on the command line (see main.rs).
-//! While connected, the port fields here are shown but disabled -- the
-//! worker owns the actual open ports and there's no live "change port"
-//! operation, only disconnect-then-reconnect.
 
 use crate::conn_status;
 use crate::logging;
@@ -29,9 +12,6 @@ use crate::worker::{Command, SharedState, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
 
-/// RTC6705's usable range, as enforced by vtx_msp.c's freq_is_in_58ghz()
-/// -- moved here from pages/vtx_table.rs alongside the Frequency section
-/// itself.
 const MIN_FREQ_KHZ: u32 = 5_600_000;
 const MAX_FREQ_KHZ: u32 = 6_000_000;
 use egui_dock::{DockArea, DockState};
@@ -132,20 +112,11 @@ impl App {
         }
     }
 
-    /// Opens `page` as a new tab, or focuses/activates it if already open.
     fn open_page(&mut self, page: Page) {
-        // find_tab() returns Option<TabPath> in this egui_dock version
-        // (a named struct, not a raw tuple). Passing it straight into
-        // set_active_tab() on the theory the API is symmetric.
         if let Some(path) = self.dock_state.find_tab(&page) {
             self.dock_state.set_active_tab(path);
         } else {
             self.dock_state.push_to_focused_leaf(page);
-            // Runs once, exactly when the tab is first created (not on
-            // every subsequent focus) -- the show() function itself
-            // gets called every frame the tab is visible, so triggering
-            // this there instead would mean re-sending the refresh
-            // constantly rather than just on first open.
             if page == Page::Calibration {
                 let _ = self.cmd_tx.send(Command::RefreshCalTable);
             }
@@ -155,23 +126,11 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
-        // Bottom: VTX log / power meter log, split 50/50 with a divider.
         egui::Panel::bottom("logs_panel")
             .resizable(true)
             .default_size(220.0)
             .min_size(80.0)
             .show(ui, |ui| {
-                // Nested resizable panel gives a real draggable divider
-                // between the two logs (with its own persisted width).
-                // Fixed default well clear of nav_panel's own default
-                // width below: egui's Panel derives its available rect
-                // from parent_ui.available_rect_before_wrap(), so a
-                // panel shown later (nav_panel) correctly inherits the
-                // space this one already claimed -- that part isn't
-                // buggy. What was happening is two independent dividers
-                // (this one, and nav_panel's right edge) landing at
-                // nearly the same x-position and reading as one
-                // continuous line running through both panels.
                 egui::Panel::left("vtx_log_panel")
                     .resizable(true)
                     .default_size(420.0)
@@ -181,11 +140,9 @@ impl eframe::App for App {
                         logging::show_panel(ui, "VTX log", &self.logs.vtx.lock().unwrap());
                     });
 
-                // Takes whatever width the vtx_log_panel above left behind.
                 logging::show_panel(ui, "Power meter log", &self.logs.meter.lock().unwrap());
             });
 
-        // Left: page list + connection controls.
         egui::Panel::left("nav_panel")
             .resizable(true)
             .default_size(250.0)
@@ -193,12 +150,6 @@ impl eframe::App for App {
             .max_size(500.0)
             .show_separator_line(true)
             .show(ui, |ui| {
-                // Content here can outgrow the panel's available height
-                // (e.g. once VTX Status/OSD Status are populated, or
-                // when the bottom logs panel is dragged tall) -- and now
-                // that the panel itself is resizable, width too (drag it
-                // narrow enough and rows like the port fields no longer
-                // fit). ScrollArea::both handles both without clipping.
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.heading("Pages");
                 ui.separator();
@@ -238,11 +189,9 @@ impl eframe::App for App {
                         } else if vtx_state.is_idle() {
                             let mut settings = AppSettings::load();
                             settings.vtx_port = self.vtx_port_input.clone();
-                            let _ = settings.save(); // best-effort -- remembers the port for next launch regardless of whether the connect itself succeeds
+                            let _ = settings.save();
                             let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
                         }
-                        // Connecting/Disconnecting: button click ignored -- an
-                        // operation's already in flight for this port.
                     }
                 });
 
@@ -282,16 +231,13 @@ impl eframe::App for App {
                                     .selectable_value(&mut self.meter_kind, kind, kind.name())
                                     .changed()
                                 {
-                                    // Reflected immediately (even before Connect) so the
-                                    // calibration page's update-rate dropdown can clamp
-                                    // to this kind's max_update_hz() right away.
                                     let mut s = self.state.lock().unwrap();
                                     s.meter_kind = kind;
                                     s.update_hz = s.update_hz.min(kind.max_update_hz() as f64);
                                     drop(s);
                                     let mut settings = AppSettings::load();
                                     settings.meter_kind = kind;
-                                    let _ = settings.save(); // best-effort -- same pattern as the port fields
+                                    let _ = settings.save();
                                 }
                             }
                         });
@@ -310,10 +256,6 @@ impl eframe::App for App {
                         let _ = self.cmd_tx.send(Command::DisconnectVtx);
                         let _ = self.cmd_tx.send(Command::DisconnectMeter);
                     } else {
-                        // Per-port ConnectVtx/ConnectMeter handlers already no-op
-                        // if that specific port is already open (see worker.rs),
-                        // so it's safe to just request both unconditionally here
-                        // rather than working out which ones actually need it.
                         if vtx_state.is_idle() {
                             let mut settings = AppSettings::load();
                             settings.vtx_port = self.vtx_port_input.clone();
@@ -409,14 +351,6 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.heading("VTX Status");
-                // Every value below is either read directly off the VTX's
-                // own MSP_PACALIBRATION reply, or (Power) derived from two
-                // VTX-reported facts (the reported level, looked up against
-                // the mW column of the calibration table also read from the
-                // VTX) -- see worker::VtxStatus's own doc comment. "—" means
-                // no reading has arrived yet (or the connected firmware
-                // doesn't send that particular field), never a guessed or
-                // defaulted value that could be mistaken for real data.
                 let (vtx_status, vtx_last_seen_at, osd_canvas, osd_keepalive_at) = {
                     let s = self.state.lock().unwrap();
                     (s.vtx_status.clone(), s.vtx_last_seen_at.clone(), s.osd_canvas, s.osd_keepalive_at.clone())
@@ -442,9 +376,6 @@ impl eframe::App for App {
 
                             ui.label("RTC6705 level:");
                             ui.label(match status.rtc6705_level {
-                                // Fixed, known mapping (rtc6705.h's own
-                                // rtc6705_power_t enum) -- not a guess, just a
-                                // more readable form of the same raw value.
                                 Some(0) => "3 dBm".to_string(),
                                 Some(1) => "7 dBm".to_string(),
                                 Some(2) => "11 dBm".to_string(),
@@ -502,12 +433,6 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.heading("OSD Status");
-                // Both fields below come from what THIS tool has sent/
-                // received over MSP_DISPLAYPORT -- see
-                // build_status_displayport_frames()'s doc comment in
-                // worker.rs for why this overlay exists (an MCU hang should
-                // show up here as a screen that stops updating, independent
-                // of whatever the serial link itself is or isn't reporting).
                 egui::Grid::new("osd_status_grid").num_columns(2).show(ui, |ui| {
                     ui.label("Size:");
                     ui.label(match osd_canvas {
@@ -524,19 +449,13 @@ impl eframe::App for App {
                     ui.end_row();
                 });
 
-                // While unchecked, worker.rs sends NO MSP_DISPLAYPORT traffic
-                // at all -- no keepalive, no clear, no draw_string/draw_screen
-                // -- so the firmware's own OSD content (e.g. debug_pa_loop()'s
-                // PID debug rows) can be observed with this tool's own
-                // overlay entirely out of the picture.
                 let mut osd_debug_overlay_enabled = self.state.lock().unwrap().osd_debug_overlay_enabled;
                 if ui.checkbox(&mut osd_debug_overlay_enabled, "Enable debug overlay").changed() {
                     self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
                 }
-                }); // ScrollArea
+                });
             });
 
-        // Center: whichever pages are open, as dock tabs.
         egui::CentralPanel::default().show(ui, |ui| {
             let mut viewer = TabViewer {
                 shared: &self.state,

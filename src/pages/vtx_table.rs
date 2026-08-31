@@ -1,11 +1,3 @@
-//! VTX Table page. This is now purely a LOCAL editor for the table the
-//! app hands back to the VTX when it asks (see worker.rs's passive
-//! responder and vtxtable.rs) -- there's no MSP push/pull to the VTX
-//! here anymore, since Betaflight's real protocol never has the FC pull
-//! a table FROM a VTX (confirmed against betaflight/betaflight's actual
-//! msp.c and PR #11705). Three ways to populate the table: hand-edit
-//! below, load a saved JSON file, or import Betaflight CLI `vtxtable`
-//! lines.
 
 use crate::msp::{VtxBand, VtxPowerLevel};
 use crate::settings::AppSettings;
@@ -16,29 +8,15 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-const MAX_CHANNELS_PER_BAND: usize = 8; // fixed by the wire format (freq[8] in VtxBand/SET_VTXTABLE_BAND)
+const MAX_CHANNELS_PER_BAND: usize = 8;
 
-/// UI-thread-owned scratch state that doesn't belong in the persisted
-/// VtxTableConfig itself (file path text field, CLI paste buffer, last
-/// error).
 #[derive(Default)]
 pub struct VtxTablePageState {
     pub file_path: String,
     pub cli_text: String,
     pub last_error: Option<String>,
-    /// Set when Save is clicked and the target file already exists --
-    /// renders the overwrite-confirm dialog instead of saving
-    /// immediately. Cleared (without saving) if the user cancels or
-    /// closes the dialog.
     pub confirm_overwrite: bool,
-    /// Bands removed by lowering "Number of bands", most-recently-
-    /// removed last -- restored (in reverse, i.e. most-recent-first)
-    /// the next time the count is raised again, so briefly lowering
-    /// then raising the count never loses what was actually typed in.
-    /// Cleared on Load/Import, since restoring bands from a previous,
-    /// unrelated table into a freshly loaded one wouldn't make sense.
     pub removed_bands: Vec<VtxBand>,
-    /// Same idea as removed_bands, for power levels.
     pub removed_power_levels: Vec<VtxPowerLevel>,
 }
 
@@ -100,7 +78,6 @@ pub fn show(
 
     ui.heading("VTX Table");
 
-    // ---- File I/O + CLI import -------------------------------------
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label("File:");
@@ -114,7 +91,7 @@ pub fn show(
                         page.removed_power_levels.clear();
                         let mut settings = AppSettings::load();
                         settings.vtx_table_path = page.file_path.clone();
-                        let _ = settings.save(); // best-effort -- same pattern as the port fields
+                        let _ = settings.save();
                     }
                     Err(e) => page.last_error = Some(format!("load failed: {e}")),
                 }
@@ -178,7 +155,7 @@ pub fn show(
                 });
             });
         if !open {
-            cancelled = true; // closed via the window's own X -- default is Cancel, per spec
+            cancelled = true;
         }
         if confirmed {
             page.confirm_overwrite = false;
@@ -198,7 +175,6 @@ pub fn show(
 
     ui.separator();
 
-    // ---- Bands table --------------------------------------------------
     ui.group(|ui| {
         ui.strong("Bands");
 
@@ -248,7 +224,6 @@ pub fn show(
 
     ui.separator();
 
-    // ---- Power levels table --------------------------------------------
     ui.group(|ui| {
         ui.strong("Power levels");
 
@@ -281,7 +256,6 @@ pub fn show(
 
     ui.separator();
 
-    // ---- Debug: query what the VTX itself currently reports -----------
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.strong("Debug: query VTX's own reported config");
