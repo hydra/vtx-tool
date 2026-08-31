@@ -24,7 +24,7 @@ use crate::pages::calibration::CalibrationPageState;
 use crate::pages::vtx_table::VtxTablePageState;
 use crate::power_meter::PowerMeterKind;
 use crate::settings::AppSettings;
-use crate::vtxtable::VtxTableConfig;
+use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
 use crate::worker::{Command, SharedState, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
@@ -89,6 +89,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 pub struct App {
     state: Arc<Mutex<SharedState>>,
     vtx_table: Arc<Mutex<VtxTableConfig>>,
+    vtx_selection: Arc<Mutex<VtxSelectionState>>,
     sweep: SharedSweep,
     cmd_tx: Sender<Command>,
     logs: &'static SharedLogs,
@@ -105,6 +106,7 @@ impl App {
     pub fn new(
         state: Arc<Mutex<SharedState>>,
         vtx_table: Arc<Mutex<VtxTableConfig>>,
+        vtx_selection: Arc<Mutex<VtxSelectionState>>,
         sweep: SharedSweep,
         cmd_tx: Sender<Command>,
         logs: &'static SharedLogs,
@@ -114,6 +116,7 @@ impl App {
         Self {
             state,
             vtx_table,
+            vtx_selection,
             sweep,
             cmd_tx,
             logs,
@@ -332,19 +335,20 @@ impl eframe::App for App {
                 ui.separator();
                 ui.heading("Frequency");
                 {
-                    let mut cfg = self.vtx_table.lock().unwrap();
+                    let table = self.vtx_table.lock().unwrap();
+                    let mut sel = self.vtx_selection.lock().unwrap();
 
-                    ui.checkbox(&mut cfg.pitmode, "Pit mode");
+                    ui.checkbox(&mut sel.pitmode, "Pit mode");
 
-                    let mut manual_mode = cfg.selected_band == 0;
+                    let mut manual_mode = sel.selected_band == 0;
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut manual_mode, false, "Band/Channel");
                         ui.selectable_value(&mut manual_mode, true, "Manual");
                     });
 
                     if manual_mode {
-                        cfg.selected_band = 0;
-                        let mut freq_khz = cfg.selected_freq_mhz as u32 * 1000;
+                        sel.selected_band = 0;
+                        let mut freq_khz = sel.selected_freq_mhz as u32 * 1000;
                         if ui
                             .add(
                                 egui::DragValue::new(&mut freq_khz)
@@ -354,46 +358,47 @@ impl eframe::App for App {
                             )
                             .changed()
                         {
-                            cfg.selected_freq_mhz = (freq_khz / 1000) as u16;
+                            sel.selected_freq_mhz = (freq_khz / 1000) as u16;
                         }
                         ui.label("Frequency");
                     } else {
-                        if cfg.selected_band == 0 {
-                            cfg.selected_band = 1;
+                        if sel.selected_band == 0 {
+                            sel.selected_band = 1;
                         }
-                        let band_indices: Vec<u8> = cfg.bands.iter().map(|b| b.index).collect();
+                        let band_indices: Vec<u8> = table.bands.iter().map(|b| b.index).collect();
                         egui::ComboBox::from_label("Band")
                             .selected_text(
-                                cfg.bands
+                                table
+                                    .bands
                                     .iter()
-                                    .find(|b| b.index == cfg.selected_band)
+                                    .find(|b| b.index == sel.selected_band)
                                     .map(|b| format!("{} ({})", b.name, b.letter))
                                     .unwrap_or_else(|| "-".to_string()),
                             )
                             .show_ui(ui, |ui| {
                                 for idx in band_indices {
-                                    if let Some(b) = cfg.bands.iter().find(|b| b.index == idx) {
+                                    if let Some(b) = table.bands.iter().find(|b| b.index == idx) {
                                         let label = format!("{} ({})", b.name, b.letter);
-                                        ui.selectable_value(&mut cfg.selected_band, idx, label);
+                                        ui.selectable_value(&mut sel.selected_band, idx, label);
                                     }
                                 }
                             });
 
-                        let chan_count = cfg
+                        let chan_count = table
                             .bands
                             .iter()
-                            .find(|b| b.index == cfg.selected_band)
+                            .find(|b| b.index == sel.selected_band)
                             .map(|b| b.channel_count.max(1))
                             .unwrap_or(1);
-                        ui.add(egui::Slider::new(&mut cfg.selected_channel, 1..=chan_count).text("Channel"));
+                        ui.add(egui::Slider::new(&mut sel.selected_channel, 1..=chan_count).text("Channel"));
 
-                        let freq = cfg.selected_frequency_mhz();
+                        let freq = sel.frequency_mhz(&table);
                         ui.label(format!("-> {freq} MHz"));
                     }
 
-                    let power_count = cfg.power_levels.len().max(1) as u8;
-                    ui.add(egui::Slider::new(&mut cfg.selected_power, 1..=power_count).text("Power level"));
-                    if let Some(p) = cfg.power_levels.iter().find(|p| p.index == cfg.selected_power) {
+                    let power_count = table.power_levels.len().max(1) as u8;
+                    ui.add(egui::Slider::new(&mut sel.selected_power, 1..=power_count).text("Power level"));
+                    if let Some(p) = table.power_levels.iter().find(|p| p.index == sel.selected_power) {
                         ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
                     }
 
