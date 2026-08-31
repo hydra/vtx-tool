@@ -36,15 +36,34 @@ pub enum FrequencyCapability {
     FullyProgrammable { min_mhz: u32, max_mhz: u32 },
 }
 
-/// Standard band list shared by both ImmersionRC variants -- V1 can't
-/// select these itself (ManualBand), V2 can (ProgrammableBand).
-const IMMERSIONRC_BANDS_MHZ: &[u32] = &[5800, 2400, 1200, 900, 868, 433, 72, 35];
+/// V1's own selectable bands -- V1 has no serial API to select one
+/// (ManualBand), so this is just the set the sweep prompts against; order
+/// doesn't matter here the way it does for V2's table below.
+const IMMERSIONRC_V1_BANDS_MHZ: &[u32] = &[5800, 2400, 1200, 900, 868, 433, 72, 35];
+
+/// V2's supported frequency table, confirmed from the manual -- ORDER
+/// MATTERS: this is indexed 0-15 exactly as written, and the index
+/// itself is what "F<idx>" sends/means on the wire (see
+/// PowerMeter::set_frequency() and freq_to_v2_index() below), unlike V1
+/// which has no index concept at all since it can't be set
+/// programmatically. NOT the same list as V1's (that one has 900MHz and
+/// a single 5800MHz entry; V2's manual specifically gives 915MHz and a
+/// full 5600-6000MHz sweep in 50MHz steps -- a real, confirmed
+/// difference between the two devices, not an oversight).
+const IMMERSIONRC_V2_FREQ_TABLE_MHZ: &[u32] = &[
+    35, 72, 433, 868, 915, 1200, 2400, // indices 0-6
+    5600, 5650, 5700, 5750, 5800, 5850, 5900, 5950, 6000, // indices 7-15, 50MHz steps
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PowerMeterKind {
     ImmersionRcV1,
-    /// Protocol mostly unconfirmed -- see PowerMeter::set_frequency's doc
-    /// comment for the one piece that IS confirmed (from cImmersionRC.py).
+    /// V, D, and F (both query and set forms) are confirmed from the
+    /// official manual -- see PowerMeter::set_frequency()/read_peak_dbm()/
+    /// read_frequency_raw()'s own doc comments for exactly what's
+    /// confirmed vs. still uncertain (baud rate and max update rate
+    /// remain unconfirmed placeholders, borrowed from V1 -- see
+    /// default_baud()/max_update_hz()).
     ImmersionRcV2,
     /// Stand-in for "some meter with a manual range, unknown protocol" --
     /// reads/aliveness log a message and return an error rather than
@@ -115,10 +134,10 @@ impl PowerMeterKind {
     pub fn capability(self) -> FrequencyCapability {
         match self {
             PowerMeterKind::ImmersionRcV1 => FrequencyCapability::ManualBand {
-                bands_mhz: IMMERSIONRC_BANDS_MHZ.to_vec(),
+                bands_mhz: IMMERSIONRC_V1_BANDS_MHZ.to_vec(),
             },
             PowerMeterKind::ImmersionRcV2 => FrequencyCapability::ProgrammableBand {
-                bands_mhz: IMMERSIONRC_BANDS_MHZ.to_vec(),
+                bands_mhz: IMMERSIONRC_V2_FREQ_TABLE_MHZ.to_vec(),
             },
             // Range is an arbitrary placeholder -- unknown for any real device.
             PowerMeterKind::GenericManual => FrequencyCapability::Manual { min_mhz: 5000, max_mhz: 10000 },
@@ -144,6 +163,23 @@ pub fn nearest_band(bands: &[u32], freq_mhz: u32) -> u32 {
         .copied()
         .min_by_key(|&b| freq_mhz.abs_diff(b))
         .unwrap_or(freq_mhz)
+}
+
+/// Maps `freq_mhz` to its nearest ImmersionRC V2 freqIdx (0-15, see
+/// IMMERSIONRC_V2_FREQ_TABLE_MHZ). The calibration sweep always calls
+/// PowerMeter::set_frequency() with a value already rounded to an exact
+/// table entry (via nearest_band(), using this same table -- see
+/// calibration_engine.rs's begin_frequency()), so this should normally
+/// find an exact match; it still picks the nearest one regardless, for
+/// safety if set_frequency() is ever called directly with an arbitrary
+/// value.
+fn freq_to_v2_index(freq_mhz: u32) -> u8 {
+    IMMERSIONRC_V2_FREQ_TABLE_MHZ
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &f)| freq_mhz.abs_diff(f))
+        .map(|(i, _)| i as u8)
+        .unwrap_or(0)
 }
 
 /// clap value_parser function for --meter-kind (wired in via
@@ -190,11 +226,8 @@ impl PowerMeter {
     pub fn read_dbm(&mut self, timeout: Duration) -> Result<f32> {
         match self.kind {
             PowerMeterKind::ImmersionRcV1 => self.read_dbm_immersionrc(timeout),
-            // ASSUMPTION: V2 uses the same "D\r\n" -> ASCII dBm reply
-            // protocol as V1 -- cImmersionRC.py (which is where
-            // set_frequency's confirmed F-command below comes from) uses
-            // the identical D-command for its reading loop, so this is a
-            // reasonable guess, not a bench-confirmed one.
+            // Confirmed: V2's manual gives "D" as the current AVERAGE
+            // power query in dBm -- same command and reply shape as V1.
             PowerMeterKind::ImmersionRcV2 => self.read_dbm_immersionrc(timeout),
             PowerMeterKind::GenericManual | PowerMeterKind::GenericFullyProgrammable => {
                 log::warn!(target: "meter", "read_dbm not implemented for {} -- protocol unknown", self.kind.name());
@@ -203,16 +236,14 @@ impl PowerMeter {
         }
     }
 
-    /// Sends the meter's presence-check command ("V\r\n" for the
-    /// ImmersionRC protocol -- a version query, going by convention with
-    /// D=reading, F=frequency) and returns Ok(()) if ANY reply comes
-    /// back, without caring what it says. Used purely to detect "is
-    /// something actually there answering" -- separate from read_dbm's
-    /// power polling.
+    /// Sends the meter's presence-check command ("V\r\n" -- a version
+    /// query, confirmed for both V1 and V2) and returns Ok(()) if ANY
+    /// reply comes back, without caring what it says. Used purely to
+    /// detect "is something actually there answering" -- separate from
+    /// read_dbm's power polling.
     pub fn check_alive(&mut self, timeout: Duration) -> Result<()> {
         match self.kind {
             PowerMeterKind::ImmersionRcV1 => self.send_and_read_line(b"V\r\n", timeout).map(|_| ()),
-            // ASSUMPTION: same V-command as V1 -- unconfirmed for V2 specifically.
             PowerMeterKind::ImmersionRcV2 => self.send_and_read_line(b"V\r\n", timeout).map(|_| ()),
             PowerMeterKind::GenericManual | PowerMeterKind::GenericFullyProgrammable => {
                 log::warn!(target: "meter", "check_alive not implemented for {} -- protocol unknown", self.kind.name());
@@ -227,16 +258,10 @@ impl PowerMeter {
     /// calibration_engine.rs's begin_frequency), but every kind has an
     /// implementation here for completeness/safety if called directly.
     ///
-    /// ImmersionRC V2 is a log-only stub for now, EXCEPT one piece is
-    /// actually confirmed: cImmersionRC.py's frequency setter sends
-    /// `F{i}\r\n` where `i = (clamp(freq_mhz, 5650, 5950) - 5625) / 50`
-    /// -- but that formula is specific to the narrow 5.6-5.95GHz band
-    /// (50MHz channel spacing within it), and our band list spans
-    /// several unrelated RF bands (2.4GHz, 1.2GHz, 900MHz, etc.) that
-    /// formula says nothing about. Wiring in just the 5.8GHz case would
-    /// leave a confusing half-implementation, so this stays a uniform
-    /// log-only stub across all bands for now -- worth revisiting if the
-    /// 5.8GHz case alone is useful sooner than the rest.
+    /// ImmersionRC V2: confirmed from the manual -- "F<freqIdx>" selects
+    /// by index into IMMERSIONRC_V2_FREQ_TABLE_MHZ (0-15). Finds the
+    /// nearest table entry to `freq_mhz` via freq_to_v2_index() and
+    /// sends its index.
     pub fn set_frequency(&mut self, freq_mhz: u32) -> Result<()> {
         match self.kind {
             PowerMeterKind::ImmersionRcV1 => {
@@ -244,8 +269,10 @@ impl PowerMeter {
                 Ok(())
             }
             PowerMeterKind::ImmersionRcV2 => {
-                log::warn!(target: "meter", "set_frequency({freq_mhz}) not yet implemented for ImmersionRC V2 -- protocol unknown beyond the 5.8GHz case (see doc comment), no-op for now");
-                Ok(())
+                let idx = freq_to_v2_index(freq_mhz);
+                let cmd = format!("F{idx}\r\n");
+                self.send_and_read_line(cmd.as_bytes(), Duration::from_millis(300))
+                    .map(|_| ())
             }
             PowerMeterKind::GenericManual => {
                 log::warn!(target: "meter", "set_frequency() called on a Manual-capability meter, which has no frequency-set API -- ignoring");
@@ -258,8 +285,48 @@ impl PowerMeter {
         }
     }
 
-    /// ImmersionRC "D\r\n" -> ASCII dBm reply, shared by V1 and V2 (see
-    /// the ASSUMPTION note on read_dbm's V2 arm).
+    /// ImmersionRC V2 only ("E\r\n" -- confirmed from the manual as the
+    /// current PEAK power query in dBm, as opposed to read_dbm()'s "D",
+    /// the current AVERAGE). Not confirmed for V1, so that arm errors
+    /// out honestly rather than guessing it shares V2's command.
+    pub fn read_peak_dbm(&mut self, timeout: Duration) -> Result<f32> {
+        match self.kind {
+            PowerMeterKind::ImmersionRcV2 => {
+                let line = self.send_and_read_line(b"E\r\n", timeout)?;
+                line.parse::<f32>()
+                    .map_err(|e| anyhow::anyhow!("meter replied '{line}' (not a number): {e}"))
+            }
+            _ => {
+                log::warn!(target: "meter", "read_peak_dbm not implemented for {} -- only confirmed for ImmersionRC V2", self.kind.name());
+                bail!("read_peak_dbm not implemented for {} (only confirmed for ImmersionRC V2)", self.kind.name());
+            }
+        }
+    }
+
+    /// ImmersionRC V2 only ("F\r\n" with no argument -- confirmed from
+    /// the manual as a query for the meter's current frequency setting).
+    /// The manual doesn't say whether the reply is the freqIdx (0-15,
+    /// symmetric with the "F<freqIdx>" set form) or a resolved MHz
+    /// value, so this returns the raw parsed number rather than
+    /// asserting one interpretation -- reconcile against
+    /// IMMERSIONRC_V2_FREQ_TABLE_MHZ once that's confirmed on real
+    /// hardware. Not confirmed for V1.
+    pub fn read_frequency_raw(&mut self, timeout: Duration) -> Result<u32> {
+        match self.kind {
+            PowerMeterKind::ImmersionRcV2 => {
+                let line = self.send_and_read_line(b"F\r\n", timeout)?;
+                line.parse::<u32>()
+                    .map_err(|e| anyhow::anyhow!("meter replied '{line}' (not a number): {e}"))
+            }
+            _ => {
+                log::warn!(target: "meter", "read_frequency_raw not implemented for {} -- only confirmed for ImmersionRC V2", self.kind.name());
+                bail!("read_frequency_raw not implemented for {} (only confirmed for ImmersionRC V2)", self.kind.name());
+            }
+        }
+    }
+
+    /// ImmersionRC "D\r\n" -> ASCII dBm reply, confirmed for both V1 and
+    /// V2 (see read_dbm's own doc comment on its V2 arm).
     fn read_dbm_immersionrc(&mut self, timeout: Duration) -> Result<f32> {
         let line = self.send_and_read_line(b"D\r\n", timeout)?;
         line.parse::<f32>()
