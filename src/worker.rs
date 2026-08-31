@@ -876,6 +876,33 @@ pub fn spawn(
                                 }
                             }
                             ctx.request_repaint();
+                        } else if frame.function == function::VTX_CONFIG && !frame.payload.is_empty() {
+                            // The VTX's reply to a query we queued (see
+                            // calibration_engine::PendingSend::RequestVtxConfig's
+                            // own doc comment -- queued after every
+                            // frequency/pitmode push, sent by the same
+                            // firmware path worker.rs's own startup-time
+                            // read_vtx_config() already uses, just
+                            // non-blocking here). This is what updates the
+                            // Frequency panel's UI -- from the VTX's own
+                            // reported state, not from what we assumed our
+                            // push did, since the VTX may reject, ignore,
+                            // or otherwise not apply it.
+                            match msp::decode_vtx_config(&frame.payload) {
+                                Ok(cfg) => {
+                                    let mut vt = vtx_table.lock().unwrap();
+                                    vt.selected_band = cfg.band;
+                                    vt.selected_channel = cfg.channel;
+                                    vt.selected_power = cfg.power;
+                                    vt.selected_freq_mhz = cfg.frequency_mhz;
+                                    vt.pitmode = cfg.pitmode;
+                                    drop(vt);
+                                    debug!(target: "vtx", "VTX_CONFIG reply: band={} channel={} power={} freq={}MHz pitmode={}",
+                                        cfg.band, cfg.channel, cfg.power, cfg.frequency_mhz, cfg.pitmode);
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => error!(target: "vtx", "failed to decode VTX_CONFIG reply: {e}"),
+                            }
                         } else if frame.function == function::SET_OSD_CANVAS {
                             if let Some(canvas) = msp::decode_osd_canvas(&frame.payload) {
                                 state.lock().unwrap().osd_canvas = Some(canvas);
