@@ -269,14 +269,19 @@ pub fn show(
 
         let power_points: Vec<[f64; 2]> = state.power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
         let temp_points_raw: Vec<[f64; 2]> = state.temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
+        let mcu_temp_points_raw: Vec<[f64; 2]> = state.mcu_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
         let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0);
 
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
-        let (temp_lo, temp_hi) = min_max_or(&temp_points_raw, 0.0, 1.0);
+        let combined_temp_points: Vec<[f64; 2]> =
+            temp_points_raw.iter().chain(mcu_temp_points_raw.iter()).copied().collect();
+        let (temp_lo, temp_hi) = min_max_or(&combined_temp_points, 0.0, 1.0);
         let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
         let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
         let temp_points_scaled: PlotPoints =
             temp_points_raw.iter().map(|&[t, c]| [t, temp_to_power(c)]).collect();
+        let mcu_temp_points_scaled: PlotPoints =
+            mcu_temp_points_raw.iter().map(|&[t, c]| [t, temp_to_power(c)]).collect();
         let power_points: PlotPoints = power_points.into();
 
         let left_axis = AxisHints::new_y().label("mW").placement(HPlacement::Left);
@@ -300,6 +305,9 @@ pub fn show(
             plot_ui.line(Line::new("Power (mW)", power_points));
             if !temp_points_raw.is_empty() {
                 plot_ui.line(Line::new("PA temp (°C)", temp_points_scaled).color(egui::Color32::YELLOW));
+            }
+            if !mcu_temp_points_raw.is_empty() {
+                plot_ui.line(Line::new("MCU temp (°C)", mcu_temp_points_scaled).color(egui::Color32::ORANGE));
             }
         });
         plot_response.response.context_menu(|ui| {

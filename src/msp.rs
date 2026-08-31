@@ -30,6 +30,7 @@ pub struct PaCalibrationReading {
     pub pid_active: Option<bool>,
     pub frequency_mhz: Option<u16>,
     pub session_active: Option<bool>,
+    pub mcu_temp_c: Option<f32>,
     pub ntc_raw: Option<u16>,
     pub pa_temp_c: Option<f32>,
 }
@@ -49,9 +50,15 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
         (None, None, None, None)
     };
     let session_active = if payload.len() >= 11 { Some(payload[10] != 0) } else { None };
-    let (ntc_raw, pa_temp_c) = if payload.len() >= 15 {
-        let ntc_raw = (payload[11] as u16) | ((payload[12] as u16) << 8);
-        let pa_temp_c_x10 = (payload[13] as i16) | ((payload[14] as i16) << 8);
+    let mcu_temp_c = if payload.len() >= 13 {
+        let mcu_temp_c_x10 = (payload[11] as i16) | ((payload[12] as i16) << 8);
+        Some(mcu_temp_c_x10 as f32 / 10.0)
+    } else {
+        None
+    };
+    let (ntc_raw, pa_temp_c) = if payload.len() >= 17 {
+        let ntc_raw = (payload[13] as u16) | ((payload[14] as u16) << 8);
+        let pa_temp_c_x10 = (payload[15] as i16) | ((payload[16] as i16) << 8);
         (Some(ntc_raw), Some(pa_temp_c_x10 as f32 / 10.0))
     } else {
         (None, None)
@@ -65,6 +72,7 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
         pid_active,
         frequency_mhz,
         session_active,
+        mcu_temp_c,
         ntc_raw,
         pa_temp_c,
     })
