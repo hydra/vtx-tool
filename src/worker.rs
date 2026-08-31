@@ -26,6 +26,7 @@ pub struct VtxStatus {
     pub detector_mv: u16,
     pub pid_active: Option<bool>,
     pub session_active: Option<bool>,
+    pub mcu_temp_c: Option<f32>,
     pub ntc_raw: Option<u16>,
     pub pa_temp_c: Option<f32>,
 }
@@ -37,6 +38,7 @@ pub struct SharedState {
     pub last_dbm: Option<f32>,
     pub power_history: VecDeque<(f64, f32)>,
     pub temp_history: VecDeque<(f64, f32)>,
+    pub mcu_temp_history: VecDeque<(f64, f32)>,
     pub reading_seq: u64,
     pub meter_kind: PowerMeterKind,
     pub attenuation_db: f32,
@@ -63,6 +65,7 @@ impl Default for SharedState {
             last_dbm: None,
             power_history: VecDeque::new(),
             temp_history: VecDeque::new(),
+            mcu_temp_history: VecDeque::new(),
             reading_seq: 0,
             meter_kind: PowerMeterKind::default(),
             attenuation_db: 30.0,
@@ -628,6 +631,7 @@ pub fn spawn(
                                     detector_mv: reading.detector_mv,
                                     pid_active: reading.pid_active,
                                     session_active: reading.session_active,
+                                    mcu_temp_c: reading.mcu_temp_c,
                                     ntc_raw: reading.ntc_raw,
                                     pa_temp_c: reading.pa_temp_c,
                                 };
@@ -643,16 +647,27 @@ pub fn spawn(
                                         }
                                     }
                                 }
+                                if let Some(mcu_temp_c) = reading.mcu_temp_c {
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    s.mcu_temp_history.push_back((elapsed, mcu_temp_c));
+                                    while let Some(&(t, _)) = s.mcu_temp_history.front() {
+                                        if elapsed - t > HISTORY_WINDOW_SECS {
+                                            s.mcu_temp_history.pop_front();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
                                 let osd_debug_overlay_enabled = s.osd_debug_overlay_enabled;
                                 drop(s);
                                 if osd_debug_overlay_enabled && displayport_queue.is_empty() {
                                     displayport_queue.push_back(msp::encode_displayport_clear());
                                     displayport_queue.extend(build_status_displayport_frames(&status));
                                 }
-                                debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?} ntc_raw={:?} pa_temp_c={:?}",
+                                debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?} mcu_temp_c={:?} ntc_raw={:?} pa_temp_c={:?}",
                                     reading.power_level, power_mw, reading.boost_on, reading.rtc6705_level,
                                     reading.frequency_mhz, reading.vref_mv, reading.detector_mv,
-                                    reading.pid_active, reading.session_active, reading.ntc_raw, reading.pa_temp_c);
+                                    reading.pid_active, reading.session_active, reading.mcu_temp_c, reading.ntc_raw, reading.pa_temp_c);
                                 pa_calibration_reading = Some(reading);
                             }
                         }

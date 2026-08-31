@@ -413,12 +413,16 @@ impl eframe::App for App {
                             });
                             ui.end_row();
 
-                            ui.label("PA NTC ADC:");
-                            ui.label(status.ntc_raw.map(|raw| raw.to_string()).unwrap_or_else(|| "—".to_string()));
+                            ui.label("MCU temperature:");
+                            ui.label(status.mcu_temp_c.map(|c| format!("{c:.1} °C")).unwrap_or_else(|| "—".to_string()));
                             ui.end_row();
 
-                            ui.label("PA temperature:");
+                            ui.label("PA NTC temperature:");
                             ui.label(status.pa_temp_c.map(|c| format!("{c:.1} °C")).unwrap_or_else(|| "—".to_string()));
+                            ui.end_row();
+
+                            ui.label("PA NTC ADC:");
+                            ui.label(status.ntc_raw.map(|raw| raw.to_string()).unwrap_or_else(|| "—".to_string()));
                             ui.end_row();
 
                             ui.label("Last seen:");
