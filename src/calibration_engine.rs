@@ -164,7 +164,7 @@ pub enum CellStatus {
     /// (or the physical DAC range) made the target unreachable, or a
     /// search got pinned without ever reaching the tolerance band.
     Uncalibrated,
-    /// User deliberately skipped this point (see SweepEngine::skip_current)
+    /// User deliberately skipped this point (see SweepEngine::skip_multiple)
     /// -- distinct from Uncalibrated, which means a search actually ran
     /// and failed to converge; this means no search ran at all.
     Skipped,
@@ -685,13 +685,13 @@ pub struct SweepEngine {
     /// clear_hard_limits() when the PA table is Refreshed.
     pub hard_limits: HashMap<u8, i32>,
     /// Sends the engine owes but hasn't issued yet -- safe-state pushes
-    /// (from skip_current()/abort()) and calibration session begin/end,
+    /// (from skip_multiple()/abort()) and calibration session begin/end,
     /// each processed one per eligible tick (see poll()'s own top-
     /// priority handling), respecting link.can_send_now() the exact same
     /// way every other send in this file does. This is what "only the
     /// engine sends commands" actually means in practice: a caller like
     /// worker.rs computes a payload (it owns vtx_table, this engine
-    /// doesn't) and hands it to skip_current()/abort() to queue, rather
+    /// doesn't) and hands it to skip_multiple()/abort() to queue, rather
     /// than sending it directly itself -- which is exactly how a real
     /// bug happened (an external, ungated send landing while the link
     /// was still supposed to be settling from a previous command).
@@ -762,7 +762,7 @@ pub struct SweepEngine {
 /// doc comment on SweepEngine. Each variant carries everything poll()
 /// needs to actually issue it once link.can_send_now() allows.
 enum PendingSend {
-    /// A pitmode-safe VTX_CONFIG push -- from abort()/skip_current()/
+    /// A pitmode-safe VTX_CONFIG push -- from abort()/skip_multiple()/
     /// exit_manual()/advance_position()'s own completion branch, all via
     /// safe_state_payload_at_current_point(), which computes this
     /// engine-internally now (see that function's own doc comment).
@@ -791,6 +791,32 @@ enum PendingSend {
     /// pushed, since the VTX may reject, ignore, or otherwise not apply
     /// it; this only reflects what the VTX itself actually reports back.
     RequestVtxConfig,
+    /// Explicitly parks the DAC at `vbias_mv` for `level`, with boost
+    /// forced off -- queued by skip_multiple() alongside its own
+    /// pitmode-forced SafeState push, so a multi-skip batch fully parks
+    /// the PA (not just suppresses RF output via pitmode) while
+    /// transitioning between points, instead of leaving the DAC sitting
+    /// at whatever value it was at when the batch began. Unlike
+    /// CalibrationState (which always uses level=0/mv=None, "don't touch
+    /// either"), this commands a specific level/mv/boost=Off outright.
+    DacLow { level: u8, vbias_mv: u16 },
+    /// Explicitly commands boost=On for `level` (mv untouched) -- the
+    /// one-time "undo" for DacLow's boost=Off, queued right after it as
+    /// part of skip_multiple()'s resume sequence. Necessary because of a
+    /// real firmware behavior (see vtx_msp_set_calibration() in
+    /// vtx_msp.c): boost_mode=2 (Auto) only clears the manual-override
+    /// flag (rf_pa_manual_boost_clear()) -- it does NOT call
+    /// rf_pa_boost_on() or otherwise re-apply the level's own
+    /// ext_pa_enable state. Since DacLow's boost=Off physically called
+    /// rf_pa_boost_off(), simply letting the next regular ScanPa send
+    /// (which always uses boost_mode=Auto) run its course left the PA
+    /// stuck off for the rest of the sweep -- confirmed from a live log
+    /// where boost_on stayed false through every subsequent point after
+    /// the first Skip, even though every one of those sends correctly
+    /// carried boost_mode=Auto. This restores the physical state once;
+    /// the very next Auto send then correctly clears the override flag
+    /// without disturbing it.
+    RestoreBoost { level: u8 },
 }
 
 
@@ -970,7 +996,7 @@ impl SweepEngine {
         let level = self.levels[self.level_idx];
         debug!(target: "vtx", "[sweep] manual: level={level} freq={}MHz vbias_mv={} detector_mv={detector_mv}",
             self.frequencies[self.freq_idx], self.manual_dac_mv);
-        self.completed_steps += 2; // counts as both ops, same as skip_current()/PA Failure
+        self.completed_steps += 2; // counts as both ops, same as skip_multiple()/PA Failure
         self.pending_result = Some(SweepResult {
             level,
             freq_idx: self.freq_idx,
@@ -986,10 +1012,35 @@ impl SweepEngine {
         self.advance_position()
     }
 
+    /// Pure position arithmetic, shared by advance_position() and
+    /// skip_multiple(): advances (level_idx, freq_idx) by exactly one
+    /// step, wrapping level_idx into freq_idx exactly the way the whole
+    /// sweep enumerates points. No side effects -- doesn't touch
+    /// self.state, doesn't push anything, doesn't call
+    /// begin_frequency(). Returns Some(true) if this step crossed into a
+    /// new frequency, Some(false) if it just moved to the next level
+    /// within the same frequency, or None if this was the last point in
+    /// the whole sweep -- in that case level_idx/freq_idx are left
+    /// UNCHANGED (still pointing at the last valid point, not advanced
+    /// past the end), so a caller can still build a safe-state payload
+    /// for wherever it actually stopped.
+    fn advance_indices(&mut self) -> Option<bool> {
+        if self.level_idx + 1 < self.levels.len() {
+            self.level_idx += 1;
+            return Some(false);
+        }
+        if self.freq_idx + 1 >= self.frequencies.len() {
+            return None; // whole sweep complete -- indices left at the last valid point
+        }
+        self.level_idx = 0;
+        self.freq_idx += 1;
+        Some(true)
+    }
+
     /// The ONE place level_idx/freq_idx ever change, for EITHER mode --
     /// see the module doc comment. Called by every "this point is done,
     /// move on" site in this file: finish_scan_pa()'s failure paths,
-    /// finish_scan_detector(), manual_next(), and skip_current() (both
+    /// finish_scan_detector(), manual_next(), and skip_multiple() (both
     /// modes). Reads which mode is currently active from self.state
     /// itself (no separate flag to pass in or keep in sync), and always
     /// leaves self.state set to wherever that mode should be once this
@@ -1013,11 +1064,8 @@ impl SweepEngine {
         // out to be the last point) needs to preserve. See
         // safe_state_payload_at_current_point()'s own doc comment.
         let safe_state_payload = self.safe_state_payload_at_current_point();
-        self.level_idx += 1;
-        if self.level_idx >= self.levels.len() {
-            self.level_idx = 0;
-            self.freq_idx += 1;
-            if self.freq_idx >= self.frequencies.len() {
+        match self.advance_indices() {
+            None => {
                 debug!(target: "vtx", "[sweep] all frequencies complete");
                 // Force pitmode on at the last-used frequency -- without
                 // this, a sweep/manual session that runs all the way to
@@ -1032,20 +1080,24 @@ impl SweepEngine {
                 self.session_active = false;
                 self.boost_mode = BoostMode::Auto;
                 self.pending_sends.push_back(PendingSend::CalibrationState);
-                return None;
+                None
             }
-            let next_freq = self.frequencies[self.freq_idx];
-            self.begin_frequency(next_freq, resume); // may land on AwaitingFreqConfirm
-        } else {
-            // Same frequency, next level -- no retune needed, just
-            // return directly to whichever mode is active, ready for its
-            // next point.
-            self.state = match resume {
-                ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
-                ResumeMode::Manual => EngineState::Manual,
-            };
+            Some(true) => {
+                let next_freq = self.frequencies[self.freq_idx];
+                self.begin_frequency(next_freq, resume); // may land on AwaitingFreqConfirm
+                Some((self.levels[self.level_idx], self.freq_idx))
+            }
+            Some(false) => {
+                // Same frequency, next level -- no retune needed, just
+                // return directly to whichever mode is active, ready for
+                // its next point.
+                self.state = match resume {
+                    ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
+                    ResumeMode::Manual => EngineState::Manual,
+                };
+                Some((self.levels[self.level_idx], self.freq_idx))
+            }
         }
-        Some((self.levels[self.level_idx], self.freq_idx))
     }
 
     /// Exits Manual mode via the "Manual" button pressed a second time.
@@ -1187,80 +1239,147 @@ impl SweepEngine {
         self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
-    /// Skips whatever (level, freq) point is currently in progress and
-    /// advances to wherever normal progression would go next -- the next
-    /// level at this same frequency, or the next frequency if this was
-    /// the last selected level, exactly as if this point had finished
-    /// normally (just marked Skipped instead of Calibrated/Uncalibrated).
-    /// Both modes now go through the exact same advance_position() --
-    /// see its own doc comment. Automatic mode used to just bump
-    /// level_idx and rely on poll()'s own top-of-tick rollover check to
-    /// notice the overflow next time around; that check no longer exists
-    /// (advance_position() does the whole rollover, including any
-    /// retune, immediately and eagerly, the same way Manual mode's side
-    /// always has).
+    /// Skips `count` (level, freq) points in a row, advancing exactly as
+    /// if each had finished normally (marked Skipped instead of
+    /// Calibrated/Uncalibrated) -- but without cycling the VTX through
+    /// every intermediate point along the way. This is what the UI's
+    /// Skip button now sends: it debounces rapid presses into a single
+    /// call here (500ms after the last press -- see
+    /// pages/calibration.rs), rather than sending `count` separate
+    /// single-skip commands. Previously, each skip queued its own
+    /// pitmode-safe transition (and, if it crossed a frequency, its own
+    /// retune) -- pressing Skip 4 times in under a second used to queue
+    /// 4 rounds of that traffic, each gated by its own settle window,
+    /// which then took several visible seconds to drain, with the VTX
+    /// visibly/audibly cycling through every intermediate frequency
+    /// along the way. Batching means exactly ONE combined safe
+    /// transition covers the whole batch, and exactly one retune (if
+    /// any) lands the VTX directly on wherever the batch actually ends.
     ///
-    /// `safe_state_payload_at_current_point()` is queued as a
-    /// pitmode-safe VTX_CONFIG push, giving the VTX a defined safe point
-    /// between the skipped point and whatever comes next, sent through
-    /// the same gated mechanism as every other send in this file rather
-    /// than directly. Computed here (not by the caller from vtx_table --
-    /// see that function's own doc comment for why) before
-    /// advance_position() runs below, though advance_position() would
-    /// compute the identical payload itself anyway if this happens to be
-    /// the last remaining point -- sending the same safe pitmode state
-    /// twice in a row is harmless.
+    /// The first point skipped is whatever was ACTUALLY in progress when
+    /// the first press arrived -- same cell-accounting distinction the
+    /// old single-skip path made (mid-ScanPa: both cells outstanding;
+    /// mid-ScanDetector: just the detector cell; Manual/EnteringPoint:
+    /// nothing committed yet). Every point after the first was never
+    /// visited at all (fast-forwarded past, not stepped into), so those
+    /// always mark both cells.
+    ///
+    /// The combined safe transition is two queued sends, not one: a
+    /// pitmode-forced VTX_CONFIG (via safe_state_payload_at_current_point(),
+    /// same as abort()/exit_manual()) AND an explicit SET_PACALIBRATION
+    /// parking the DAC at the safe/low-power end of the STARTING level's
+    /// range (see coarse_ramp_start_vbias_mv()) with boost forced off --
+    /// pitmode alone suppresses RF output but doesn't itself move the
+    /// DAC or touch the boost stage, and both together park the PA more
+    /// thoroughly than either alone during a transition that might
+    /// otherwise take a visible moment to land.
+    ///
+    /// If the batch runs past the last remaining point, ends the session
+    /// exactly like advance_position()'s own completion branch (one
+    /// safe-state push at wherever the batch actually stopped, then
+    /// close out) -- the DAC-low push is skipped in that case, since
+    /// pitmode already covers "session's over, VTX should go quiet" and
+    /// there's no "resume" to protect against.
     ///
     /// Returns the new (level, freq_idx) only for Manual mode (the UI
     /// reseeds the DAC slider from it) -- automatic mode's own table
     /// redraws from cell status instead, so it always returns None,
-    /// matching this function's previous behavior.
-    pub fn skip_current(&mut self) -> Option<(u8, usize)> {
-        let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
-        debug!(target: "vtx", "[sweep] skipped level={level} freq_idx={} ({}/{} steps completed)",
+    /// matching skip_current()'s old behavior. count=0 is a no-op.
+    pub fn skip_multiple(&mut self, count: u32) -> Option<(u8, usize)> {
+        if count == 0 {
+            return None;
+        }
+        let resume = match &self.state {
+            EngineState::Manual => ResumeMode::Manual,
+            EngineState::Automatic(_) => ResumeMode::Automatic,
+            _ => return None, // not in a skippable state (Idle, AwaitingFreqConfirm, ConnectionLost)
+        };
+        let starting_level = self.levels[self.level_idx];
+        debug!(target: "vtx", "[sweep] skip x{count} starting at level={starting_level} freq_idx={} ({}/{} steps completed)",
             self.freq_idx, self.completed_steps, self.total_steps);
-        let safe_state_payload = self.safe_state_payload_at_current_point();
 
-        match &self.state {
-            EngineState::Manual => {
-                self.completed_steps += 2; // same accounting as manual_next()/automatic's own skip below
-                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                self.per_level_status.insert(level, LevelStatus::Skipped);
-                let next_pos = self.advance_position();
-                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
-                next_pos
-            }
-            EngineState::Automatic(step) => {
-                // Mark whichever cell(s) were still outstanding for this
-                // point. Mid-ScanPa: neither op for this point ever ran,
-                // so both the VBIAS cell (never converged) and the
-                // Detector cell (never even started) get marked, and
-                // both count toward completed_steps below. Mid-
-                // ScanDetector: ScanPa already finished normally
-                // (finish_scan_pa already counted its own completed_steps
-                // and set the VBIAS cell's real outcome) -- only the
-                // Detector cell and its one remaining op need accounting
-                // for here.
-                let skipped_ops = match step {
-                    AutomaticStep::ScanPa(_) => {
+        let mut crossed_frequency = false;
+
+        for i in 0..count {
+            let level = self.levels[self.level_idx];
+            if i == 0 {
+                let ops = match &self.state {
+                    EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
                         Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
                         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
                         2
                     }
-                    AutomaticStep::ScanDetector(_) => {
+                    EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
                         Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
                         1
                     }
-                    AutomaticStep::EnteringPoint => 0,
+                    EngineState::Automatic(AutomaticStep::EnteringPoint) => 0,
+                    EngineState::Manual => {
+                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        2
+                    }
+                    _ => 0,
                 };
-                self.completed_steps += skipped_ops;
-                self.per_level_status.insert(level, LevelStatus::Skipped);
-                self.advance_position();
-                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
-                None
+                self.completed_steps += ops;
+            } else {
+                // Fast-forwarded past entirely -- never visited, so both
+                // cells are still outstanding.
+                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                self.completed_steps += 2;
             }
-            _ => None, // not in a skippable state (Idle, AwaitingFreqConfirm, ConnectionLost)
+            self.per_level_status.insert(level, LevelStatus::Skipped);
+
+            match self.advance_indices() {
+                None => {
+                    // Whole sweep completed partway through this batch --
+                    // same handling as advance_position()'s own completion
+                    // branch, at wherever we actually stopped
+                    // (advance_indices() leaves level_idx/freq_idx at the
+                    // last valid point on this outcome).
+                    debug!(target: "vtx", "[sweep] skip x{count}: all frequencies complete after {} skips", i + 1);
+                    let safe_state_payload = self.safe_state_payload_at_current_point();
+                    self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+                    self.state = EngineState::Idle;
+                    self.session_active = false;
+                    self.boost_mode = BoostMode::Auto;
+                    self.pending_sends.push_back(PendingSend::CalibrationState);
+                    return None;
+                }
+                Some(crossed) => crossed_frequency |= crossed,
+            }
+        }
+
+        // ONE combined safe transition for the whole batch -- not one
+        // per skipped point. DAC-low first (park the PA before any
+        // retune that follows), then pitmode, then an explicit boost
+        // restore for wherever the batch is resuming -- see
+        // RestoreBoost's own doc comment for why this last step is
+        // necessary (Auto alone does not undo DacLow's boost=Off).
+        let (bound_lo, bound_hi) = self.effective_bounds(starting_level);
+        let low_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
+        self.pending_sends.push_back(PendingSend::DacLow { level: starting_level, vbias_mv: low_mv as u16 });
+        let pitmode_payload = self.safe_state_payload_at_current_point();
+        self.pending_sends.push_back(PendingSend::SafeState(pitmode_payload));
+        let resume_level = self.levels[self.level_idx];
+        self.pending_sends.push_back(PendingSend::RestoreBoost { level: resume_level });
+        debug!(target: "vtx", "[sweep] skip x{count}: safe transition queued (level={starting_level} vbias_mv={low_mv} boost=Off, then pitmode, then boost restored for level={resume_level}), resuming at level={resume_level} freq_idx={}",
+            self.freq_idx);
+
+        if crossed_frequency {
+            let freq_mhz = self.frequencies[self.freq_idx];
+            self.begin_frequency(freq_mhz, resume); // may land on AwaitingFreqConfirm
+        } else {
+            self.state = match resume {
+                ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
+                ResumeMode::Manual => EngineState::Manual,
+            };
+        }
+
+        match resume {
+            ResumeMode::Manual => Some((self.levels[self.level_idx], self.freq_idx)),
+            ResumeMode::Automatic => None,
         }
     }
 
@@ -1359,7 +1478,7 @@ impl SweepEngine {
             }
         }
 
-        // Queued sends (safe-state pushes from skip_current()/abort(),
+        // Queued sends (safe-state pushes from skip_multiple()/abort(),
         // calibration session begin/end) take absolute priority over
         // everything else, and are processed regardless of engine state
         // -- abort() already transitions to Idle synchronously, but its
@@ -1390,6 +1509,18 @@ impl SweepEngine {
                     link.send_v1(function::VTX_CONFIG as u8, &[])?;
                     link.note_sent(MspCommandKind::Other);
                     debug!(target: "vtx", "[sweep] requested current VTX_CONFIG (to confirm the last push actually landed)");
+                }
+                PendingSend::DacLow { level, vbias_mv } => {
+                    let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, BoostMode::Off.wire_byte());
+                    link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
+                    link.note_sent(MspCommandKind::Calibration);
+                    debug!(target: "vtx", "[sweep] DAC parked low: level={level} vbias_mv={vbias_mv} boost=Off");
+                }
+                PendingSend::RestoreBoost { level } => {
+                    let payload = msp::encode_pa_calibration_request(level, None, self.session_active, BoostMode::On.wire_byte());
+                    link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
+                    link.note_sent(MspCommandKind::Calibration);
+                    debug!(target: "vtx", "[sweep] boost restored: level={level} boost=On");
                 }
             }
             return Ok(true);
@@ -2142,7 +2273,7 @@ impl SweepEngine {
     /// Builds a pitmode-forced VTX_CONFIG payload at whatever (level,
     /// freq) this engine itself is CURRENTLY (or, if just past the last
     /// point, was MOST RECENTLY) working on -- level_idx/freq_idx are
-    /// never reset by abort()/skip_current(), and advance_position()'s
+    /// never reset by abort()/skip_multiple(), and advance_position()'s
     /// own completion branch captures them before either index moves,
     /// so this is always the right point in every case that calls it.
     ///
@@ -2151,7 +2282,7 @@ impl SweepEngine {
     /// exiting Manual mode) needs to force pitmode WITHOUT changing
     /// which frequency the VTX is left on, and vtx_table is the
     /// Frequency panel's own, unrelated setting (see
-    /// Command::SkipCurrent's own comment in worker.rs for the exact
+    /// Command::SkipMultiple's own comment in worker.rs for the exact
     /// failure that caused when this used vtx_table's cached frequency
     /// instead of the sweep's own).
     fn safe_state_payload_at_current_point(&self) -> Vec<u8> {
@@ -2429,7 +2560,7 @@ impl SweepEngine {
             // detector cell the same way (no search ran there either)
             // and account for BOTH steps (this ScanPa op plus the
             // ScanDetector op that never ran) in completed_steps, same
-            // reasoning as skip_current() -- otherwise the progress bar
+            // reasoning as skip_multiple() -- otherwise the progress bar
             // would never reach 100%.
             let cell_status = if not_settled { CellStatus::NotSettled } else { CellStatus::PaFailure };
             let level_status = if not_settled { LevelStatus::NotSettled } else { LevelStatus::PaFailure };
@@ -2546,7 +2677,7 @@ fn interpolate(target_mw: f32, below: (f32, u16), above: (f32, u16)) -> u16 {
 /// safe-state-on-connect and safe-state-on-reconnect pushes (see
 /// worker.rs), where there's no active sweep whose frequency needs
 /// preserving, so the current selection (resolved against `table`) is
-/// exactly what's wanted. NOT used for abort()/skip_current()/
+/// exactly what's wanted. NOT used for abort()/skip_multiple()/
 /// exit_manual() -- those compute their own payload internally now (see
 /// SweepEngine::safe_state_payload_at_current_point()), since a sweep in
 /// progress needs to preserve its OWN last-used frequency, not revert to

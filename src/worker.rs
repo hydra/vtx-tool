@@ -249,10 +249,13 @@ pub enum Command {
     /// Stops the sweep and pushes a pitmode-forced VTX_CONFIG as a safe
     /// state (see calibration_engine::safe_state_payload).
     AbortSweep,
-    /// Skip whatever (level, freq) point is currently in progress and
-    /// move on to whatever's next in normal progression order (see
-    /// SweepEngine::skip_current).
-    SkipCurrent,
+    /// Skip `count` (level, freq) points in a row, advancing to wherever
+    /// normal progression would land after that many (see
+    /// SweepEngine::skip_multiple). The UI debounces rapid Skip presses
+    /// (500ms after the last one) into a single one of these carrying
+    /// the total click count, rather than sending one command per press
+    /// -- see pages/calibration.rs.
+    SkipMultiple { count: u32 },
     /// Pushes the working pa_table's calibration[]/detector[] for every
     /// real level (idx >= 1) to the VTX via SET_PACALTABLE, which
     /// persists to EEPROM immediately as part of processing each entry
@@ -715,10 +718,10 @@ pub fn spawn(
                             s.update_hz = prev;
                         }
                     }
-                    Command::SkipCurrent => {
+                    Command::SkipMultiple { count } => {
                         // No direct send here anymore -- only the engine sends
-                        // commands. skip_current() computes its own pitmode-
-                        // forced payload internally now, from the engine's own
+                        // commands. skip_multiple() computes its own combined
+                        // safe transition internally now, from the engine's own
                         // current (level, freq) -- see its own doc comment for
                         // why this no longer goes through vtx_table -- and
                         // queues it for poll()'s own next eligible tick to
@@ -731,7 +734,7 @@ pub fn spawn(
                         // was tracking ever got a say).
                         let next_pos = {
                             let mut guard = sweep.lock().unwrap();
-                            guard.as_mut().and_then(|engine| engine.skip_current())
+                            guard.as_mut().and_then(|engine| engine.skip_multiple(count))
                         };
                         // Only Some() when Manual mode's own skip advanced the
                         // position -- reseed the slider from the new cell's
