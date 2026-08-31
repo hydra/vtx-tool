@@ -626,6 +626,24 @@ pub struct DetectorDebugInfo {
     pub pinned_count: u32,
 }
 
+/// Snapshot of a single VTX_CONFIG frequency/pitmode push this engine
+/// just made (see SweepEngine::build_vtx_config_frequency_payload() --
+/// every call sets SweepEngine::pending_vtx_config_update to one of
+/// these). worker.rs takes it after every poll() (same one-shot
+/// take()-and-clear pattern as pending_result/pending_meter_frequency)
+/// and updates its own vtx_table cache to match, which is what the
+/// Frequency panel's UI actually displays -- without this file needing
+/// to know vtx_table (or the UI) exists at all. Purely informational;
+/// nothing in this file ever reads it back, and no MSP traffic is added
+/// or changed by its existence -- it just reports what the
+/// payload-building step already decided to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushedVtxConfig {
+    pub freq_mhz: u16,
+    pub power: u8,
+    pub pitmode: bool,
+}
+
 pub struct SweepEngine {
     pub levels: Vec<u8>,       // selected levels, ascending
     pub frequencies: Vec<u16>, // from PA table idx=0's value[] (frequency breakpoints)
@@ -671,6 +689,16 @@ pub struct SweepEngine {
     /// a power level + DAC vbias_mv), never actually retuned the VTX, so it
     /// stayed on whatever frequency it was last configured to.
     pending_frequency_push: Option<u16>,
+    /// One-shot notification of a push just made -- see PushedVtxConfig's
+    /// own doc comment. worker.rs takes() this (same pattern as
+    /// pending_result/pending_meter_frequency above), so it's only ever
+    /// applied once per actual push, never re-applied on a later tick
+    /// where nothing new happened (which would otherwise mean the sweep's
+    /// last state kept overwriting the Frequency panel forever, even long
+    /// after the sweep ended and the person had gone on to edit it by
+    /// hand). pub so worker.rs can take() it; nothing in this file ever
+    /// reads it back.
+    pub pending_vtx_config_update: Option<PushedVtxConfig>,
     /// Set whenever a ProgrammableBand/FullyProgrammable meter needs its
     /// own frequency changed too -- worker.rs drains this and calls
     /// PowerMeter::set_frequency(), then clears it. Unlike
@@ -834,6 +862,7 @@ impl SweepEngine {
             meter_capability: FrequencyCapability::Manual { min_mhz: 0, max_mhz: 0 }, // set for real in start()
             last_prompted_band: None,
             pending_frequency_push: None,
+            pending_vtx_config_update: None,
             pending_meter_frequency: None,
             hard_limits: HashMap::new(),
             pending_sends: VecDeque::new(),
@@ -1442,7 +1471,7 @@ impl SweepEngine {
         // last tuned to.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
-            let payload = build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
+            let payload = self.build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] pushed frequency change to {freq_mhz}MHz (power={level})");
@@ -2131,10 +2160,10 @@ impl SweepEngine {
     /// Command::SkipCurrent's own comment in worker.rs for the exact
     /// failure that caused when this used vtx_table's cached frequency
     /// instead of the sweep's own).
-    fn safe_state_payload_at_current_point(&self) -> Vec<u8> {
+    fn safe_state_payload_at_current_point(&mut self) -> Vec<u8> {
         let level = self.levels.get(self.level_idx).copied().unwrap_or(1);
         let freq_mhz = self.frequencies.get(self.freq_idx).copied().unwrap_or(5800);
-        build_vtx_config_frequency_payload(freq_mhz, level, true)
+        self.build_vtx_config_frequency_payload(freq_mhz, level, true)
     }
 
     /// Called by poll() once both vtx_ready and meter_ready are true
@@ -2337,7 +2366,7 @@ impl SweepEngine {
         // actually issues the VTX_CONFIG retune once that's ready.
         if let Some(freq_mhz) = self.pending_frequency_push.take() {
             let level = self.levels.first().copied().unwrap_or(1);
-            let payload = build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
+            let payload = self.build_vtx_config_frequency_payload(freq_mhz, level, false); // normal retune -- pitmode off
             link.send_v1(function::VTX_CONFIG as u8, &payload)?;
             link.note_sent(MspCommandKind::Retune);
             debug!(target: "vtx", "[sweep] manual: pushed frequency change to {freq_mhz}MHz (power={level})");
@@ -2468,34 +2497,43 @@ impl SweepEngine {
         self.per_level_status.insert(level, LevelStatus::Done);
         self.advance_position();
     }
-}
 
-/// Builds an MSP_VTX_CONFIG payload that retunes the VTX to `freq_mhz`
-/// directly (band=0) -- independent of the stored VtxTableConfig's
-/// "Selected" state (a separate, user-facing concept the sweep
-/// shouldn't disturb). `power` just needs to be a valid level index so
-/// vtx_apply_hw() picks a sensible RTC6705 register while retuning; the
-/// SET_PACALIBRATION calls that immediately follow set the real level
-/// and DAC value regardless (and re-set the RTC6705 register too, via
-/// vtx_msp_set_calibration()), so this doesn't need to be exact.
-fn build_vtx_config_frequency_payload(freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
-    let mut p = vec![0u8; 15];
-    p[0] = 5; // VTXDEV_MSP
-    p[1] = 0; // band=0 -> use the raw frequency field directly
-    p[2] = 0; // channel (unused when band=0)
-    p[3] = power;
-    p[4] = pitmode as u8;
-    p[5] = (freq_mhz & 0xff) as u8;
-    p[6] = (freq_mhz >> 8) as u8;
-    p[7] = 1; // device_ready
-    p[8] = 0; // low_power_disarm
-    p[9] = 0;
-    p[10] = 0; // pit_mode_freq
-    p[11] = 1; // vtx_table_available -- MUST be nonzero or handle_msp_set_vtx_config() ignores the whole push
-    p[12] = 0; // band_count -- not meaningful for a direct-frequency push; a mismatch just makes the VTX re-broadcast its own table afterward, harmless
-    p[13] = 0; // channel_count
-    p[14] = 0; // power_level_count
-    p
+    /// Builds an MSP_VTX_CONFIG payload that retunes the VTX to
+    /// `freq_mhz` directly (band=0) -- independent of the stored
+    /// VtxTableConfig's "Selected" state (a separate, user-facing
+    /// concept this file has no access to and doesn't directly touch).
+    /// `power` just needs to be a valid level index so vtx_apply_hw()
+    /// picks a sensible RTC6705 register while retuning; the
+    /// SET_PACALIBRATION calls that immediately follow set the real
+    /// level and DAC value regardless (and re-set the RTC6705 register
+    /// too, via vtx_msp_set_calibration()), so this doesn't need to be
+    /// exact.
+    ///
+    /// Every call records what it built into pending_vtx_config_update
+    /// (see that field's own doc comment) -- this doesn't add or change
+    /// any MSP traffic, it's purely bookkeeping so worker.rs can mirror
+    /// what actually got pushed into its own vtx_table, and therefore
+    /// the Frequency panel's UI.
+    fn build_vtx_config_frequency_payload(&mut self, freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
+        self.pending_vtx_config_update = Some(PushedVtxConfig { freq_mhz, power, pitmode });
+        let mut p = vec![0u8; 15];
+        p[0] = 5; // VTXDEV_MSP
+        p[1] = 0; // band=0 -> use the raw frequency field directly
+        p[2] = 0; // channel (unused when band=0)
+        p[3] = power;
+        p[4] = pitmode as u8;
+        p[5] = (freq_mhz & 0xff) as u8;
+        p[6] = (freq_mhz >> 8) as u8;
+        p[7] = 1; // device_ready
+        p[8] = 0; // low_power_disarm
+        p[9] = 0;
+        p[10] = 0; // pit_mode_freq
+        p[11] = 1; // vtx_table_available -- MUST be nonzero or handle_msp_set_vtx_config() ignores the whole push
+        p[12] = 0; // band_count -- not meaningful for a direct-frequency push; a mismatch just makes the VTX re-broadcast its own table afterward, harmless
+        p[13] = 0; // channel_count
+        p[14] = 0; // power_level_count
+        p
+    }
 }
 
 /// Linear interpolation of the detector value at exactly `target_mw`,
