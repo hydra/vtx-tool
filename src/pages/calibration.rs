@@ -270,7 +270,9 @@ pub fn show(
         let power_points: Vec<[f64; 2]> = state.power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
         let temp_points_raw: Vec<[f64; 2]> = state.temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
         let mcu_temp_points_raw: Vec<[f64; 2]> = state.mcu_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
-        let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0);
+        let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0)
+            .max(state.temp_history.back().map(|&(t, _)| t).unwrap_or(0.0))
+            .max(state.mcu_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0));
 
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
         let combined_temp_points: Vec<[f64; 2]> =

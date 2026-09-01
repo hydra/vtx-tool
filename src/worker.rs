@@ -131,6 +131,8 @@ pub fn spawn(
         let mut displayport_queue: VecDeque<Vec<u8>> = VecDeque::new();
         let mut last_displayport_keepalive = Instant::now();
         const DISPLAYPORT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+        let mut last_history_trim = Instant::now();
+        const HISTORY_TRIM_INTERVAL: Duration = Duration::from_secs(1);
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
@@ -543,6 +545,17 @@ pub fn spawn(
                 ctx.request_repaint();
             }
 
+            if last_history_trim.elapsed() >= HISTORY_TRIM_INTERVAL {
+                last_history_trim = Instant::now();
+                let now = start.elapsed().as_secs_f64();
+                let mut s = state.lock().unwrap();
+                trim_stale_history(&mut s.power_history, now);
+                trim_stale_history(&mut s.temp_history, now);
+                trim_stale_history(&mut s.mcu_temp_history, now);
+                drop(s);
+                ctx.request_repaint();
+            }
+
             if let Some(link) = vtx.as_mut() {
                 if last_status_query.elapsed() >= VTX_STATUS_QUERY_INTERVAL && link.can_send_now() {
                     last_status_query = Instant::now();
@@ -639,24 +652,10 @@ pub fn spawn(
                                 if let Some(temp_c) = reading.pa_temp_c {
                                     let elapsed = start.elapsed().as_secs_f64();
                                     s.temp_history.push_back((elapsed, temp_c));
-                                    while let Some(&(t, _)) = s.temp_history.front() {
-                                        if elapsed - t > HISTORY_WINDOW_SECS {
-                                            s.temp_history.pop_front();
-                                        } else {
-                                            break;
-                                        }
-                                    }
                                 }
                                 if let Some(mcu_temp_c) = reading.mcu_temp_c {
                                     let elapsed = start.elapsed().as_secs_f64();
                                     s.mcu_temp_history.push_back((elapsed, mcu_temp_c));
-                                    while let Some(&(t, _)) = s.mcu_temp_history.front() {
-                                        if elapsed - t > HISTORY_WINDOW_SECS {
-                                            s.mcu_temp_history.pop_front();
-                                        } else {
-                                            break;
-                                        }
-                                    }
                                 }
                                 let osd_debug_overlay_enabled = s.osd_debug_overlay_enabled;
                                 drop(s);
@@ -811,13 +810,6 @@ pub fn spawn(
                             s.last_dbm = Some(dbm);
                             s.power_history.push_back((elapsed, mw));
                             s.reading_seq += 1;
-                            while let Some(&(t, _)) = s.power_history.front() {
-                                if elapsed - t > HISTORY_WINDOW_SECS {
-                                    s.power_history.pop_front();
-                                } else {
-                                    break;
-                                }
-                            }
                         }
                         Err(e) => error!(target: "meter", "read failed: {e}"),
                     }
@@ -925,6 +917,16 @@ fn format_time_hms() -> String {
         .unwrap_or(0);
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn trim_stale_history(history: &mut VecDeque<(f64, f32)>, now: f64) {
+    while let Some(&(t, _)) = history.front() {
+        if now - t > HISTORY_WINDOW_SECS {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
 }
 
 fn read_pa_table(link: &mut MspLink) -> Result<Vec<msp::PaCalibration>> {
