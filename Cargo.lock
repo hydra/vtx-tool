@@ -3466,25 +3466,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "rf-cal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "eframe",
- "egui",
- "egui_dock",
- "egui_plot",
- "egui_table",
- "env_logger",
- "image",
- "log",
- "serde",
- "serde_json",
- "serialport",
-]
-
-[[package]]
 name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4203,6 +4184,25 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vtx-tool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eframe",
+ "egui",
+ "egui_dock",
+ "egui_plot",
+ "egui_table",
+ "env_logger",
+ "image",
+ "log",
+ "serde",
+ "serde_json",
+ "serialport",
+]
 
 [[package]]
 name = "walkdir"

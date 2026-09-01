@@ -1,7 +1,11 @@
 [package]
-name = "rf-cal"
+name = "vtx-tool"
 version = "0.1.0"
 edition = "2021"
+authors = [
+    "Dominic Clifton",
+    "Claude",
+]
 
 [dependencies]
 serialport = "4"
