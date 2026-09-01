@@ -208,6 +208,8 @@ pub struct CurrentStep {
     pub freq_idx: usize,
     pub vbias_mv: Option<i32>,
     pub detector_mv: Option<i32>,
+    pub cal_is_current: bool,
+    pub det_is_current: bool,
 }
 
 pub struct StepDebugInfo {
@@ -826,7 +828,6 @@ impl SweepEngine {
                         if needs_settle { "settling" } else { "coarse ramp" }
                     )),
                 );
-                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Current);
                 self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st)
             }
             AutomaticStep::ScanPa(st) => self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st),
@@ -1188,7 +1189,14 @@ impl SweepEngine {
     pub fn current_step(&self) -> Option<CurrentStep> {
         let level = self.levels.get(self.level_idx).copied()?;
         if matches!(&self.state, EngineState::Manual) {
-            return Some(CurrentStep { level, freq_idx: self.freq_idx, vbias_mv: Some(self.manual_dac_mv), detector_mv: None });
+            return Some(CurrentStep {
+                level,
+                freq_idx: self.freq_idx,
+                vbias_mv: Some(self.manual_dac_mv),
+                detector_mv: None,
+                cal_is_current: true,
+                det_is_current: true,
+            });
         }
         match &self.state {
             EngineState::Automatic(AutomaticStep::ScanPa(st)) => Some(CurrentStep {
@@ -1196,12 +1204,16 @@ impl SweepEngine {
                 freq_idx: self.freq_idx,
                 vbias_mv: Some(st.vbias_mv),
                 detector_mv: None,
+                cal_is_current: true,
+                det_is_current: false,
             }),
             EngineState::Automatic(AutomaticStep::ScanDetector(st)) => Some(CurrentStep {
                 level,
                 freq_idx: self.freq_idx,
                 vbias_mv: None,
                 detector_mv: st.last_reading.map(|r| r.detector_mv as i32),
+                cal_is_current: false,
+                det_is_current: true,
             }),
             _ => None,
         }
@@ -1461,7 +1473,6 @@ impl SweepEngine {
         let up = power_up_step(self.sign_inverted);
         let (bound_lo, bound_hi) = self.effective_bounds(level);
         let detector_start_vbias_mv = (vbias_mv - up * 5).clamp(bound_lo, bound_hi);
-        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Current);
         self.state = EngineState::Automatic(AutomaticStep::ScanDetector(ScanDetectorState {
             phase: ScanDetectorPhase::Backoff,
             vbias_mv: detector_start_vbias_mv,
