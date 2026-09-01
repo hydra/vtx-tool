@@ -139,9 +139,10 @@ impl eframe::App for App {
             .default_size(220.0)
             .min_size(80.0)
             .show(ui, |ui| {
+                let half_width = ui.available_width() / 2.0;
                 egui::Panel::left("vtx_log_panel")
                     .resizable(true)
-                    .default_size(420.0)
+                    .default_size(half_width)
                     .min_size(160.0)
                     .show_separator_line(true)
                     .show(ui, |ui| {
