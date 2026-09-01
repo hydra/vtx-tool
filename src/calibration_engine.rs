@@ -483,6 +483,8 @@ impl SweepEngine {
         self.state = EngineState::Automatic(AutomaticStep::EnteringPoint);
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.push_back(PendingSend::CalibrationState);
+        let resume_level = self.levels[self.level_idx];
+        self.pending_sends.push_back(PendingSend::RestoreBoost { level: resume_level });
     }
 
     fn begin_frequency(&mut self, freq_mhz: u16, resume: ResumeMode) {
