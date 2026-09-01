@@ -159,7 +159,8 @@ impl eframe::App for App {
             .show_separator_line(true)
             .show(ui, |ui| {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                egui::CollapsingHeader::new("Pages").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Pages")
+                    .default_open(true).show_unindented(ui, |ui| {
                     if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("Home")).clicked() {
                         self.open_page(Page::Home);
                     }
@@ -172,7 +173,7 @@ impl eframe::App for App {
                 });
 
                 ui.separator();
-                egui::CollapsingHeader::new("Connection").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Connection").default_open(true).show_unindented(ui, |ui| {
                     let (vtx_state, meter_state) = {
                         let s = self.state.lock().unwrap();
                         (s.vtx_port_state, s.meter_port_state)
@@ -180,9 +181,7 @@ impl eframe::App for App {
 
                     egui::Grid::new("connection_grid").num_columns(2).show(ui, |ui| {
                         grid_label(ui, "VTX");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            conn_status::show_port(ui, vtx_state);
-                        });
+                        conn_status::show_port(ui, vtx_state);
                         ui.end_row();
 
                         ui.add_enabled(
@@ -191,7 +190,7 @@ impl eframe::App for App {
                                 .desired_width(100.0)
                                 .hint_text("VTX port"),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        {
                             let label = if vtx_state.is_ready() { "Disconnect" } else { "Connect" };
                             if ui.small_button(label).clicked() {
                                 if vtx_state.is_ready() {
@@ -203,13 +202,11 @@ impl eframe::App for App {
                                     let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
                                 }
                             }
-                        });
+                        }
                         ui.end_row();
 
                         grid_label(ui, "Power Meter");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            conn_status::show_port(ui, meter_state);
-                        });
+                        conn_status::show_port(ui, meter_state);
                         ui.end_row();
 
                         ui.add_enabled(
@@ -218,7 +215,7 @@ impl eframe::App for App {
                                 .desired_width(100.0)
                                 .hint_text("Power meter port"),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        {
                             let label = if meter_state.is_ready() { "Disconnect" } else { "Connect" };
                             if ui.small_button(label).clicked() {
                                 if meter_state.is_ready() {
@@ -233,7 +230,7 @@ impl eframe::App for App {
                                     });
                                 }
                             }
-                        });
+                        }
                         ui.end_row();
                     });
 
@@ -262,42 +259,38 @@ impl eframe::App for App {
                     let all_label = if overall == conn_status::OverallState::Ready { "Disconnect-all" } else { "Connect-all" };
                     egui::Grid::new("overall_grid").num_columns(2).show(ui, |ui| {
                         grid_label(ui, "Overall");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            conn_status::show_overall(ui, overall);
-                        });
+                        conn_status::show_overall(ui, overall);
                         ui.end_row();
 
                         grid_label(ui, "");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(all_label).clicked() {
-                                if overall == conn_status::OverallState::Ready {
-                                    let _ = self.cmd_tx.send(Command::DisconnectVtx);
-                                    let _ = self.cmd_tx.send(Command::DisconnectMeter);
-                                } else {
-                                    if vtx_state.is_idle() {
-                                        let mut settings = AppSettings::load();
-                                        settings.vtx_port = self.vtx_port_input.clone();
-                                        let _ = settings.save();
-                                        let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
-                                    }
-                                    if meter_state.is_idle() {
-                                        let mut settings = AppSettings::load();
-                                        settings.meter_port = self.meter_port_input.clone();
-                                        let _ = settings.save();
-                                        let _ = self.cmd_tx.send(Command::ConnectMeter {
-                                            port: self.meter_port_input.clone(),
-                                            meter_kind: self.meter_kind,
-                                        });
-                                    }
+                        if ui.button(all_label).clicked() {
+                            if overall == conn_status::OverallState::Ready {
+                                let _ = self.cmd_tx.send(Command::DisconnectVtx);
+                                let _ = self.cmd_tx.send(Command::DisconnectMeter);
+                            } else {
+                                if vtx_state.is_idle() {
+                                    let mut settings = AppSettings::load();
+                                    settings.vtx_port = self.vtx_port_input.clone();
+                                    let _ = settings.save();
+                                    let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
+                                }
+                                if meter_state.is_idle() {
+                                    let mut settings = AppSettings::load();
+                                    settings.meter_port = self.meter_port_input.clone();
+                                    let _ = settings.save();
+                                    let _ = self.cmd_tx.send(Command::ConnectMeter {
+                                        port: self.meter_port_input.clone(),
+                                        meter_kind: self.meter_kind,
+                                    });
                                 }
                             }
-                        });
+                        }
                         ui.end_row();
                     });
                 });
 
                 ui.separator();
-                egui::CollapsingHeader::new("Frequency").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Frequency").default_open(true).show_unindented(ui, |ui| {
                     let table = self.vtx_table.lock().unwrap();
                     let mut sel = self.vtx_selection.lock().unwrap();
 
@@ -390,7 +383,7 @@ impl eframe::App for App {
                 });
 
                 ui.separator();
-                egui::CollapsingHeader::new("VTX Status").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("VTX Status").default_open(true).show_unindented(ui, |ui| {
                     let (vtx_status, vtx_last_seen_at) = {
                         let s = self.state.lock().unwrap();
                         (s.vtx_status.clone(), s.vtx_last_seen_at.clone())
@@ -477,7 +470,7 @@ impl eframe::App for App {
                 });
 
                 ui.separator();
-                egui::CollapsingHeader::new("OSD Status").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("OSD Status").default_open(true).show_unindented(ui, |ui| {
                     let (osd_canvas, osd_keepalive_at) = {
                         let s = self.state.lock().unwrap();
                         (s.osd_canvas, s.osd_keepalive_at.clone())
