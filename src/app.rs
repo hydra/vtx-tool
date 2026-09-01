@@ -70,7 +70,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     }
 
     fn id(&mut self, tab: &mut Page) -> egui::Id {
-        egui::Id::new(("rf-cal-page", *tab as u8))
+        egui::Id::new(("vtx-tool-page", *tab as u8))
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Page) {
