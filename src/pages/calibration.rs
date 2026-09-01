@@ -513,6 +513,8 @@ pub fn show(
         ui.add(egui::ProgressBar::new(overall).text("Overall").show_percentage());
     }
 
+    ui.separator();
+
     let (automatic_mode, manual_mode, manual_dac_mv) = {
         let g = sweep.lock().unwrap();
         match g.as_ref() {
@@ -538,11 +540,15 @@ pub fn show(
         None => ("Inactive", false, None, None, None),
     };
 
+    const CALIBRATION_GROUP_HEIGHT: f32 = 220.0;
+
     ui.columns(3, |columns| {
         columns[0].group(|ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            ui.strong("Controls");
             egui::Grid::new("calibration_control_grid").num_columns(2).show(ui, |ui| {
-                grid_label(ui, "");
+                grid_label(ui, "Calibration");
                 ui.horizontal(|ui| {
                     let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
                     if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
@@ -612,34 +618,41 @@ pub fn show(
                 }
                 ui.end_row();
 
-                grid_label(ui, "");
-                ui.horizontal(|ui| {
-                    ui.add_enabled(manual_mode, egui::Checkbox::new(&mut page.fine_step, "fine"));
-                    let mut pa_on = pa_boost_on.unwrap_or(false);
-                    if ui.add_enabled(manual_mode, egui::Checkbox::new(&mut pa_on, "PA")).changed() {
-                        let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
-                    }
-                    if ui.add_enabled(manual_mode, egui::Button::new("Next >")).clicked() {
-                        let _ = cmd_tx.send(Command::ManualNext);
-                    }
-                });
+                grid_label(ui, "Fine");
+                ui.add_enabled(manual_mode, egui::Checkbox::new(&mut page.fine_step, ""));
+                ui.end_row();
+
+                grid_label(ui, "PA");
+                let mut pa_on = pa_boost_on.unwrap_or(false);
+                if ui.add_enabled(manual_mode, egui::Checkbox::new(&mut pa_on, "")).changed() {
+                    let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
+                }
                 ui.end_row();
 
                 grid_label(ui, "");
-                ui.horizontal(|ui| {
-                    if ui.button("Send to VTX").clicked() {
-                        let _ = cmd_tx.send(Command::SendCalTableToVtx);
-                    }
-                    if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
-                        page.show_erase_confirm_dialog = true;
-                    }
-                });
+                if ui.add_enabled(manual_mode, egui::Button::new("Save and advance")).clicked() {
+                    let _ = cmd_tx.send(Command::ManualNext);
+                }
+                ui.end_row();
+
+                grid_label(ui, "");
+                if ui.button("Send to VTX").clicked() {
+                    let _ = cmd_tx.send(Command::SendCalTableToVtx);
+                }
+                ui.end_row();
+
+                grid_label(ui, "");
+                if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
+                    page.show_erase_confirm_dialog = true;
+                }
                 ui.end_row();
             });
         });
 
         columns[1].group(|ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            ui.strong("Settings");
             egui::Grid::new("calibration_settings_grid").num_columns(2).show(ui, |ui| {
                 grid_label(ui, "Scan detector tolerance");
                 ui.add(
@@ -654,6 +667,8 @@ pub fn show(
 
         columns[2].group(|ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            ui.strong("Debug");
             egui::Grid::new("calibration_debug_grid").num_columns(2).show(ui, |ui| {
                 grid_label(ui, "Scan Phase");
                 ui.label(scan_phase);
