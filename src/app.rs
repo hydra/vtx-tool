@@ -153,13 +153,13 @@ impl eframe::App for App {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.heading("Pages");
                 ui.separator();
-                if ui.button("Home").clicked() {
+                if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("Home")).clicked() {
                     self.open_page(Page::Home);
                 }
-                if ui.button("VTX Table").clicked() {
+                if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("VTX Table")).clicked() {
                     self.open_page(Page::VtxTable);
                 }
-                if ui.button("Calibration").clicked() {
+                if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("Calibration")).clicked() {
                     self.open_page(Page::Calibration);
                 }
 
@@ -171,55 +171,63 @@ impl eframe::App for App {
                     (s.vtx_port_state, s.meter_port_state)
                 };
 
-                ui.horizontal(|ui| {
+                egui::Grid::new("connection_grid").num_columns(2).show(ui, |ui| {
                     ui.label("VTX");
-                    conn_status::show_port(ui, vtx_state);
-                });
-                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        conn_status::show_port(ui, vtx_state);
+                    });
+                    ui.end_row();
+
                     ui.add_enabled(
                         vtx_state.is_idle(),
                         egui::TextEdit::singleline(&mut self.vtx_port_input)
                             .desired_width(100.0)
                             .hint_text("VTX port"),
                     );
-                    let label = if vtx_state.is_ready() { "Disconnect" } else { "Connect" };
-                    if ui.small_button(label).clicked() {
-                        if vtx_state.is_ready() {
-                            let _ = self.cmd_tx.send(Command::DisconnectVtx);
-                        } else if vtx_state.is_idle() {
-                            let mut settings = AppSettings::load();
-                            settings.vtx_port = self.vtx_port_input.clone();
-                            let _ = settings.save();
-                            let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if vtx_state.is_ready() { "Disconnect" } else { "Connect" };
+                        if ui.small_button(label).clicked() {
+                            if vtx_state.is_ready() {
+                                let _ = self.cmd_tx.send(Command::DisconnectVtx);
+                            } else if vtx_state.is_idle() {
+                                let mut settings = AppSettings::load();
+                                settings.vtx_port = self.vtx_port_input.clone();
+                                let _ = settings.save();
+                                let _ = self.cmd_tx.send(Command::ConnectVtx { port: self.vtx_port_input.clone() });
+                            }
                         }
-                    }
-                });
+                    });
+                    ui.end_row();
 
-                ui.horizontal(|ui| {
                     ui.label("Power Meter");
-                    conn_status::show_port(ui, meter_state);
-                });
-                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        conn_status::show_port(ui, meter_state);
+                    });
+                    ui.end_row();
+
                     ui.add_enabled(
                         meter_state.is_idle(),
                         egui::TextEdit::singleline(&mut self.meter_port_input)
                             .desired_width(100.0)
                             .hint_text("Power meter port"),
                     );
-                    let label = if meter_state.is_ready() { "Disconnect" } else { "Connect" };
-                    if ui.small_button(label).clicked() {
-                        if meter_state.is_ready() {
-                            let _ = self.cmd_tx.send(Command::DisconnectMeter);
-                        } else if meter_state.is_idle() {
-                            let mut settings = AppSettings::load();
-                            settings.meter_port = self.meter_port_input.clone();
-                            let _ = settings.save();
-                            let _ = self.cmd_tx.send(Command::ConnectMeter {
-                                port: self.meter_port_input.clone(),
-                                meter_kind: self.meter_kind,
-                            });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if meter_state.is_ready() { "Disconnect" } else { "Connect" };
+                        if ui.small_button(label).clicked() {
+                            if meter_state.is_ready() {
+                                let _ = self.cmd_tx.send(Command::DisconnectMeter);
+                            } else if meter_state.is_idle() {
+                                let mut settings = AppSettings::load();
+                                settings.meter_port = self.meter_port_input.clone();
+                                let _ = settings.save();
+                                let _ = self.cmd_tx.send(Command::ConnectMeter {
+                                    port: self.meter_port_input.clone(),
+                                    meter_kind: self.meter_kind,
+                                });
+                            }
                         }
-                    }
+                    });
+                    ui.end_row();
                 });
 
                 ui.add_enabled_ui(meter_state.is_idle(), |ui| {
@@ -280,73 +288,94 @@ impl eframe::App for App {
                     let table = self.vtx_table.lock().unwrap();
                     let mut sel = self.vtx_selection.lock().unwrap();
 
-                    ui.checkbox(&mut sel.pitmode, "Pit mode");
-
                     let mut manual_mode = sel.selected_band == 0;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut manual_mode, false, "Band/Channel");
-                        ui.selectable_value(&mut manual_mode, true, "Manual");
-                    });
 
-                    if manual_mode {
-                        sel.selected_band = 0;
-                        let mut freq_khz = sel.selected_freq_mhz as u32 * 1000;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut freq_khz)
-                                    .range(MIN_FREQ_KHZ..=MAX_FREQ_KHZ)
-                                    .suffix(" kHz")
-                                    .speed(1000),
-                            )
-                            .changed()
-                        {
-                            sel.selected_freq_mhz = (freq_khz / 1000) as u16;
-                        }
-                        ui.label("Frequency");
-                    } else {
-                        if sel.selected_band == 0 {
-                            sel.selected_band = 1;
-                        }
-                        let band_indices: Vec<u8> = table.bands.iter().map(|b| b.index).collect();
-                        egui::ComboBox::from_label("Band")
-                            .selected_text(
-                                table
-                                    .bands
-                                    .iter()
-                                    .find(|b| b.index == sel.selected_band)
-                                    .map(|b| format!("{} ({})", b.name, b.letter))
-                                    .unwrap_or_else(|| "-".to_string()),
-                            )
-                            .show_ui(ui, |ui| {
-                                for idx in band_indices {
-                                    if let Some(b) = table.bands.iter().find(|b| b.index == idx) {
-                                        let label = format!("{} ({})", b.name, b.letter);
-                                        ui.selectable_value(&mut sel.selected_band, idx, label);
+                    egui::Grid::new("frequency_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("Pit mode");
+                        ui.checkbox(&mut sel.pitmode, "");
+                        ui.end_row();
+
+                        ui.label("Mode");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut manual_mode, false, "Band/Channel");
+                            ui.selectable_value(&mut manual_mode, true, "Manual");
+                        });
+                        ui.end_row();
+
+                        if manual_mode {
+                            sel.selected_band = 0;
+                            let mut freq_khz = sel.selected_freq_mhz as u32 * 1000;
+                            ui.label("Frequency");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut freq_khz)
+                                        .range(MIN_FREQ_KHZ..=MAX_FREQ_KHZ)
+                                        .suffix(" kHz")
+                                        .speed(1000),
+                                )
+                                .changed()
+                            {
+                                sel.selected_freq_mhz = (freq_khz / 1000) as u16;
+                            }
+                            ui.end_row();
+                        } else {
+                            if sel.selected_band == 0 {
+                                sel.selected_band = 1;
+                            }
+                            let band_indices: Vec<u8> = table.bands.iter().map(|b| b.index).collect();
+                            ui.label("Band");
+                            egui::ComboBox::from_id_salt("band_combo")
+                                .selected_text(
+                                    table
+                                        .bands
+                                        .iter()
+                                        .find(|b| b.index == sel.selected_band)
+                                        .map(|b| format!("{} ({})", b.name, b.letter))
+                                        .unwrap_or_else(|| "-".to_string()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for idx in band_indices {
+                                        if let Some(b) = table.bands.iter().find(|b| b.index == idx) {
+                                            let label = format!("{} ({})", b.name, b.letter);
+                                            ui.selectable_value(&mut sel.selected_band, idx, label);
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            ui.end_row();
 
-                        let chan_count = table
-                            .bands
-                            .iter()
-                            .find(|b| b.index == sel.selected_band)
-                            .map(|b| b.channel_count.max(1))
-                            .unwrap_or(1);
-                        ui.add(egui::Slider::new(&mut sel.selected_channel, 1..=chan_count).text("Channel"));
+                            let chan_count = table
+                                .bands
+                                .iter()
+                                .find(|b| b.index == sel.selected_band)
+                                .map(|b| b.channel_count.max(1))
+                                .unwrap_or(1);
+                            ui.label("Channel");
+                            ui.add(egui::Slider::new(&mut sel.selected_channel, 1..=chan_count));
+                            ui.end_row();
 
-                        let freq = sel.frequency_mhz(&table);
-                        ui.label(format!("-> {freq} MHz"));
-                    }
+                            let freq = sel.frequency_mhz(&table);
+                            ui.label("");
+                            ui.label(format!("-> {freq} MHz"));
+                            ui.end_row();
+                        }
 
-                    let power_count = table.power_levels.len().max(1) as u8;
-                    ui.add(egui::Slider::new(&mut sel.selected_power, 1..=power_count).text("Power level"));
-                    if let Some(p) = table.power_levels.iter().find(|p| p.index == sel.selected_power) {
-                        ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
-                    }
+                        let power_count = table.power_levels.len().max(1) as u8;
+                        ui.label("Power level");
+                        ui.add(egui::Slider::new(&mut sel.selected_power, 1..=power_count));
+                        ui.end_row();
 
-                    if ui.button("Save").clicked() {
-                        let _ = self.cmd_tx.send(Command::PushVtxConfig);
-                    }
+                        ui.label("");
+                        if let Some(p) = table.power_levels.iter().find(|p| p.index == sel.selected_power) {
+                            ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
+                        }
+                        ui.end_row();
+
+                        ui.label("");
+                        if ui.button("Save").clicked() {
+                            let _ = self.cmd_tx.send(Command::PushVtxConfig);
+                        }
+                        ui.end_row();
+                    });
                 }
 
                 ui.separator();
@@ -437,6 +466,7 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.heading("OSD Status");
+                let mut osd_debug_overlay_enabled = self.state.lock().unwrap().osd_debug_overlay_enabled;
                 egui::Grid::new("osd_status_grid").num_columns(2).show(ui, |ui| {
                     ui.label("Size:");
                     ui.label(match osd_canvas {
@@ -451,12 +481,13 @@ impl eframe::App for App {
                         None => "None".to_string(),
                     });
                     ui.end_row();
-                });
 
-                let mut osd_debug_overlay_enabled = self.state.lock().unwrap().osd_debug_overlay_enabled;
-                if ui.checkbox(&mut osd_debug_overlay_enabled, "Enable debug overlay").changed() {
-                    self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
-                }
+                    ui.label("Debug overlay");
+                    if ui.checkbox(&mut osd_debug_overlay_enabled, "").changed() {
+                        self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
+                    }
+                    ui.end_row();
+                });
                 });
             });
 
