@@ -553,9 +553,12 @@ pub fn spawn(
                 last_history_trim = Instant::now();
                 let now = start.elapsed().as_secs_f64();
                 let mut s = state.lock().unwrap();
-                trim_stale_history(&mut s.power_history, now);
-                trim_stale_history(&mut s.temp_history, now);
-                trim_stale_history(&mut s.mcu_temp_history, now);
+                let both_disconnected = s.vtx_port_state.is_idle() && s.meter_port_state.is_idle();
+                if !both_disconnected {
+                    trim_stale_history(&mut s.power_history, now);
+                    trim_stale_history(&mut s.temp_history, now);
+                    trim_stale_history(&mut s.mcu_temp_history, now);
+                }
                 drop(s);
                 ctx.request_repaint();
             }
