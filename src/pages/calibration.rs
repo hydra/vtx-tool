@@ -540,13 +540,22 @@ pub fn show(
         None => ("Inactive", false, None, None, None),
     };
 
-    const CALIBRATION_GROUP_HEIGHT: f32 = 220.0;
+    const MAX_GROUP_HEIGHT: f32 = 400.0;
+    let control_h_id = ui.id().with("cal_ctrl_content_h");
+    let settings_h_id = ui.id().with("cal_settings_content_h");
+    let debug_h_id = ui.id().with("cal_debug_content_h");
+    let prev_control_h: f32 = ui.data(|d| d.get_temp(control_h_id)).unwrap_or(0.0);
+    let prev_settings_h: f32 = ui.data(|d| d.get_temp(settings_h_id)).unwrap_or(0.0);
+    let prev_debug_h: f32 = ui.data(|d| d.get_temp(debug_h_id)).unwrap_or(0.0);
+    let target_h = prev_control_h.max(prev_settings_h).max(prev_debug_h).min(MAX_GROUP_HEIGHT);
+    let mut new_heights = [0.0f32; 3];
 
     ui.columns(3, |columns| {
         columns[0].group(|ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            let top = ui.cursor().top();
             ui.strong("Controls");
+            egui::ScrollArea::horizontal().id_salt("control_scroll").show(ui, |ui| {
             egui::Grid::new("calibration_control_grid").num_columns(2).show(ui, |ui| {
                 grid_label(ui, "Calibration");
                 ui.horizontal(|ui| {
@@ -647,12 +656,20 @@ pub fn show(
                 }
                 ui.end_row();
             });
+            });
+            let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
+            new_heights[0] = content_h;
+            let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
+            if extra > 0.0 {
+                ui.add_space(extra);
+            }
         });
 
         columns[1].group(|ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            let top = ui.cursor().top();
             ui.strong("Settings");
+            egui::ScrollArea::horizontal().id_salt("settings_scroll").show(ui, |ui| {
             egui::Grid::new("calibration_settings_grid").num_columns(2).show(ui, |ui| {
                 grid_label(ui, "Scan detector tolerance");
                 ui.add(
@@ -663,12 +680,20 @@ pub fn show(
                 );
                 ui.end_row();
             });
+            });
+            let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
+            new_heights[1] = content_h;
+            let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
+            if extra > 0.0 {
+                ui.add_space(extra);
+            }
         });
 
         columns[2].group(|ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(CALIBRATION_GROUP_HEIGHT);
+            let top = ui.cursor().top();
             ui.strong("Debug");
+            egui::ScrollArea::horizontal().id_salt("debug_scroll").show(ui, |ui| {
             egui::Grid::new("calibration_debug_grid").num_columns(2).show(ui, |ui| {
                 grid_label(ui, "Scan Phase");
                 ui.label(scan_phase);
@@ -717,8 +742,25 @@ pub fn show(
                 });
                 ui.end_row();
             });
+            });
+            let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
+            new_heights[2] = content_h;
+            let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
+            if extra > 0.0 {
+                ui.add_space(extra);
+            }
         });
     });
+
+    let new_target_h = new_heights.iter().cloned().fold(0.0f32, f32::max).min(MAX_GROUP_HEIGHT);
+    ui.data_mut(|d| {
+        d.insert_temp(control_h_id, new_heights[0]);
+        d.insert_temp(settings_h_id, new_heights[1]);
+        d.insert_temp(debug_h_id, new_heights[2]);
+    });
+    if (new_target_h - target_h).abs() > 0.5 {
+        ui.ctx().request_repaint();
+    }
 
     if page.show_confirm_dialog {
         let mut open = true;
