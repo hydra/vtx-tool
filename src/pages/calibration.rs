@@ -299,7 +299,7 @@ pub fn show(
             .include_x(latest_t)
             .x_axis_label("seconds")
             .custom_y_axes(vec![left_axis, right_axis])
-            .legend(Legend::default());
+            .legend(Legend::default().position(egui_plot::Corner::LeftBottom));
         if page.plot_reset_requested {
             plot = plot.reset();
             page.plot_reset_requested = false;
