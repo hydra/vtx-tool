@@ -21,7 +21,7 @@ use vtxtable::{VtxSelectionState, VtxTableConfig};
 pub const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo/logo-1.png");
 
 #[derive(Parser, Debug)]
-#[command(name = "rf-cal", about = "RF PA calibration + VTX table tool")]
+#[command(name = "vtx-tool", about = "VTX Tool - RF PA calibration + VTX table tool")]
 struct Args {
     #[arg(long)]
     vtx_port: Option<String>,

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const SETTINGS_FILE: &str = "rf-cal-settings.json";
+const SETTINGS_FILE: &str = "settings.json";
 
 fn default_attenuation_db() -> f32 {
     30.0
