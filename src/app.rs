@@ -153,14 +153,13 @@ impl eframe::App for App {
 
         egui::Panel::left("nav_panel")
             .resizable(true)
-            .default_size(250.0)
+            .default_size(340.0)
             .min_size(120.0)
             .max_size(500.0)
             .show_separator_line(true)
             .show(ui, |ui| {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                egui::CollapsingHeader::new("Pages")
-                    .default_open(true).show_unindented(ui, |ui| {
+                egui::CollapsingHeader::new("Pages").default_open(true).show_unindented(ui, |ui| {
                     if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("Home")).clicked() {
                         self.open_page(Page::Home);
                     }
@@ -356,22 +355,24 @@ impl eframe::App for App {
                                 .map(|b| b.channel_count.max(1))
                                 .unwrap_or(1);
                             grid_label(ui, "Channel");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.add(egui::Slider::new(&mut sel.selected_channel, 1..=chan_count));
-                                let freq = sel.frequency_mhz(&table);
-                                ui.label(format!("-> {freq} MHz"));
-                            });
+                            ui.add(egui::Slider::new(&mut sel.selected_channel, 1..=chan_count));
+                            ui.end_row();
+
+                            let freq = sel.frequency_mhz(&table);
+                            grid_label(ui, "");
+                            ui.label(format!("{freq} MHz"));
                             ui.end_row();
                         }
 
                         let power_count = table.power_levels.len().max(1) as u8;
                         grid_label(ui, "Power level");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add(egui::Slider::new(&mut sel.selected_power, 1..=power_count));
-                            if let Some(p) = table.power_levels.iter().find(|p| p.index == sel.selected_power) {
-                                ui.label(format!("-> {} mW ('{}')", p.m_w, p.label));
-                            }
-                        });
+                        ui.add(egui::Slider::new(&mut sel.selected_power, 1..=power_count));
+                        ui.end_row();
+
+                        grid_label(ui, "");
+                        if let Some(p) = table.power_levels.iter().find(|p| p.index == sel.selected_power) {
+                            ui.label(format!("{} mW ('{}')", p.m_w, p.label));
+                        }
                         ui.end_row();
 
                         grid_label(ui, "");
