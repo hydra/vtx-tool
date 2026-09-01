@@ -53,6 +53,8 @@ pub struct SharedState {
     pub osd_keepalive_at: Option<String>,
     pub vtx_last_seen_at: Option<String>,
     pub osd_debug_overlay_enabled: bool,
+    pub vtx_table_ready: bool,
+    pub vtx_table_synchronized: bool,
 }
 
 const READY_WINDOW: Duration = Duration::from_millis(500);
@@ -80,6 +82,8 @@ impl Default for SharedState {
             osd_keepalive_at: None,
             vtx_last_seen_at: None,
             osd_debug_overlay_enabled: true,
+            vtx_table_ready: false,
+            vtx_table_synchronized: false,
         }
     }
 }
@@ -598,14 +602,19 @@ pub fn spawn(
                         state.lock().unwrap().vtx_last_seen_at = Some(format_time_hms());
                         if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
                             let table = vtx_table.lock().unwrap();
-                            if table.bands.is_empty() || table.power_levels.is_empty() {
-                                debug!(target: "vtx", "VTX_CONFIG query received but no vtxtable is loaded -- not replying");
+                            let table_empty = table.bands.is_empty() || table.power_levels.is_empty();
+                            let ready = state.lock().unwrap().vtx_table_ready;
+                            if table_empty || !ready {
+                                debug!(target: "vtx", "VTX_CONFIG query received but not replying (table_empty={table_empty}, ready={ready})");
                                 drop(table);
                             } else {
                                 let response = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
                                 drop(table);
                                 match link.send_v1(function::VTX_CONFIG as u8, &response) {
-                                    Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
+                                    Ok(()) => {
+                                        debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)");
+                                        state.lock().unwrap().vtx_table_synchronized = true;
+                                    }
                                     Err(e) => {
                                         error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}");
                                         vtx_link_lost = true;

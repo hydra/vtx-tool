@@ -66,11 +66,18 @@ fn main() -> eframe::Result<()> {
     let state = Arc::new(Mutex::new(worker::SharedState::default()));
     state.lock().unwrap().meter_kind = initial_meter_kind;
     state.lock().unwrap().attenuation_db = initial_settings.attenuation_db;
-    let initial_vtx_table = if initial_settings.vtx_table_path.is_empty() {
-        VtxTableConfig::default()
+    let (initial_vtx_table, vtx_table_ready_at_startup) = if initial_settings.vtx_table_path.is_empty() {
+        (VtxTableConfig::default(), false)
     } else {
-        VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)).unwrap_or_default()
+        match VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)) {
+            Ok(loaded) => {
+                let ready = !loaded.bands.is_empty() && !loaded.power_levels.is_empty();
+                (loaded, ready)
+            }
+            Err(_) => (VtxTableConfig::default(), false),
+        }
     };
+    state.lock().unwrap().vtx_table_ready = vtx_table_ready_at_startup;
     let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
     let vtx_selection = Arc::new(Mutex::new(VtxSelectionState::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
