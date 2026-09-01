@@ -598,13 +598,18 @@ pub fn spawn(
                         state.lock().unwrap().vtx_last_seen_at = Some(format_time_hms());
                         if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
                             let table = vtx_table.lock().unwrap();
-                            let response = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
-                            drop(table);
-                            match link.send_v1(function::VTX_CONFIG as u8, &response) {
-                                Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
-                                Err(e) => {
-                                    error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}");
-                                    vtx_link_lost = true;
+                            if table.bands.is_empty() || table.power_levels.is_empty() {
+                                debug!(target: "vtx", "VTX_CONFIG query received but no vtxtable is loaded -- not replying");
+                                drop(table);
+                            } else {
+                                let response = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
+                                drop(table);
+                                match link.send_v1(function::VTX_CONFIG as u8, &response) {
+                                    Ok(()) => debug!(target: "vtx", "answered VTX_CONFIG query (acting as FC)"),
+                                    Err(e) => {
+                                        error!(target: "vtx", "failed to answer VTX_CONFIG query: {e}");
+                                        vtx_link_lost = true;
+                                    }
                                 }
                             }
                             ctx.request_repaint();
