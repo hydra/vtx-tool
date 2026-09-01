@@ -22,6 +22,16 @@ pub fn grid_label(ui: &mut egui::Ui, text: &str) {
         ui.label(text);
     });
 }
+
+pub fn show_branding(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.heading("OSD/VTX Calibration tool");
+            ui.label("Written by Dominic Clifton");
+            ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+        });
+    });
+}
 use egui_dock::{DockArea, DockState};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -160,6 +170,9 @@ impl eframe::App for App {
             .show_separator_line(true)
             .show(ui, |ui| {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                show_branding(ui);
+                ui.separator();
+
                 egui::CollapsingHeader::new("Pages").default_open(true).show_unindented(ui, |ui| {
                     if ui.add_sized([ui.available_width(), 0.0], egui::Button::new("Home")).clicked() {
                         self.open_page(Page::Home);

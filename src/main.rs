@@ -18,6 +18,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use vtxtable::{VtxSelectionState, VtxTableConfig};
 
+pub const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo/logo-1.png");
+
 #[derive(Parser, Debug)]
 #[command(name = "rf-cal", about = "RF PA calibration + VTX table tool")]
 struct Args {
@@ -85,8 +87,20 @@ fn main() -> eframe::Result<()> {
 
     let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
 
+    let icon_image = image::load_from_memory(LOGO_BYTES)
+        .expect("embedded logo.png should be a valid image")
+        .to_rgba8();
+    let (icon_width, icon_height) = (icon_image.width(), icon_image.height());
+    let icon_data = eframe::egui::IconData {
+        rgba: icon_image.into_raw(),
+        width: icon_width,
+        height: icon_height,
+    };
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1920.0, 1080.0]),
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1920.0, 1080.0])
+            .with_icon(icon_data),
         ..Default::default()
     };
     eframe::run_native(
