@@ -584,6 +584,9 @@ pub fn show(
                         page.pending_skip_count += 1;
                         page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
                     }
+                    if ui.add_enabled(manual_mode, egui::Button::new("Save >")).clicked() {
+                        let _ = cmd_tx.send(Command::ManualNext);
+                    }
                 });
                 ui.end_row();
 
@@ -637,25 +640,21 @@ pub fn show(
                     let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
                 }
                 ui.end_row();
-
-                grid_label(ui, "");
-                if ui.add_enabled(manual_mode, egui::Button::new("Save and advance")).clicked() {
-                    let _ = cmd_tx.send(Command::ManualNext);
-                }
-                ui.end_row();
-
-                grid_label(ui, "");
-                if ui.button("Send to VTX").clicked() {
-                    let _ = cmd_tx.send(Command::SendCalTableToVtx);
-                }
-                ui.end_row();
-
-                grid_label(ui, "");
-                if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
-                    page.show_erase_confirm_dialog = true;
-                }
-                ui.end_row();
             });
+                ui.separator();
+                egui::Grid::new("calibration_storage_grid").num_columns(2).show(ui, |ui| {
+                    grid_label(ui, "");
+                    if ui.add_enabled(!sweep_active, egui::Button::new("Send to VTX")).clicked() {
+                        let _ = cmd_tx.send(Command::SendCalTableToVtx);
+                    }
+                    ui.end_row();
+
+                    grid_label(ui, "");
+                    if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
+                        page.show_erase_confirm_dialog = true;
+                    }
+                    ui.end_row();
+                });
             });
             let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
             new_heights[0] = content_h;
