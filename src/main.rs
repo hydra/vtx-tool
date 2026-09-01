@@ -105,6 +105,7 @@ fn main() -> eframe::Result<()> {
 
             cc.egui_ctx.all_styles_mut(|style| {
                 style.visuals.indent_has_left_vline = false;
+                style.spacing.scroll = eframe::egui::style::ScrollStyle::solid();
             });
 
             Ok(Box::new(app::App::new(
