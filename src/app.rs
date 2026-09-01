@@ -14,9 +14,9 @@ use eframe::Frame;
 
 const MIN_FREQ_KHZ: u32 = 5_600_000;
 const MAX_FREQ_KHZ: u32 = 6_000_000;
-const LEFT_COLUMN_MIN_WIDTH: f32 = 150.0;
+pub const LEFT_COLUMN_MIN_WIDTH: f32 = 150.0;
 
-fn grid_label(ui: &mut egui::Ui, text: &str) {
+pub fn grid_label(ui: &mut egui::Ui, text: &str) {
     ui.scope(|ui| {
         ui.set_min_width(LEFT_COLUMN_MIN_WIDTH);
         ui.label(text);

@@ -1185,38 +1185,6 @@ impl SweepEngine {
         Ok(false)
     }
 
-    pub fn sub_progress(&self) -> (f32, &'static str) {
-        match &self.state {
-            EngineState::Automatic(AutomaticStep::ScanPa(st)) => match st.phase {
-                ScanPaPhase::Settle => (0.0, "ScanPa: settling"),
-                ScanPaPhase::CoarseRamp => {
-                    let up = power_up_step(self.sign_inverted);
-                    let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
-                    let (bound_lo, bound_hi) = self.effective_bounds(level);
-                    let boundary = if up > 0 { bound_hi } else { bound_lo };
-                    let start = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
-                    let total_possible = ((boundary - start) as f32 / COARSE_RAMP_STEP_MV as f32)
-                        .abs()
-                        .max(1.0);
-                    let frac = (st.coarse_steps_taken as f32 / total_possible).clamp(0.0, 1.0);
-                    (0.6 * frac, "ScanPa: coarse ramp")
-                }
-                ScanPaPhase::Fine => (0.8, "ScanPa: fine creep"),
-            },
-            EngineState::Automatic(AutomaticStep::ScanDetector(st)) => match st.phase {
-                ScanDetectorPhase::Backoff => (0.20, "ScanDetector: backoff"),
-                ScanDetectorPhase::Bracket => {
-                    let extra = match (st.below.is_some(), st.above.is_some()) {
-                        (false, false) => 0.0,
-                        _ => 0.35,
-                    };
-                    (0.45 + extra, "ScanDetector: bracket search")
-                }
-            },
-            _ => (0.0, ""),
-        }
-    }
-
     pub fn current_step(&self) -> Option<CurrentStep> {
         let level = self.levels.get(self.level_idx).copied()?;
         if matches!(&self.state, EngineState::Manual) {
