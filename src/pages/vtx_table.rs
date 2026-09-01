@@ -78,6 +78,21 @@ pub fn show(
 
     ui.heading("VTX Table");
 
+    {
+        let mut s = shared.lock().unwrap();
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut s.vtx_table_ready, "Ready");
+            ui.separator();
+            ui.label("Synchronized:");
+            ui.colored_label(
+                if s.vtx_table_synchronized { egui::Color32::GREEN } else { egui::Color32::RED },
+                if s.vtx_table_synchronized { "True" } else { "False" },
+            );
+        });
+    }
+
+    let mut modified = false;
+
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label("File:");
@@ -89,6 +104,7 @@ pub fn show(
                         page.last_error = None;
                         page.removed_bands.clear();
                         page.removed_power_levels.clear();
+                        modified = true;
                         let mut settings = AppSettings::load();
                         settings.vtx_table_path = page.file_path.clone();
                         let _ = settings.save();
@@ -123,6 +139,7 @@ pub fn show(
                         page.last_error = None;
                         page.removed_bands.clear();
                         page.removed_power_levels.clear();
+                        modified = true;
                     }
                     Err(e) => page.last_error = Some(format!("import failed: {e}")),
                 }
@@ -182,6 +199,7 @@ pub fn show(
             let mut num_bands = cfg.bands.len() as u8;
             if ui.add(egui::DragValue::new(&mut num_bands).range(0..=20)).changed() {
                 resize_bands(&mut cfg, num_bands as usize, &mut page.removed_bands);
+                modified = true;
             }
             ui.label("Number of bands");
 
@@ -196,6 +214,7 @@ pub fn show(
                 for b in &mut cfg.bands {
                     b.channel_count = chans;
                 }
+                modified = true;
             }
             ui.label("Number of channels by band");
         });
@@ -211,11 +230,11 @@ pub fn show(
             for band in &mut cfg.bands {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}", band.index));
-                    ui.add(egui::TextEdit::singleline(&mut band.name).desired_width(60.0));
+                    modified |= ui.add(egui::TextEdit::singleline(&mut band.name).desired_width(60.0)).changed();
                     ui.label(format!("({})", band.letter));
                 });
                 for ch in 0..channels as usize {
-                    ui.add(egui::DragValue::new(&mut band.freqs_mhz[ch]).range(5000..=6000).suffix(" MHz"));
+                    modified |= ui.add(egui::DragValue::new(&mut band.freqs_mhz[ch]).range(5000..=6000).suffix(" MHz")).changed();
                 }
                 ui.end_row();
             }
@@ -230,6 +249,7 @@ pub fn show(
         let mut num_levels = cfg.power_levels.len() as u8;
         if ui.add(egui::DragValue::new(&mut num_levels).range(0..=20)).changed() {
             resize_power_levels(&mut cfg, num_levels as usize, &mut page.removed_power_levels);
+            modified = true;
         }
         ui.label("Number of power levels");
 
@@ -242,17 +262,23 @@ pub fn show(
 
             ui.label("Value");
             for pl in &mut cfg.power_levels {
-                ui.add(egui::DragValue::new(&mut pl.m_w).range(0..=5000).suffix(" mW"));
+                modified |= ui.add(egui::DragValue::new(&mut pl.m_w).range(0..=5000).suffix(" mW")).changed();
             }
             ui.end_row();
 
             ui.label("Label");
             for pl in &mut cfg.power_levels {
-                ui.add(egui::TextEdit::singleline(&mut pl.label).desired_width(50.0));
+                modified |= ui.add(egui::TextEdit::singleline(&mut pl.label).desired_width(50.0)).changed();
             }
             ui.end_row();
         });
     });
+
+    if modified {
+        let mut s = shared.lock().unwrap();
+        s.vtx_table_ready = false;
+        s.vtx_table_synchronized = false;
+    }
 
     ui.separator();
 
