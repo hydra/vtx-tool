@@ -441,9 +441,19 @@ pub fn show(
         current = g.as_ref().and_then(|e| e.current_step());
         for entry in &entries {
             let cal: [CellStatus; 7] = std::array::from_fn(|i| {
+                if let Some(cur) = &current {
+                    if cur.cal_is_current && cur.level == entry.idx && cur.freq_idx == i {
+                        return CellStatus::Current;
+                    }
+                }
                 g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
             });
             let det: [CellStatus; 7] = std::array::from_fn(|i| {
+                if let Some(cur) = &current {
+                    if cur.det_is_current && cur.level == entry.idx && cur.freq_idx == i {
+                        return CellStatus::Current;
+                    }
+                }
                 g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
             });
             cal_status.push(cal);
