@@ -1,4 +1,5 @@
 
+use crate::app::grid_label;
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::msp;
@@ -351,9 +352,6 @@ pub fn show(
 
     ui.separator();
     ui.heading("PA calibration table");
-    if ui.button("Refresh").clicked() {
-        let _ = cmd_tx.send(Command::RefreshCalTable);
-    }
 
     let sweep_active = sweep.lock().unwrap().as_ref().map(|e| e.is_active()).unwrap_or(false);
 
@@ -503,76 +501,16 @@ pub fn show(
             .show(ui, &mut delegate);
     });
 
-    {
-        let g = sweep.lock().unwrap();
-        let (overall, sub_val, sub_label) = match g.as_ref() {
-            Some(engine) => {
-                let (sub, label) = engine.sub_progress();
-                (engine.progress(), sub, label)
-            }
-            None => (0.0, 0.0, ""),
-        };
-        ui.add(egui::ProgressBar::new(overall).text("Overall").show_percentage());
-        ui.add(egui::ProgressBar::new(sub_val).text(if sub_label.is_empty() { "Idle" } else { sub_label }));
+    if ui.button("Refresh").clicked() {
+        let _ = cmd_tx.send(Command::RefreshCalTable);
     }
 
+    ui.separator();
+
     {
-        let debug = {
-            let g = sweep.lock().unwrap();
-            g.as_ref().map(|e| e.debug_state())
-        };
-        let (scan_phase, drop_active, fine_bound_mv, fine_highest_avg_mw, detector) = match debug {
-            Some(d) => (d.scan_phase, d.drop_detector_active, d.fine_bound_mv, d.fine_highest_avg_mw, d.detector),
-            None => ("Inactive", false, None, None, None),
-        };
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Scan Phase:");
-            ui.label(scan_phase);
-            ui.separator();
-
-            ui.label("Drop detector:");
-            ui.label(if drop_active { "Active" } else { "Inactive" });
-            ui.separator();
-
-            ui.label("fine_bound_mv:");
-            ui.label(match fine_bound_mv {
-                Some(v) => v.to_string(),
-                None => "None".to_string(),
-            });
-            ui.separator();
-
-            ui.label("fine_highest_average:");
-            ui.label(match fine_highest_avg_mw {
-                Some(v) => format!("{v:.4}mW"),
-                None => "None".to_string(),
-            });
-            ui.separator();
-
-            ui.label("Detector phase:");
-            ui.label(detector.as_ref().map(|d| d.phase).unwrap_or("None"));
-            ui.separator();
-
-            ui.label("Detector below:");
-            ui.label(match detector.as_ref().and_then(|d| d.below) {
-                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
-                None => "None".to_string(),
-            });
-            ui.separator();
-
-            ui.label("Detector above:");
-            ui.label(match detector.as_ref().and_then(|d| d.above) {
-                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
-                None => "None".to_string(),
-            });
-            ui.separator();
-
-            ui.label("Pinned counter:");
-            ui.label(match &detector {
-                Some(d) => d.pinned_count.to_string(),
-                None => "None".to_string(),
-            });
-        });
+        let g = sweep.lock().unwrap();
+        let overall = g.as_ref().map(|engine| engine.progress()).unwrap_or(0.0);
+        ui.add(egui::ProgressBar::new(overall).text("Overall").show_percentage());
     }
 
     let (automatic_mode, manual_mode, manual_dac_mv) = {
@@ -591,91 +529,181 @@ pub fn show(
         let s = shared.lock().unwrap();
         conn_status::OverallState::from_ports(s.vtx_port_state, s.meter_port_state) == conn_status::OverallState::Ready
     };
+    let debug = {
+        let g = sweep.lock().unwrap();
+        g.as_ref().map(|e| e.debug_state())
+    };
+    let (scan_phase, drop_active, fine_bound_mv, fine_highest_avg_mw, detector) = match debug {
+        Some(d) => (d.scan_phase, d.drop_detector_active, d.fine_bound_mv, d.fine_highest_avg_mw, d.detector),
+        None => ("Inactive", false, None, None, None),
+    };
 
-    ui.horizontal(|ui| {
-        ui.label("Scan detector tolerance:");
-        ui.add(
-            egui::DragValue::new(&mut page.tolerance_pct)
-                .range(0.1..=50.0)
-                .suffix("%")
-                .speed(0.1),
-        );
+    ui.columns(3, |columns| {
+        columns[0].group(|ui| {
+            ui.set_min_width(ui.available_width());
+            egui::Grid::new("calibration_control_grid").num_columns(2).show(ui, |ui| {
+                grid_label(ui, "");
+                ui.horizontal(|ui| {
+                    let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
+                    if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
+                        if manual_mode {
+                            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+                            levels.sort_unstable();
+                            let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
+                        } else {
+                            page.show_confirm_dialog = true;
+                        }
+                    }
 
-        let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
-        if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
-            if manual_mode {
-                let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-                levels.sort_unstable();
-                let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
-            } else {
-                page.show_confirm_dialog = true;
-            }
-        }
+                    let manual_enabled = !automatic_mode && !manual_mode && overall_ready && any_checked;
+                    if ui.add_enabled(manual_enabled, egui::Button::new("Manual")).clicked() {
+                        let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+                        levels.sort_unstable();
+                        let _ = cmd_tx.send(Command::StartManual { levels });
+                    }
 
-        let manual_enabled = !automatic_mode && !manual_mode && overall_ready && any_checked;
-        if ui.add_enabled(manual_enabled, egui::Button::new("Manual")).clicked() {
-            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-            levels.sort_unstable();
-            let _ = cmd_tx.send(Command::StartManual { levels });
-        }
+                    if ui.add_enabled(sweep_active, egui::Button::new("Stop")).clicked() {
+                        let _ = cmd_tx.send(Command::AbortSweep);
+                    }
+                    if ui.add_enabled(sweep_active, egui::Button::new("Skip >")).clicked() {
+                        page.pending_skip_count += 1;
+                        page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
+                    }
+                });
+                ui.end_row();
 
-        if ui.add_enabled(sweep_active, egui::Button::new("Stop")).clicked() {
-            let _ = cmd_tx.send(Command::AbortSweep);
-        }
-        if ui.add_enabled(sweep_active, egui::Button::new("Skip >")).clicked() {
-            page.pending_skip_count += 1;
-            page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
-        }
-        if let Some(deadline) = page.skip_debounce_until {
-            let now = Instant::now();
-            if now >= deadline {
-                let count = page.pending_skip_count;
-                page.pending_skip_count = 0;
-                page.skip_debounce_until = None;
-                if count > 0 {
-                    let _ = cmd_tx.send(Command::SkipMultiple { count });
+                if let Some(deadline) = page.skip_debounce_until {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        let count = page.pending_skip_count;
+                        page.pending_skip_count = 0;
+                        page.skip_debounce_until = None;
+                        if count > 0 {
+                            let _ = cmd_tx.send(Command::SkipMultiple { count });
+                        }
+                    } else {
+                        ui.ctx().request_repaint_after(deadline - now);
+                    }
                 }
-            } else {
-                ui.ctx().request_repaint_after(deadline - now);
-            }
-        }
 
-        if any_checked && !overall_ready {
-            ui.label(
-                egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
-                    .weak()
-                    .italics(),
-            );
-        }
-    });
+                if any_checked && !overall_ready {
+                    grid_label(ui, "");
+                    ui.label(
+                        egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
+                            .weak()
+                            .italics(),
+                    );
+                    ui.end_row();
+                }
 
-    ui.horizontal(|ui| {
-        ui.add_enabled_ui(manual_mode, |ui| {
-            let mut current_mv = manual_dac_mv;
-            let step = if page.fine_step { 1.0 } else { 25.0 };
-            let message = if page.fine_step { "DAC mV (+/-1mv)" } else { "DAC mV (+/-25mV)" };
-            let response =
-                ui.add_sized([400.0, 10.0], egui::Slider::new(&mut current_mv, 0..=3300)
-                    .text(message)
-                    .clamping(SliderClamping::Never)
-                    .drag_value_speed(0.1)
-                    .step_by(step));
-            if response.changed() {
-                let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
-            }
-            ui.checkbox(&mut page.fine_step, "fine");
+                let mut current_mv = manual_dac_mv;
+                let step = if page.fine_step { 1.0 } else { 25.0 };
+                let message = if page.fine_step { "DAC mV (+/-1mv)" } else { "DAC mV (+/-25mV)" };
+                grid_label(ui, message);
+                let response = ui.add_enabled(
+                    manual_mode,
+                    egui::Slider::new(&mut current_mv, 0..=3300)
+                        .clamping(SliderClamping::Never)
+                        .drag_value_speed(0.1)
+                        .step_by(step),
+                );
+                if response.changed() {
+                    let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
+                }
+                ui.end_row();
 
-            let mut pa_on = pa_boost_on.unwrap_or(false);
-            if ui.checkbox(&mut pa_on, "PA").changed() {
-                let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
-            }
+                grid_label(ui, "");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(manual_mode, egui::Checkbox::new(&mut page.fine_step, "fine"));
+                    let mut pa_on = pa_boost_on.unwrap_or(false);
+                    if ui.add_enabled(manual_mode, egui::Checkbox::new(&mut pa_on, "PA")).changed() {
+                        let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
+                    }
+                    if ui.add_enabled(manual_mode, egui::Button::new("Next >")).clicked() {
+                        let _ = cmd_tx.send(Command::ManualNext);
+                    }
+                });
+                ui.end_row();
 
-            if ui.button("Next >").clicked() {
-                let _ = cmd_tx.send(Command::ManualNext);
-            }
+                grid_label(ui, "");
+                ui.horizontal(|ui| {
+                    if ui.button("Send to VTX").clicked() {
+                        let _ = cmd_tx.send(Command::SendCalTableToVtx);
+                    }
+                    if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
+                        page.show_erase_confirm_dialog = true;
+                    }
+                });
+                ui.end_row();
+            });
+        });
+
+        columns[1].group(|ui| {
+            ui.set_min_width(ui.available_width());
+            egui::Grid::new("calibration_settings_grid").num_columns(2).show(ui, |ui| {
+                grid_label(ui, "Scan detector tolerance");
+                ui.add(
+                    egui::DragValue::new(&mut page.tolerance_pct)
+                        .range(0.1..=50.0)
+                        .suffix("%")
+                        .speed(0.1),
+                );
+                ui.end_row();
+            });
+        });
+
+        columns[2].group(|ui| {
+            ui.set_min_width(ui.available_width());
+            egui::Grid::new("calibration_debug_grid").num_columns(2).show(ui, |ui| {
+                grid_label(ui, "Scan Phase");
+                ui.label(scan_phase);
+                ui.end_row();
+
+                grid_label(ui, "Drop detector");
+                ui.label(if drop_active { "Active" } else { "Inactive" });
+                ui.end_row();
+
+                grid_label(ui, "fine_bound_mv");
+                ui.label(match fine_bound_mv {
+                    Some(v) => v.to_string(),
+                    None => "None".to_string(),
+                });
+                ui.end_row();
+
+                grid_label(ui, "fine_highest_average");
+                ui.label(match fine_highest_avg_mw {
+                    Some(v) => format!("{v:.4}mW"),
+                    None => "None".to_string(),
+                });
+                ui.end_row();
+
+                grid_label(ui, "Detector phase");
+                ui.label(detector.as_ref().map(|d| d.phase).unwrap_or("None"));
+                ui.end_row();
+
+                grid_label(ui, "Detector below");
+                ui.label(match detector.as_ref().and_then(|d| d.below) {
+                    Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                    None => "None".to_string(),
+                });
+                ui.end_row();
+
+                grid_label(ui, "Detector above");
+                ui.label(match detector.as_ref().and_then(|d| d.above) {
+                    Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                    None => "None".to_string(),
+                });
+                ui.end_row();
+
+                grid_label(ui, "Pinned counter");
+                ui.label(match &detector {
+                    Some(d) => d.pinned_count.to_string(),
+                    None => "None".to_string(),
+                });
+                ui.end_row();
+            });
         });
     });
-
 
     if page.show_confirm_dialog {
         let mut open = true;
@@ -706,16 +734,6 @@ pub fn show(
             let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
         }
     }
-
-    ui.horizontal(|ui| {
-        if ui.button("Send to VTX").clicked() {
-            let _ = cmd_tx.send(Command::SendCalTableToVtx);
-        }
-
-        if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
-            page.show_erase_confirm_dialog = true;
-        }
-    });
 
     if page.show_erase_confirm_dialog {
         let mut open = true;
