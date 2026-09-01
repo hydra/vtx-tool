@@ -25,7 +25,7 @@ pub fn grid_label(ui: &mut egui::Ui, text: &str) {
 
 pub fn show_branding(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
+        ui.vertical_centered(|ui| {
             ui.heading("OSD/VTX Calibration tool");
             ui.label("Written by Dominic Clifton");
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
@@ -70,7 +70,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     }
 
     fn id(&mut self, tab: &mut Page) -> egui::Id {
-        egui::Id::new(("vtx-tool-page", *tab as u8))
+        egui::Id::new(("rf-cal-page", *tab as u8))
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Page) {
