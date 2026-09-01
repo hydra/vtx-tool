@@ -294,7 +294,9 @@ impl eframe::App for App {
                     let mut sel = self.vtx_selection.lock().unwrap();
 
                     let mut manual_mode = sel.selected_band == 0;
+                    let sweep_active = self.sweep.lock().unwrap().as_ref().map(|e| e.is_active()).unwrap_or(false);
 
+                    ui.add_enabled_ui(!sweep_active, |ui| {
                     egui::Grid::new("frequency_grid").num_columns(2).show(ui, |ui| {
                         grid_label(ui, "Pit mode");
                         ui.checkbox(&mut sel.pitmode, "");
@@ -380,6 +382,7 @@ impl eframe::App for App {
                             let _ = self.cmd_tx.send(Command::PushVtxConfig);
                         }
                         ui.end_row();
+                    });
                     });
                 });
 
