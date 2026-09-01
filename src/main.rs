@@ -85,7 +85,10 @@ fn main() -> eframe::Result<()> {
 
     let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
 
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1920.0, 1080.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "RF Calibration",
         native_options,
@@ -99,6 +102,10 @@ fn main() -> eframe::Result<()> {
                     meter_kind: initial_meter_kind,
                 });
             }
+
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.visuals.indent_has_left_vline = false;
+            });
 
             Ok(Box::new(app::App::new(
                 state.clone(),
