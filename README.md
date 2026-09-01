@@ -8,6 +8,17 @@
 
 RF PA calibration and VTX table tool for OSD/VTX firmware.
 
+## Screenshots
+
+Here's a recent screenshot of the vtx calibration sweep in action:
+
+[<img src="assets/screenshots/Screenshot_2026-09-01_211855.png" width="800" alt="vtx-tool">](assets/screenshots/Screenshot_2026-09-01_211855.png)
+
+Here's the VTX table UI:
+
+[<img src="assets/screenshots/Screenshot_2026-09-01_211503.png" width="800" alt="vtx-tool">](assets/screenshots/Screenshot_2026-09-01_211503.png)
+
+
 ## What it is
 
 `vtx-tool` is a desktop application for calibrating the RF power amplifier (PA) of a VTX (video
@@ -52,6 +63,13 @@ a built-in VTX table, putting on onus on the user to use one that complies with 
 * Persistent VTX table storage, with load/save support.
 * MSP displayport OSD overlay while calibrating.
 * Cross-platform desktop UI (built with `egui` / `eframe`).
+
+## Supported power meters
+
+* ImmersionRC power meter V1 (tested) - Not recommended, since it only has one 5800Mhz calibration point.
+* ORQA / ImmersionRC power meter V2 (in-progress) - Recommended, since it has calibration points from 5600-6000Mhz at 50Mhz steps.
+
+Other power meters can be added fairly easily as required. pull requests welcome!
 
 ## Running from CLI
 
