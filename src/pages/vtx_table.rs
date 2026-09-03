@@ -1,4 +1,3 @@
-
 use crate::msp::{VtxBand, VtxPowerLevel};
 use crate::settings::AppSettings;
 use crate::state::SharedHandles;
@@ -86,7 +85,11 @@ pub fn show(
             ui.separator();
             ui.label("Synchronized:");
             ui.colored_label(
-                if sync.synchronized { egui::Color32::GREEN } else { egui::Color32::RED },
+                if sync.synchronized {
+                    egui::Color32::GREEN
+                } else {
+                    egui::Color32::RED
+                },
                 if sync.synchronized { "True" } else { "False" },
             );
         });
@@ -162,7 +165,10 @@ pub fn show(
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label(format!("'{}' already exists. Overwrite it?", page.file_path));
+                ui.label(format!(
+                    "'{}' already exists. Overwrite it?",
+                    page.file_path
+                ));
                 ui.horizontal(|ui| {
                     if ui.button("Overwrite").clicked() {
                         confirmed = true;
@@ -198,7 +204,10 @@ pub fn show(
 
         ui.horizontal(|ui| {
             let mut num_bands = cfg.bands.len() as u8;
-            if ui.add(egui::DragValue::new(&mut num_bands).range(0..=20)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut num_bands).range(0..=20))
+                .changed()
+            {
                 resize_bands(&mut cfg, num_bands as usize, &mut page.removed_bands);
                 modified = true;
             }
@@ -221,25 +230,35 @@ pub fn show(
         });
 
         let channels = cfg.channels;
-        egui::Grid::new("vtx_band_grid").striped(true).show(ui, |ui| {
-            ui.strong("Band");
-            for ch in 1..=channels {
-                ui.strong(format!("{ch}"));
-            }
-            ui.end_row();
-
-            for band in &mut cfg.bands {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}", band.index));
-                    modified |= ui.add(egui::TextEdit::singleline(&mut band.name).desired_width(60.0)).changed();
-                    ui.label(format!("({})", band.letter));
-                });
-                for ch in 0..channels as usize {
-                    modified |= ui.add(egui::DragValue::new(&mut band.freqs_mhz[ch]).range(5000..=6000).suffix(" MHz")).changed();
+        egui::Grid::new("vtx_band_grid")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Band");
+                for ch in 1..=channels {
+                    ui.strong(format!("{ch}"));
                 }
                 ui.end_row();
-            }
-        });
+
+                for band in &mut cfg.bands {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}", band.index));
+                        modified |= ui
+                            .add(egui::TextEdit::singleline(&mut band.name).desired_width(60.0))
+                            .changed();
+                        ui.label(format!("({})", band.letter));
+                    });
+                    for ch in 0..channels as usize {
+                        modified |= ui
+                            .add(
+                                egui::DragValue::new(&mut band.freqs_mhz[ch])
+                                    .range(5000..=6000)
+                                    .suffix(" MHz"),
+                            )
+                            .changed();
+                    }
+                    ui.end_row();
+                }
+            });
     });
 
     ui.separator();
@@ -248,31 +267,48 @@ pub fn show(
         ui.strong("Power levels");
 
         let mut num_levels = cfg.power_levels.len() as u8;
-        if ui.add(egui::DragValue::new(&mut num_levels).range(0..=20)).changed() {
-            resize_power_levels(&mut cfg, num_levels as usize, &mut page.removed_power_levels);
+        if ui
+            .add(egui::DragValue::new(&mut num_levels).range(0..=20))
+            .changed()
+        {
+            resize_power_levels(
+                &mut cfg,
+                num_levels as usize,
+                &mut page.removed_power_levels,
+            );
             modified = true;
         }
         ui.label("Number of power levels");
 
-        egui::Grid::new("vtx_power_grid").striped(true).show(ui, |ui| {
-            ui.strong("");
-            for pl in &cfg.power_levels {
-                ui.strong(format!("{}", pl.index));
-            }
-            ui.end_row();
+        egui::Grid::new("vtx_power_grid")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("");
+                for pl in &cfg.power_levels {
+                    ui.strong(format!("{}", pl.index));
+                }
+                ui.end_row();
 
-            ui.label("Value");
-            for pl in &mut cfg.power_levels {
-                modified |= ui.add(egui::DragValue::new(&mut pl.m_w).range(0..=5000).suffix(" mW")).changed();
-            }
-            ui.end_row();
+                ui.label("Value");
+                for pl in &mut cfg.power_levels {
+                    modified |= ui
+                        .add(
+                            egui::DragValue::new(&mut pl.m_w)
+                                .range(0..=5000)
+                                .suffix(" mW"),
+                        )
+                        .changed();
+                }
+                ui.end_row();
 
-            ui.label("Label");
-            for pl in &mut cfg.power_levels {
-                modified |= ui.add(egui::TextEdit::singleline(&mut pl.label).desired_width(50.0)).changed();
-            }
-            ui.end_row();
-        });
+                ui.label("Label");
+                for pl in &mut cfg.power_levels {
+                    modified |= ui
+                        .add(egui::TextEdit::singleline(&mut pl.label).desired_width(50.0))
+                        .changed();
+                }
+                ui.end_row();
+            });
     });
 
     if modified {

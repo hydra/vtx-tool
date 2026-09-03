@@ -1,4 +1,3 @@
-
 use crate::msp::{self, function, MspCommandKind, MspLink};
 use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
@@ -23,7 +22,11 @@ fn coarse_ramp_start_vbias_mv(sign_inverted: bool, bound_lo: i32, bound_hi: i32)
     }
 }
 
-fn rolling_average_since(history: &VecDeque<(f64, f32)>, since_secs: f64, window_secs: f64) -> Option<f32> {
+fn rolling_average_since(
+    history: &VecDeque<(f64, f32)>,
+    since_secs: f64,
+    window_secs: f64,
+) -> Option<f32> {
     let now = history.back()?.0;
     let window_start = (now - window_secs).max(since_secs);
     if now - window_start < window_secs - 0.01 {
@@ -96,7 +99,11 @@ pub(crate) struct SampleWait {
 
 impl SampleWait {
     fn new(current_seq: u64, needed: usize, skip_first: usize) -> Self {
-        Self { start_seq: current_seq, needed, skip_first }
+        Self {
+            start_seq: current_seq,
+            needed,
+            skip_first,
+        }
     }
 
     fn ready(&self, current_seq: u64) -> bool {
@@ -181,7 +188,10 @@ pub enum ConnectionLossReason {
 
 pub enum EngineState {
     Idle,
-    AwaitingFreqConfirm { freq_mhz: u16, resume: ResumeMode },
+    AwaitingFreqConfirm {
+        freq_mhz: u16,
+        resume: ResumeMode,
+    },
     Automatic(AutomaticStep),
     Manual,
     ConnectionLost {
@@ -274,7 +284,6 @@ enum PendingSend {
     RestoreBoost { level: u8 },
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoostMode {
     Off,
@@ -323,7 +332,10 @@ impl SweepEngine {
             total_steps,
             completed_steps: 0,
             pending_result: None,
-            meter_capability: FrequencyCapability::Manual { min_mhz: 0, max_mhz: 0 },
+            meter_capability: FrequencyCapability::Manual {
+                min_mhz: 0,
+                max_mhz: 0,
+            },
             last_prompted_band: None,
             pending_frequency_push: None,
             pending_meter_frequency: None,
@@ -413,8 +425,16 @@ impl SweepEngine {
             pa_failure: false,
             not_settled: false,
         });
-        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Manual);
-        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Manual);
+        Self::set_cell_status(
+            &mut self.cal_cell_status,
+            (level, self.freq_idx),
+            CellStatus::Manual,
+        );
+        Self::set_cell_status(
+            &mut self.det_cell_status,
+            (level, self.freq_idx),
+            CellStatus::Manual,
+        );
         self.per_level_status.insert(level, LevelStatus::Done);
         self.advance_position()
     }
@@ -441,7 +461,8 @@ impl SweepEngine {
         match self.advance_indices() {
             None => {
                 debug!(target: "vtx", "[sweep] all frequencies complete");
-                self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+                self.pending_sends
+                    .push_back(PendingSend::SafeState(safe_state_payload));
                 self.state = EngineState::Idle;
                 self.session_active = false;
                 self.boost_mode = BoostMode::Auto;
@@ -472,7 +493,8 @@ impl SweepEngine {
         self.manual_send_pending = false;
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
-        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+        self.pending_sends
+            .push_back(PendingSend::SafeState(safe_state_payload));
         self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
@@ -484,7 +506,9 @@ impl SweepEngine {
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.push_back(PendingSend::CalibrationState);
         let resume_level = self.levels[self.level_idx];
-        self.pending_sends.push_back(PendingSend::RestoreBoost { level: resume_level });
+        self.pending_sends.push_back(PendingSend::RestoreBoost {
+            level: resume_level,
+        });
     }
 
     fn begin_frequency(&mut self, freq_mhz: u16, resume: ResumeMode) {
@@ -550,7 +574,8 @@ impl SweepEngine {
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.clear();
-        self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+        self.pending_sends
+            .push_back(PendingSend::SafeState(safe_state_payload));
         self.pending_sends.push_back(PendingSend::CalibrationState);
     }
 
@@ -574,26 +599,54 @@ impl SweepEngine {
             if i == 0 {
                 let ops = match &self.state {
                     EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
-                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        Self::set_cell_status(
+                            &mut self.cal_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::Skipped,
+                        );
+                        Self::set_cell_status(
+                            &mut self.det_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::Skipped,
+                        );
                         2
                     }
                     EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
-                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        Self::set_cell_status(
+                            &mut self.det_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::Skipped,
+                        );
                         1
                     }
                     EngineState::Automatic(AutomaticStep::EnteringPoint) => 0,
                     EngineState::Manual => {
-                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                        Self::set_cell_status(
+                            &mut self.cal_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::Skipped,
+                        );
+                        Self::set_cell_status(
+                            &mut self.det_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::Skipped,
+                        );
                         2
                     }
                     _ => 0,
                 };
                 self.completed_steps += ops;
             } else {
-                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::Skipped);
-                Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::Skipped);
+                Self::set_cell_status(
+                    &mut self.cal_cell_status,
+                    (level, self.freq_idx),
+                    CellStatus::Skipped,
+                );
+                Self::set_cell_status(
+                    &mut self.det_cell_status,
+                    (level, self.freq_idx),
+                    CellStatus::Skipped,
+                );
                 self.completed_steps += 2;
             }
             self.per_level_status.insert(level, LevelStatus::Skipped);
@@ -602,7 +655,8 @@ impl SweepEngine {
                 None => {
                     debug!(target: "vtx", "[sweep] skip x{count}: all frequencies complete after {} skips", i + 1);
                     let safe_state_payload = self.safe_state_payload_at_current_point();
-                    self.pending_sends.push_back(PendingSend::SafeState(safe_state_payload));
+                    self.pending_sends
+                        .push_back(PendingSend::SafeState(safe_state_payload));
                     self.state = EngineState::Idle;
                     self.session_active = false;
                     self.boost_mode = BoostMode::Auto;
@@ -615,11 +669,17 @@ impl SweepEngine {
 
         let (bound_lo, bound_hi) = self.effective_bounds(starting_level);
         let low_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
-        self.pending_sends.push_back(PendingSend::DacLow { level: starting_level, vbias_mv: low_mv as u16 });
+        self.pending_sends.push_back(PendingSend::DacLow {
+            level: starting_level,
+            vbias_mv: low_mv as u16,
+        });
         let pitmode_payload = self.safe_state_payload_at_current_point();
-        self.pending_sends.push_back(PendingSend::SafeState(pitmode_payload));
+        self.pending_sends
+            .push_back(PendingSend::SafeState(pitmode_payload));
         let resume_level = self.levels[self.level_idx];
-        self.pending_sends.push_back(PendingSend::RestoreBoost { level: resume_level });
+        self.pending_sends.push_back(PendingSend::RestoreBoost {
+            level: resume_level,
+        });
         debug!(target: "vtx", "[sweep] skip x{count}: safe transition queued (level={starting_level} vbias_mv={low_mv} boost=Off, then pitmode, then boost restored for level={resume_level}), resuming at level={resume_level} freq_idx={}",
             self.freq_idx);
 
@@ -670,9 +730,17 @@ impl SweepEngine {
         vtx_ready: bool,
         meter_ready: bool,
     ) -> anyhow::Result<bool> {
-        let result = self.poll_dispatch(link, history, reading_seq, latest_reading.clone(), vtx_ready, meter_ready);
+        let result = self.poll_dispatch(
+            link,
+            history,
+            reading_seq,
+            latest_reading.clone(),
+            vtx_ready,
+            meter_ready,
+        );
 
-        if let EngineState::Automatic(AutomaticStep::ScanDetector(detector_state)) = &mut self.state {
+        if let EngineState::Automatic(AutomaticStep::ScanDetector(detector_state)) = &mut self.state
+        {
             if let Some(reading) = latest_reading {
                 detector_state.last_reading = Some(reading);
             }
@@ -712,7 +780,12 @@ impl SweepEngine {
                     self.pending_sends.push_back(PendingSend::RequestVtxConfig);
                 }
                 PendingSend::CalibrationState => {
-                    let payload = msp::encode_pa_calibration_request(0, None, self.session_active, self.boost_mode.wire_byte());
+                    let payload = msp::encode_pa_calibration_request(
+                        0,
+                        None,
+                        self.session_active,
+                        self.boost_mode.wire_byte(),
+                    );
                     link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
                     link.note_sent(MspCommandKind::Other);
                     debug!(target: "vtx", "[sweep] calibration state pushed: session_active={} boost_mode={:?}",
@@ -724,13 +797,23 @@ impl SweepEngine {
                     debug!(target: "vtx", "[sweep] requested current VTX_CONFIG (to confirm the last push actually landed)");
                 }
                 PendingSend::DacLow { level, vbias_mv } => {
-                    let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, BoostMode::Off.wire_byte());
+                    let payload = msp::encode_pa_calibration_request(
+                        level,
+                        Some(vbias_mv),
+                        self.session_active,
+                        BoostMode::Off.wire_byte(),
+                    );
                     link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
                     link.note_sent(MspCommandKind::Calibration);
                     debug!(target: "vtx", "[sweep] DAC parked low: level={level} vbias_mv={vbias_mv} boost=Off");
                 }
                 PendingSend::RestoreBoost { level } => {
-                    let payload = msp::encode_pa_calibration_request(level, None, self.session_active, BoostMode::On.wire_byte());
+                    let payload = msp::encode_pa_calibration_request(
+                        level,
+                        None,
+                        self.session_active,
+                        BoostMode::On.wire_byte(),
+                    );
                     link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
                     link.note_sent(MspCommandKind::Calibration);
                     debug!(target: "vtx", "[sweep] boost restored: level={level} boost=On");
@@ -739,8 +822,16 @@ impl SweepEngine {
             return Ok(true);
         }
 
-        if let EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, .. } = &self.state {
-            let (level, freq_mhz, vbias_mv_at_loss, reason) = (*level, *freq_mhz, *vbias_mv_at_loss, *reason);
+        if let EngineState::ConnectionLost {
+            level,
+            freq_mhz,
+            vbias_mv_at_loss,
+            reason,
+            ..
+        } = &self.state
+        {
+            let (level, freq_mhz, vbias_mv_at_loss, reason) =
+                (*level, *freq_mhz, *vbias_mv_at_loss, *reason);
             if vtx_ready && meter_ready {
                 self.auto_resume(level, freq_mhz, vbias_mv_at_loss, reason);
             }
@@ -803,13 +894,22 @@ impl SweepEngine {
         match step {
             AutomaticStep::EnteringPoint => {
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
-                let start_vbias_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
+                let start_vbias_mv =
+                    coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi);
                 let needs_settle = self.pa_enable_settle_pending;
                 let st = ScanPaState {
-                    phase: if needs_settle { ScanPaPhase::Settle } else { ScanPaPhase::CoarseRamp },
+                    phase: if needs_settle {
+                        ScanPaPhase::Settle
+                    } else {
+                        ScanPaPhase::CoarseRamp
+                    },
                     vbias_mv: start_vbias_mv,
                     wait: None,
-                    settle_started_instant: if needs_settle { Some(Instant::now()) } else { None },
+                    settle_started_instant: if needs_settle {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    },
                     settle_timed_out: false,
                     coarse_steps_taken: 0,
                     last_below_target_mv: None,
@@ -827,13 +927,23 @@ impl SweepEngine {
                     LevelStatus::InProgress(format!(
                         "{} / {} @ {freq_mhz}MHz",
                         SweepOp::ScanPa.label(),
-                        if needs_settle { "settling" } else { "coarse ramp" }
+                        if needs_settle {
+                            "settling"
+                        } else {
+                            "coarse ramp"
+                        }
                     )),
                 );
-                self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st)
+                self.tick_scan_pa(
+                    link, history, now_seq, throttled, level, freq_mhz, target_mw, st,
+                )
             }
-            AutomaticStep::ScanPa(st) => self.tick_scan_pa(link, history, now_seq, throttled, level, freq_mhz, target_mw, st),
-            AutomaticStep::ScanDetector(st) => self.tick_scan_detector(link, history, now_seq, throttled, level, freq_mhz, target_mw, st),
+            AutomaticStep::ScanPa(st) => self.tick_scan_pa(
+                link, history, now_seq, throttled, level, freq_mhz, target_mw, st,
+            ),
+            AutomaticStep::ScanDetector(st) => self.tick_scan_detector(
+                link, history, now_seq, throttled, level, freq_mhz, target_mw, st,
+            ),
         }
     }
 
@@ -865,13 +975,18 @@ impl SweepEngine {
 
         if matches!(st.phase, ScanPaPhase::Fine) {
             if let Some(started_at) = st.fine_started_at_secs {
-                if let Some(rolling) = rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS) {
+                if let Some(rolling) =
+                    rolling_average_since(history, started_at, PA_FAILURE_WINDOW_SECS)
+                {
                     let in_grace_period = st
                         .fine_started_instant
                         .map(|t| t.elapsed() < PA_FAILURE_GRACE_DURATION)
                         .unwrap_or(false);
                     match st.fine_highest_avg_mw {
-                        Some(peak) if !in_grace_period && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) => {
+                        Some(peak)
+                            if !in_grace_period
+                                && rolling < peak * (1.0 - PA_FAILURE_DROP_FRACTION) =>
+                        {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: PA FAILURE -- {PA_FAILURE_WINDOW_SECS}s rolling average ({rolling:.4}mW) fell more than {:.0}% below the peak seen this fine creep ({peak:.4}mW) at vbias_mv={} -- PA likely thermally rolling off, bailing this (level,freq)", PA_FAILURE_DROP_FRACTION * 100.0, st.vbias_mv);
                             self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::PaFailure);
                             return Ok(false);
@@ -970,7 +1085,11 @@ impl SweepEngine {
                         st.vbias_mv);
                     let margin_mv = {
                         let m = st.vbias_mv.abs() * 25 / 100;
-                        if m == 0 { st.coarse_step_mv } else { m }
+                        if m == 0 {
+                            st.coarse_step_mv
+                        } else {
+                            m
+                        }
                     };
                     let padded_bound_mv = (st.vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
                     debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)", st.vbias_mv);
@@ -1123,7 +1242,11 @@ impl SweepEngine {
                 } else {
                     let desired = st.vbias_mv - up;
                     let clamped = desired.clamp(bound_lo, bound_hi);
-                    st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                    st.pinned_count = if desired != clamped {
+                        st.pinned_count + 1
+                    } else {
+                        0
+                    };
                     st.vbias_mv = clamped;
                     st.wait = None;
                     st.last_reading = None;
@@ -1150,7 +1273,11 @@ impl SweepEngine {
                     st.vbias_mv - up
                 };
                 let clamped = desired.clamp(bound_lo, bound_hi);
-                st.pinned_count = if desired != clamped { st.pinned_count + 1 } else { 0 };
+                st.pinned_count = if desired != clamped {
+                    st.pinned_count + 1
+                } else {
+                    0
+                };
                 st.vbias_mv = clamped;
                 st.wait = None;
                 st.last_reading = None;
@@ -1286,13 +1413,22 @@ impl SweepEngine {
         self.build_vtx_config_frequency_payload(freq_mhz, level, true)
     }
 
-    fn auto_resume(&mut self, level: u8, freq_mhz: u16, vbias_mv_at_loss: i32, reason: ConnectionLossReason) {
+    fn auto_resume(
+        &mut self,
+        level: u8,
+        freq_mhz: u16,
+        vbias_mv_at_loss: i32,
+        reason: ConnectionLossReason,
+    ) {
         let resume = match &self.state {
             EngineState::ConnectionLost { resume, .. } => *resume,
             _ => ResumeMode::Automatic,
         };
         debug!(target: "vtx", "[sweep] connection restored ({reason:?}), resuming: level={level} freq={freq_mhz}MHz resume={resume:?}");
-        if matches!(reason, ConnectionLossReason::Vtx | ConnectionLossReason::Both) {
+        if matches!(
+            reason,
+            ConnectionLossReason::Vtx | ConnectionLossReason::Both
+        ) {
             let up = power_up_step(self.sign_inverted);
             let safe_vbias_mv = (vbias_mv_at_loss - up * HEARTBEAT_BACKOFF_MV).clamp(0, 3300);
             self.hard_limits.insert(level, safe_vbias_mv);
@@ -1309,9 +1445,7 @@ impl SweepEngine {
         }
         self.unresponsive_since = None;
         self.state = match resume {
-            ResumeMode::Automatic => {
-                EngineState::Automatic(AutomaticStep::EnteringPoint)
-            }
+            ResumeMode::Automatic => EngineState::Automatic(AutomaticStep::EnteringPoint),
             ResumeMode::Manual => EngineState::Manual,
         };
         self.pending_frequency_push = Some(freq_mhz);
@@ -1332,16 +1466,30 @@ impl SweepEngine {
         if !matches!(reason, ConnectionLossReason::Meter) {
             match &self.state {
                 EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
-                    Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    Self::set_cell_status(
+                        &mut self.cal_cell_status,
+                        (level, self.freq_idx),
+                        CellStatus::LimitHit,
+                    );
                 }
                 EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
-                    Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                    Self::set_cell_status(
+                        &mut self.det_cell_status,
+                        (level, self.freq_idx),
+                        CellStatus::LimitHit,
+                    );
                 }
                 _ => {}
             }
         }
         self.unresponsive_since = None;
-        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, resume: ResumeMode::Automatic };
+        self.state = EngineState::ConnectionLost {
+            level,
+            freq_mhz,
+            vbias_mv_at_loss,
+            reason,
+            resume: ResumeMode::Automatic,
+        };
     }
 
     pub fn clear_hard_limits(&mut self) {
@@ -1353,14 +1501,23 @@ impl SweepEngine {
         self.det_cell_status.clear();
     }
 
-    fn set_cell_status(map: &mut HashMap<(u8, usize), CellStatus>, key: (u8, usize), status: CellStatus) {
+    fn set_cell_status(
+        map: &mut HashMap<(u8, usize), CellStatus>,
+        key: (u8, usize),
+        status: CellStatus,
+    ) {
         if matches!(map.get(&key), Some(CellStatus::LimitHit)) && status != CellStatus::LimitHit {
             return;
         }
         map.insert(key, status);
     }
 
-    fn maybe_trip_connection_lost(&mut self, vtx_ready: bool, meter_ready: bool, vbias_mv_now: i32) -> bool {
+    fn maybe_trip_connection_lost(
+        &mut self,
+        vtx_ready: bool,
+        meter_ready: bool,
+        vbias_mv_now: i32,
+    ) -> bool {
         if vtx_ready && meter_ready {
             self.unresponsive_since = None;
             return false;
@@ -1377,29 +1534,56 @@ impl SweepEngine {
             (true, false) => ConnectionLossReason::Meter,
             (true, true) => unreachable!("only reached when at least one is false"),
         };
-        let resume = if matches!(&self.state, EngineState::Manual) { ResumeMode::Manual } else { ResumeMode::Automatic };
+        let resume = if matches!(&self.state, EngineState::Manual) {
+            ResumeMode::Manual
+        } else {
+            ResumeMode::Automatic
+        };
         debug!(target: "vtx", "[sweep] connection lost ({reason:?}) for {:?} -- pausing (level={level} freq={freq_mhz}MHz vbias_mv={vbias_mv_now}, resume={resume:?})",
             since.elapsed());
         if !matches!(reason, ConnectionLossReason::Meter) {
             if matches!(&self.state, EngineState::Manual) {
-                Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                Self::set_cell_status(
+                    &mut self.cal_cell_status,
+                    (level, self.freq_idx),
+                    CellStatus::LimitHit,
+                );
             } else {
                 match &self.state {
                     EngineState::Automatic(AutomaticStep::ScanPa(_)) => {
-                        Self::set_cell_status(&mut self.cal_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                        Self::set_cell_status(
+                            &mut self.cal_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::LimitHit,
+                        );
                     }
                     EngineState::Automatic(AutomaticStep::ScanDetector(_)) => {
-                        Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), CellStatus::LimitHit);
+                        Self::set_cell_status(
+                            &mut self.det_cell_status,
+                            (level, self.freq_idx),
+                            CellStatus::LimitHit,
+                        );
                     }
                     _ => {}
                 }
             }
         }
-        self.state = EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss: vbias_mv_now, reason, resume };
+        self.state = EngineState::ConnectionLost {
+            level,
+            freq_mhz,
+            vbias_mv_at_loss: vbias_mv_now,
+            reason,
+            resume,
+        };
         true
     }
 
-    fn poll_manual(&mut self, link: &mut MspLink, vtx_ready: bool, meter_ready: bool) -> anyhow::Result<bool> {
+    fn poll_manual(
+        &mut self,
+        link: &mut MspLink,
+        vtx_ready: bool,
+        meter_ready: bool,
+    ) -> anyhow::Result<bool> {
         if !link.can_send_now() {
             return Ok(false);
         }
@@ -1420,7 +1604,12 @@ impl SweepEngine {
         }
         let level = self.levels[self.level_idx];
         let vbias_mv = self.manual_dac_mv.clamp(0, 3300) as u16;
-        let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, self.boost_mode.wire_byte());
+        let payload = msp::encode_pa_calibration_request(
+            level,
+            Some(vbias_mv),
+            self.session_active,
+            self.boost_mode.wire_byte(),
+        );
         link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
         link.note_sent(MspCommandKind::Calibration);
         self.last_send = Instant::now();
@@ -1428,10 +1617,20 @@ impl SweepEngine {
         Ok(true)
     }
 
-    fn send_calibration(&mut self, link: &mut MspLink, level: u8, vbias_mv: i32) -> anyhow::Result<()> {
+    fn send_calibration(
+        &mut self,
+        link: &mut MspLink,
+        level: u8,
+        vbias_mv: i32,
+    ) -> anyhow::Result<()> {
         let (lo, hi) = self.effective_bounds(level);
         let vbias_mv = vbias_mv.clamp(lo, hi) as u16;
-        let payload = msp::encode_pa_calibration_request(level, Some(vbias_mv), self.session_active, self.boost_mode.wire_byte());
+        let payload = msp::encode_pa_calibration_request(
+            level,
+            Some(vbias_mv),
+            self.session_active,
+            self.boost_mode.wire_byte(),
+        );
         link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
         link.note_sent(MspCommandKind::Calibration);
         Ok(())
@@ -1463,9 +1662,21 @@ impl SweepEngine {
         );
 
         if pa_failure || not_settled {
-            let cell_status = if not_settled { CellStatus::NotSettled } else { CellStatus::PaFailure };
-            let level_status = if not_settled { LevelStatus::NotSettled } else { LevelStatus::PaFailure };
-            Self::set_cell_status(&mut self.det_cell_status, (level, self.freq_idx), cell_status);
+            let cell_status = if not_settled {
+                CellStatus::NotSettled
+            } else {
+                CellStatus::PaFailure
+            };
+            let level_status = if not_settled {
+                LevelStatus::NotSettled
+            } else {
+                LevelStatus::PaFailure
+            };
+            Self::set_cell_status(
+                &mut self.det_cell_status,
+                (level, self.freq_idx),
+                cell_status,
+            );
             self.completed_steps += 1;
             self.per_level_status.insert(level, level_status);
             self.advance_position();
@@ -1500,13 +1711,22 @@ impl SweepEngine {
         Self::set_cell_status(
             &mut self.det_cell_status,
             (level, self.freq_idx),
-            if success { CellStatus::Calibrated } else { CellStatus::Uncalibrated },
+            if success {
+                CellStatus::Calibrated
+            } else {
+                CellStatus::Uncalibrated
+            },
         );
         self.per_level_status.insert(level, LevelStatus::Done);
         self.advance_position();
     }
 
-    fn build_vtx_config_frequency_payload(&self, freq_mhz: u16, power: u8, pitmode: bool) -> Vec<u8> {
+    fn build_vtx_config_frequency_payload(
+        &self,
+        freq_mhz: u16,
+        power: u8,
+        pitmode: bool,
+    ) -> Vec<u8> {
         let mut p = vec![0u8; 15];
         p[0] = 5;
         p[1] = 0;

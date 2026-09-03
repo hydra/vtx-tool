@@ -1,4 +1,3 @@
-
 use anyhow::{bail, Result};
 use serialport::ClearBuffer;
 use std::io::{BufRead, BufReader, Write};
@@ -15,8 +14,7 @@ pub enum FrequencyCapability {
 const IMMERSIONRC_V1_BANDS_MHZ: &[u32] = &[5800, 2400, 1200, 900, 868, 433, 72, 35];
 
 const IMMERSIONRC_V2_FREQ_TABLE_MHZ: &[u32] = &[
-    35, 72, 433, 868, 915, 1200, 2400,
-    5600, 5650, 5700, 5750, 5800, 5850, 5900, 5950, 6000,
+    35, 72, 433, 868, 915, 1200, 2400, 5600, 5650, 5700, 5750, 5800, 5850, 5900, 5950, 6000,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -77,10 +75,14 @@ impl PowerMeterKind {
             PowerMeterKind::ImmersionRcV2 => FrequencyCapability::ProgrammableBand {
                 bands_mhz: IMMERSIONRC_V2_FREQ_TABLE_MHZ.to_vec(),
             },
-            PowerMeterKind::GenericManual => FrequencyCapability::Manual { min_mhz: 5000, max_mhz: 10000 },
-            PowerMeterKind::GenericFullyProgrammable => {
-                FrequencyCapability::FullyProgrammable { min_mhz: 5000, max_mhz: 10000 }
-            }
+            PowerMeterKind::GenericManual => FrequencyCapability::Manual {
+                min_mhz: 5000,
+                max_mhz: 10000,
+            },
+            PowerMeterKind::GenericFullyProgrammable => FrequencyCapability::FullyProgrammable {
+                min_mhz: 5000,
+                max_mhz: 10000,
+            },
         }
     }
 }
@@ -115,7 +117,10 @@ pub fn parse_cli(s: &str) -> Result<PowerMeterKind, String> {
         .find(|k| k.cli_name().eq_ignore_ascii_case(s))
         .ok_or_else(|| {
             let choices: Vec<&str> = PowerMeterKind::ALL.iter().map(|k| k.cli_name()).collect();
-            format!("unknown power meter kind '{s}' (expected one of: {})", choices.join(", "))
+            format!(
+                "unknown power meter kind '{s}' (expected one of: {})",
+                choices.join(", ")
+            )
         })
 }
 
@@ -145,7 +150,10 @@ impl PowerMeter {
             PowerMeterKind::ImmersionRcV2 => self.read_dbm_immersionrc(timeout),
             PowerMeterKind::GenericManual | PowerMeterKind::GenericFullyProgrammable => {
                 log::warn!(target: "meter", "read_dbm not implemented for {} -- protocol unknown", self.kind.name());
-                bail!("read_dbm not implemented for {} (protocol unknown)", self.kind.name());
+                bail!(
+                    "read_dbm not implemented for {} (protocol unknown)",
+                    self.kind.name()
+                );
             }
         }
     }
@@ -156,7 +164,10 @@ impl PowerMeter {
             PowerMeterKind::ImmersionRcV2 => self.send_and_read_line(b"V\r\n", timeout).map(|_| ()),
             PowerMeterKind::GenericManual | PowerMeterKind::GenericFullyProgrammable => {
                 log::warn!(target: "meter", "check_alive not implemented for {} -- protocol unknown", self.kind.name());
-                bail!("check_alive not implemented for {} (protocol unknown)", self.kind.name());
+                bail!(
+                    "check_alive not implemented for {} (protocol unknown)",
+                    self.kind.name()
+                );
             }
         }
     }
@@ -193,7 +204,10 @@ impl PowerMeter {
             }
             _ => {
                 log::warn!(target: "meter", "read_peak_dbm not implemented for {} -- only confirmed for ImmersionRC V2", self.kind.name());
-                bail!("read_peak_dbm not implemented for {} (only confirmed for ImmersionRC V2)", self.kind.name());
+                bail!(
+                    "read_peak_dbm not implemented for {} (only confirmed for ImmersionRC V2)",
+                    self.kind.name()
+                );
             }
         }
     }
@@ -207,7 +221,10 @@ impl PowerMeter {
             }
             _ => {
                 log::warn!(target: "meter", "read_frequency_raw not implemented for {} -- only confirmed for ImmersionRC V2", self.kind.name());
-                bail!("read_frequency_raw not implemented for {} (only confirmed for ImmersionRC V2)", self.kind.name());
+                bail!(
+                    "read_frequency_raw not implemented for {} (only confirmed for ImmersionRC V2)",
+                    self.kind.name()
+                );
             }
         }
     }

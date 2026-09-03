@@ -1,4 +1,3 @@
-
 use crate::calibration_engine::{self, SweepEngine};
 use crate::conn_status::PortState;
 use crate::msp::{self, function, MspLink};
@@ -22,22 +21,38 @@ const READY_WINDOW: Duration = Duration::from_millis(500);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 pub enum Command {
-    ConnectVtx { port: String },
+    ConnectVtx {
+        port: String,
+    },
     DisconnectVtx,
-    ConnectMeter { port: String, meter_kind: PowerMeterKind },
+    ConnectMeter {
+        port: String,
+        meter_kind: PowerMeterKind,
+    },
     DisconnectMeter,
     RefreshCalTable,
     RefreshVtxConfig,
     PushVtxConfig,
-    StartSweep { levels: Vec<u8>, tolerance_pct: f32 },
-    StartManual { levels: Vec<u8> },
-    SetManualDac { mv: i32 },
+    StartSweep {
+        levels: Vec<u8>,
+        tolerance_pct: f32,
+    },
+    StartManual {
+        levels: Vec<u8>,
+    },
+    SetManualDac {
+        mv: i32,
+    },
     ManualNext,
     ExitManual,
-    SetPaBoost { on: bool },
+    SetPaBoost {
+        on: bool,
+    },
     ConfirmFrequency,
     AbortSweep,
-    SkipMultiple { count: u32 },
+    SkipMultiple {
+        count: u32,
+    },
     SendCalTableToVtx,
     EraseCalibration,
 }
@@ -88,16 +103,29 @@ pub fn spawn(
                                     shared.vtx.lock().unwrap().port_state = PortState::Ready;
 
                                     if let Some(link) = vtx.as_mut() {
-                                        let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap(), &vtx_selection.lock().unwrap());
+                                        let payload = calibration_engine::safe_state_payload(
+                                            &vtx_table.lock().unwrap(),
+                                            &vtx_selection.lock().unwrap(),
+                                        );
                                         match link.send_v1(function::VTX_CONFIG as u8, &payload) {
-                                            Ok(()) => debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect"),
-                                            Err(e) => error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}"),
+                                            Ok(()) => {
+                                                debug!(target: "vtx", "pushed pitmode-safe VTX_CONFIG on connect")
+                                            }
+                                            Err(e) => {
+                                                error!(target: "vtx", "failed to push safe-state VTX_CONFIG on connect: {e}")
+                                            }
                                         }
                                         if shared.osd.lock().unwrap().debug_overlay_enabled {
-                                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                            if let Err(e) = link.send_v1(
+                                                function::DISPLAYPORT as u8,
+                                                &msp::encode_displayport_keepalive(),
+                                            ) {
                                                 error!(target: "vtx", "failed to send DisplayPort keepalive on connect: {e}");
                                             }
-                                            if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                            if let Err(e) = link.send_v1(
+                                                function::DISPLAYPORT as u8,
+                                                &msp::encode_displayport_clear(),
+                                            ) {
                                                 error!(target: "vtx", "failed to clear DisplayPort screen on connect: {e}");
                                             }
                                             last_displayport_keepalive = Instant::now();
@@ -126,7 +154,10 @@ pub fn spawn(
                             ctx.request_repaint();
                             if let Some(link) = vtx.as_mut() {
                                 if shared.osd.lock().unwrap().debug_overlay_enabled {
-                                    if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_release()) {
+                                    if let Err(e) = link.send_v1(
+                                        function::DISPLAYPORT as u8,
+                                        &msp::encode_displayport_release(),
+                                    ) {
                                         error!(target: "vtx", "failed to release DisplayPort on disconnect: {e}");
                                     }
                                 }
@@ -160,8 +191,10 @@ pub fn spawn(
                                 let mut meter_state = shared.meter.lock().unwrap();
                                 meter_state.port_state = PortState::Connecting;
                                 meter_state.kind = meter_kind;
-                                meter_state.update_hz =
-                                    meter_state.update_hz.min(meter_kind.max_update_hz() as f64).max(0.01);
+                                meter_state.update_hz = meter_state
+                                    .update_hz
+                                    .min(meter_kind.max_update_hz() as f64)
+                                    .max(0.01);
                                 meter_state.power_history.clear();
                             }
                             ctx.request_repaint();
@@ -173,11 +206,13 @@ pub fn spawn(
                                     meter_port_path = Some(port.clone());
                                     shared.meter.lock().unwrap().port_state = PortState::Ready;
                                     last_meter_read = Instant::now() - Duration::from_secs(1);
-                                    last_meter_alive_check = Instant::now() - Duration::from_secs(1);
+                                    last_meter_alive_check =
+                                        Instant::now() - Duration::from_secs(1);
                                 }
                                 Err(e) => {
                                     error!(target: "meter", "open failed: {e}");
-                                    shared.meter.lock().unwrap().port_state = PortState::Disconnected;
+                                    shared.meter.lock().unwrap().port_state =
+                                        PortState::Disconnected;
                                 }
                             }
                         }
@@ -233,7 +268,10 @@ pub fn spawn(
                     Command::PushVtxConfig => {
                         if let Some(link) = vtx.as_mut() {
                             let table = vtx_table.lock().unwrap();
-                            let payload = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
+                            let payload = vtx_selection
+                                .lock()
+                                .unwrap()
+                                .encode_vtx_config_response(&table);
                             drop(table);
                             match link.send_v1(function::VTX_CONFIG as u8, &payload) {
                                 Ok(()) => debug!(target: "vtx", "pushed VTX_CONFIG (Save)"),
@@ -244,16 +282,25 @@ pub fn spawn(
                         }
                     }
 
-                    Command::StartSweep { levels, tolerance_pct } => {
+                    Command::StartSweep {
+                        levels,
+                        tolerance_pct,
+                    } => {
                         let (vtx_state_now, meter_state_now) = shared.port_states();
-                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready {
+                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready
+                        {
                             error!(target: "vtx", "StartSweep requested while not fully connected (vtx={:?} meter={:?})",
                                 vtx_state_now, meter_state_now);
                         } else {
                             let resumed = {
                                 let mut guard = sweep.lock().unwrap();
                                 match guard.as_mut() {
-                                    Some(engine) if matches!(&engine.state, calibration_engine::EngineState::Manual) => {
+                                    Some(engine)
+                                        if matches!(
+                                            &engine.state,
+                                            calibration_engine::EngineState::Manual
+                                        ) =>
+                                    {
                                         engine.resume_automatic_from_current();
                                         true
                                     }
@@ -263,54 +310,57 @@ pub fn spawn(
                             if resumed {
                                 debug!(target: "vtx", "resumed automatic calibration from current manual position");
                             } else {
-                            let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
-                            let (meter_kind, prev_update_hz) = {
-                                let meter_state = shared.meter.lock().unwrap();
-                                (meter_state.kind, meter_state.update_hz)
-                            };
-                            let freq_entry = pa_table.iter().find(|e| e.idx == 0);
-                            let frequencies: Vec<u16> =
-                                freq_entry.map(|e| e.value.iter().copied().filter(|&f| f > 0).collect()).unwrap_or_default();
-                            let sign_inverted = freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
+                                let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
+                                let (meter_kind, prev_update_hz) = {
+                                    let meter_state = shared.meter.lock().unwrap();
+                                    (meter_state.kind, meter_state.update_hz)
+                                };
+                                let freq_entry = pa_table.iter().find(|e| e.idx == 0);
+                                let frequencies: Vec<u16> = freq_entry
+                                    .map(|e| e.value.iter().copied().filter(|&f| f > 0).collect())
+                                    .unwrap_or_default();
+                                let sign_inverted =
+                                    freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
 
-                            let mut target_mw_by_level = std::collections::HashMap::new();
-                            for &lvl in &levels {
-                                if let Some(entry) = pa_table.iter().find(|e| e.idx == lvl) {
-                                    target_mw_by_level.insert(lvl, entry.m_w);
+                                let mut target_mw_by_level = std::collections::HashMap::new();
+                                for &lvl in &levels {
+                                    if let Some(entry) = pa_table.iter().find(|e| e.idx == lvl) {
+                                        target_mw_by_level.insert(lvl, entry.m_w);
+                                    }
                                 }
-                            }
 
-                            if frequencies.is_empty() {
-                                error!(target: "vtx", "StartSweep: no frequency breakpoints in the PA table -- Refresh it first");
-                            } else if levels.is_empty() {
-                                error!(target: "vtx", "StartSweep: no power levels selected");
-                            } else {
-                                let mut engine = SweepEngine::new(
-                                    levels,
-                                    frequencies,
-                                    tolerance_pct,
-                                    sign_inverted,
-                                    target_mw_by_level,
-                                    meter_kind.max_update_hz(),
-                                );
-                                engine.start(meter_kind.capability());
-                                let sweep_hz = engine.sweep_hz;
-                                debug!(target: "vtx", "sweep started: {} levels, {} frequencies, tolerance {tolerance_pct}%",
+                                if frequencies.is_empty() {
+                                    error!(target: "vtx", "StartSweep: no frequency breakpoints in the PA table -- Refresh it first");
+                                } else if levels.is_empty() {
+                                    error!(target: "vtx", "StartSweep: no power levels selected");
+                                } else {
+                                    let mut engine = SweepEngine::new(
+                                        levels,
+                                        frequencies,
+                                        tolerance_pct,
+                                        sign_inverted,
+                                        target_mw_by_level,
+                                        meter_kind.max_update_hz(),
+                                    );
+                                    engine.start(meter_kind.capability());
+                                    let sweep_hz = engine.sweep_hz;
+                                    debug!(target: "vtx", "sweep started: {} levels, {} frequencies, tolerance {tolerance_pct}%",
                                     engine.levels.len(), engine.frequencies.len());
-                                {
-                                    let mut meter_state = shared.meter.lock().unwrap();
-                                    meter_state.pre_sweep_update_hz = Some(prev_update_hz);
-                                    meter_state.update_hz = sweep_hz;
+                                    {
+                                        let mut meter_state = shared.meter.lock().unwrap();
+                                        meter_state.pre_sweep_update_hz = Some(prev_update_hz);
+                                        meter_state.update_hz = sweep_hz;
+                                    }
+                                    *sweep.lock().unwrap() = Some(engine);
                                 }
-                                *sweep.lock().unwrap() = Some(engine);
-                            }
                             }
                         }
                     }
 
                     Command::StartManual { levels } => {
                         let (vtx_state_now, meter_state_now) = shared.port_states();
-                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready {
+                        if vtx_state_now != PortState::Ready || meter_state_now != PortState::Ready
+                        {
                             error!(target: "vtx", "StartManual requested while not fully connected (vtx={:?} meter={:?})",
                                 vtx_state_now, meter_state_now);
                         } else {
@@ -320,9 +370,11 @@ pub fn spawn(
                                 (meter_state.kind, meter_state.update_hz)
                             };
                             let freq_entry = pa_table.iter().find(|e| e.idx == 0);
-                            let frequencies: Vec<u16> =
-                                freq_entry.map(|e| e.value.iter().copied().filter(|&f| f > 0).collect()).unwrap_or_default();
-                            let sign_inverted = freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
+                            let frequencies: Vec<u16> = freq_entry
+                                .map(|e| e.value.iter().copied().filter(|&f| f > 0).collect())
+                                .unwrap_or_default();
+                            let sign_inverted =
+                                freq_entry.map(|e| e.dac_sign_inverted).unwrap_or(false);
 
                             let mut target_mw_by_level = std::collections::HashMap::new();
                             for &lvl in &levels {
@@ -373,11 +425,20 @@ pub fn spawn(
 
                     Command::ManualNext => {
                         let detector_mv = {
-                            shared.vtx.lock().unwrap().status.as_ref().map(|v| v.detector_mv).unwrap_or(0)
+                            shared
+                                .vtx
+                                .lock()
+                                .unwrap()
+                                .status
+                                .as_ref()
+                                .map(|v| v.detector_mv)
+                                .unwrap_or(0)
                         };
                         let next_pos = {
                             let mut guard = sweep.lock().unwrap();
-                            guard.as_mut().and_then(|engine| engine.manual_next(detector_mv))
+                            guard
+                                .as_mut()
+                                .and_then(|engine| engine.manual_next(detector_mv))
                         };
                         if let Some((level, freq_idx)) = next_pos {
                             let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
@@ -426,7 +487,9 @@ pub fn spawn(
                     Command::SkipMultiple { count } => {
                         let next_pos = {
                             let mut guard = sweep.lock().unwrap();
-                            guard.as_mut().and_then(|engine| engine.skip_multiple(count))
+                            guard
+                                .as_mut()
+                                .and_then(|engine| engine.skip_multiple(count))
                         };
                         if let Some((level, freq_idx)) = next_pos {
                             let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
@@ -446,7 +509,10 @@ pub fn spawn(
                             let mut sent = 0;
                             for entry in pa_table.iter().filter(|e| e.idx > 0) {
                                 let payload = msp::encode_pa_calibration(entry);
-                                if link.send_v2(function::SET_PACALTABLE, Some(&payload)).is_ok() {
+                                if link
+                                    .send_v2(function::SET_PACALTABLE, Some(&payload))
+                                    .is_ok()
+                                {
                                     sent += 1;
                                 }
                             }
@@ -470,10 +536,14 @@ pub fn spawn(
                                                 engine.clear_cell_status();
                                             }
                                         }
-                                        Err(e) => error!(target: "vtx", "PA table read after erase failed: {e}"),
+                                        Err(e) => {
+                                            error!(target: "vtx", "PA table read after erase failed: {e}")
+                                        }
                                     }
                                 }
-                                Err(e) => error!(target: "vtx", "failed to send calibration reset: {e}"),
+                                Err(e) => {
+                                    error!(target: "vtx", "failed to send calibration reset: {e}")
+                                }
                             }
                         } else {
                             error!(target: "vtx", "EraseCalibration requested while disconnected");
@@ -511,15 +581,22 @@ pub fn spawn(
                 }
                 let osd_debug_overlay_enabled = shared.osd.lock().unwrap().debug_overlay_enabled;
                 if osd_debug_overlay_enabled {
-                    if last_displayport_keepalive.elapsed() >= DISPLAYPORT_KEEPALIVE_INTERVAL && link.can_send_now() {
+                    if last_displayport_keepalive.elapsed() >= DISPLAYPORT_KEEPALIVE_INTERVAL
+                        && link.can_send_now()
+                    {
                         last_displayport_keepalive = Instant::now();
-                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                        if let Err(e) = link.send_v1(
+                            function::DISPLAYPORT as u8,
+                            &msp::encode_displayport_keepalive(),
+                        ) {
                             error!(target: "vtx", "failed to send DisplayPort keepalive: {e}");
                         }
                         shared.osd.lock().unwrap().keepalive_at = Some(format_time_hms());
                     }
                     while link.can_send_now() {
-                        let Some(frame) = displayport_queue.pop_front() else { break };
+                        let Some(frame) = displayport_queue.pop_front() else {
+                            break;
+                        };
                         if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &frame) {
                             error!(target: "vtx", "failed to send DisplayPort frame: {e}");
                             break;
@@ -539,13 +616,17 @@ pub fn spawn(
                         shared.vtx.lock().unwrap().last_seen_at = Some(format_time_hms());
                         if frame.function == function::VTX_CONFIG && frame.payload.is_empty() {
                             let table = vtx_table.lock().unwrap();
-                            let table_empty = table.bands.is_empty() || table.power_levels.is_empty();
+                            let table_empty =
+                                table.bands.is_empty() || table.power_levels.is_empty();
                             let ready = shared.table_sync.lock().unwrap().ready;
                             if table_empty || !ready {
                                 debug!(target: "vtx", "VTX_CONFIG query received but not replying (table_empty={table_empty}, ready={ready})");
                                 drop(table);
                             } else {
-                                let response = vtx_selection.lock().unwrap().encode_vtx_config_response(&table);
+                                let response = vtx_selection
+                                    .lock()
+                                    .unwrap()
+                                    .encode_vtx_config_response(&table);
                                 drop(table);
                                 match link.send_v1(function::VTX_CONFIG as u8, &response) {
                                     Ok(()) => {
@@ -559,7 +640,9 @@ pub fn spawn(
                                 }
                             }
                             ctx.request_repaint();
-                        } else if frame.function == function::VTX_CONFIG && !frame.payload.is_empty() {
+                        } else if frame.function == function::VTX_CONFIG
+                            && !frame.payload.is_empty()
+                        {
                             match msp::decode_vtx_config(&frame.payload) {
                                 Ok(cfg) => {
                                     let mut sel = vtx_selection.lock().unwrap();
@@ -573,7 +656,9 @@ pub fn spawn(
                                         cfg.band, cfg.channel, cfg.power, cfg.frequency_mhz, cfg.pitmode);
                                     ctx.request_repaint();
                                 }
-                                Err(e) => error!(target: "vtx", "failed to decode VTX_CONFIG reply: {e}"),
+                                Err(e) => {
+                                    error!(target: "vtx", "failed to decode VTX_CONFIG reply: {e}")
+                                }
                             }
                         } else if frame.function == function::SET_OSD_CANVAS {
                             if let Some(canvas) = msp::decode_osd_canvas(&frame.payload) {
@@ -581,7 +666,8 @@ pub fn spawn(
                                 debug!(target: "vtx", "OSD canvas: {}x{}", canvas.0, canvas.1);
                             }
                         } else if frame.function == function::PACALIBRATION {
-                            if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload) {
+                            if let Ok(reading) = msp::decode_pa_calibration_reading(&frame.payload)
+                            {
                                 let mut vtx_state = shared.vtx.lock().unwrap();
                                 let power_mw = vtx_state
                                     .pa_table
@@ -616,7 +702,8 @@ pub fn spawn(
                                     shared.osd.lock().unwrap().debug_overlay_enabled;
                                 if osd_debug_overlay_enabled && displayport_queue.is_empty() {
                                     displayport_queue.push_back(msp::encode_displayport_clear());
-                                    displayport_queue.extend(build_status_displayport_frames(&status));
+                                    displayport_queue
+                                        .extend(build_status_displayport_frames(&status));
                                 }
                                 debug!(target: "vtx", "status: level={} power_mw={:?} boost_on={:?} rtc6705_level={:?} freq_mhz={:?} vbias_mv={} detector_mv={} pid_active={:?} session_active={:?} mcu_temp_c={:?} ntc_raw={:?} pa_temp_c={:?}",
                                     reading.power_level, power_mw, reading.boost_on, reading.rtc6705_level,
@@ -645,7 +732,9 @@ pub fn spawn(
                     engine.force_connection_lost(calibration_engine::ConnectionLossReason::Vtx);
                 }
             }
-            let vtx_ready = vtx_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
+            let vtx_ready = vtx_last_seen
+                .map(|t| t.elapsed() < READY_WINDOW)
+                .unwrap_or(false);
             if vtx.is_some() {
                 let mut vtx_state = shared.vtx.lock().unwrap();
                 vtx_state.ready = vtx_ready;
@@ -660,7 +749,8 @@ pub fn spawn(
 
             if vtx.is_none() {
                 if let Some(path) = vtx_port_path.clone() {
-                    let is_lost = shared.vtx.lock().unwrap().port_state == PortState::LostCommunication;
+                    let is_lost =
+                        shared.vtx.lock().unwrap().port_state == PortState::LostCommunication;
                     if is_lost && vtx_last_reconnect_attempt.elapsed() >= RECONNECT_INTERVAL {
                         vtx_last_reconnect_attempt = Instant::now();
                         match MspLink::open(&path, 115200) {
@@ -670,15 +760,26 @@ pub fn spawn(
                                 vtx_last_seen = None;
                                 shared.vtx.lock().unwrap().port_state = PortState::Ready;
                                 if let Some(link) = vtx.as_mut() {
-                                    let payload = calibration_engine::safe_state_payload(&vtx_table.lock().unwrap(), &vtx_selection.lock().unwrap());
-                                    if let Err(e) = link.send_v1(function::VTX_CONFIG as u8, &payload) {
+                                    let payload = calibration_engine::safe_state_payload(
+                                        &vtx_table.lock().unwrap(),
+                                        &vtx_selection.lock().unwrap(),
+                                    );
+                                    if let Err(e) =
+                                        link.send_v1(function::VTX_CONFIG as u8, &payload)
+                                    {
                                         error!(target: "vtx", "failed to push safe-state VTX_CONFIG after reconnect: {e}");
                                     }
                                     if shared.osd.lock().unwrap().debug_overlay_enabled {
-                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_keepalive()) {
+                                        if let Err(e) = link.send_v1(
+                                            function::DISPLAYPORT as u8,
+                                            &msp::encode_displayport_keepalive(),
+                                        ) {
                                             error!(target: "vtx", "failed to send DisplayPort keepalive after reconnect: {e}");
                                         }
-                                        if let Err(e) = link.send_v1(function::DISPLAYPORT as u8, &msp::encode_displayport_clear()) {
+                                        if let Err(e) = link.send_v1(
+                                            function::DISPLAYPORT as u8,
+                                            &msp::encode_displayport_clear(),
+                                        ) {
                                             error!(target: "vtx", "failed to clear DisplayPort screen after reconnect: {e}");
                                         }
                                         last_displayport_keepalive = Instant::now();
@@ -691,13 +792,17 @@ pub fn spawn(
                                     }
                                 }
                             }
-                            Err(e) => debug!(target: "vtx", "reconnect attempt for {path} failed: {e}"),
+                            Err(e) => {
+                                debug!(target: "vtx", "reconnect attempt for {path} failed: {e}")
+                            }
                         }
                     }
                 }
             }
 
-            let meter_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
+            let meter_ready = meter_last_seen
+                .map(|t| t.elapsed() < READY_WINDOW)
+                .unwrap_or(false);
             if let Some(link) = vtx.as_mut() {
                 let (history_snapshot, reading_seq) = {
                     let meter_state = shared.meter.lock().unwrap();
@@ -706,14 +811,23 @@ pub fn spawn(
                 let mut sweep_guard = sweep.lock().unwrap();
                 if let Some(engine) = sweep_guard.as_mut() {
                     let was_active = engine.is_active();
-                    match engine.poll(link, &history_snapshot, reading_seq, pa_calibration_reading, vtx_ready, meter_ready) {
+                    match engine.poll(
+                        link,
+                        &history_snapshot,
+                        reading_seq,
+                        pa_calibration_reading,
+                        vtx_ready,
+                        meter_ready,
+                    ) {
                         Ok(_sent) => {}
                         Err(e) => error!(target: "vtx", "sweep step failed: {e}"),
                     }
                     if let Some(freq) = engine.pending_meter_frequency.take() {
                         if let Some(m) = meter.as_mut() {
                             match m.set_frequency(freq) {
-                                Ok(()) => debug!(target: "meter", "set_frequency({freq}) requested"),
+                                Ok(()) => {
+                                    debug!(target: "meter", "set_frequency({freq}) requested")
+                                }
                                 Err(e) => error!(target: "meter", "set_frequency failed: {e}"),
                             }
                         } else {
@@ -723,8 +837,10 @@ pub fn spawn(
                     if let Some(result) = engine.pending_result.take() {
                         if result.success {
                             let mut vtx_state = shared.vtx.lock().unwrap();
-                            if let Some(entry) =
-                                vtx_state.pa_table.iter_mut().find(|e| e.idx == result.level)
+                            if let Some(entry) = vtx_state
+                                .pa_table
+                                .iter_mut()
+                                .find(|e| e.idx == result.level)
                             {
                                 if let Some(vbias_mv) = result.vbias_mv {
                                     if let Some(slot) = entry.value.get_mut(result.freq_idx) {
@@ -805,7 +921,9 @@ pub fn spawn(
                     engine.force_connection_lost(calibration_engine::ConnectionLossReason::Meter);
                 }
             } else if meter.is_some() {
-                let is_ready = meter_last_seen.map(|t| t.elapsed() < READY_WINDOW).unwrap_or(false);
+                let is_ready = meter_last_seen
+                    .map(|t| t.elapsed() < READY_WINDOW)
+                    .unwrap_or(false);
                 let mut meter_state = shared.meter.lock().unwrap();
                 if is_ready {
                     if meter_state.port_state != PortState::Ready {
@@ -820,7 +938,10 @@ pub fn spawn(
                 if let Some(path) = meter_port_path.clone() {
                     let (is_lost, kind) = {
                         let meter_state = shared.meter.lock().unwrap();
-                        (meter_state.port_state == PortState::LostCommunication, meter_state.kind)
+                        (
+                            meter_state.port_state == PortState::LostCommunication,
+                            meter_state.kind,
+                        )
                     };
                     if is_lost && meter_last_reconnect_attempt.elapsed() >= RECONNECT_INTERVAL {
                         meter_last_reconnect_attempt = Instant::now();
@@ -833,7 +954,9 @@ pub fn spawn(
                                 last_meter_read = Instant::now() - Duration::from_secs(1);
                                 last_meter_alive_check = Instant::now() - Duration::from_secs(1);
                             }
-                            Err(e) => debug!(target: "meter", "reconnect attempt for {path} failed: {e}"),
+                            Err(e) => {
+                                debug!(target: "meter", "reconnect attempt for {path} failed: {e}")
+                            }
                         }
                     }
                 }
@@ -850,14 +973,50 @@ fn build_status_displayport_frames(status: &VtxStatus) -> Vec<Vec<u8>> {
     }
     let rows = [
         row("Level", status.level.to_string()),
-        row("Power mW", status.power_mw.map(|v| format!("{v}mW")).unwrap_or_else(|| "-".to_string())),
-        row("PA", status.boost_on.map(|b| if b { "ON" } else { "OFF" }.to_string()).unwrap_or_else(|| "?".to_string())),
-        row("RTC6705", status.rtc6705_level.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())),
-        row("Freq", status.frequency_mhz.map(|v| format!("{v}MHz")).unwrap_or_else(|| "-".to_string())),
+        row(
+            "Power mW",
+            status
+                .power_mw
+                .map(|v| format!("{v}mW"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        row(
+            "PA",
+            status
+                .boost_on
+                .map(|b| if b { "ON" } else { "OFF" }.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        ),
+        row(
+            "RTC6705",
+            status
+                .rtc6705_level
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        row(
+            "Freq",
+            status
+                .frequency_mhz
+                .map(|v| format!("{v}MHz"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
         row("VBIAS", format!("{}mV", status.vbias_mv)),
         row("Vdet", status.detector_mv.to_string()),
-        row("PID", status.pid_active.map(|b| if b { "Active" } else { "Idle" }.to_string()).unwrap_or_else(|| "?".to_string())),
-        row("Session", status.session_active.map(|b| if b { "Open" } else { "Closed" }.to_string()).unwrap_or_else(|| "?".to_string())),
+        row(
+            "PID",
+            status
+                .pid_active
+                .map(|b| if b { "Active" } else { "Idle" }.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        ),
+        row(
+            "Session",
+            status
+                .session_active
+                .map(|b| if b { "Open" } else { "Closed" }.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        ),
     ];
 
     let mut frames: Vec<Vec<u8>> = rows

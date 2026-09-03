@@ -1,4 +1,3 @@
-
 use crate::app::grid_label;
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
@@ -8,12 +7,12 @@ use crate::settings::AppSettings;
 use crate::state::SharedHandles;
 use crate::worker::{Command, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
+use egui::SliderClamping;
 use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoints};
+use egui_table::AutoSizeMode;
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
-use egui::SliderClamping;
-use egui_table::AutoSizeMode;
 
 const CANDIDATE_HZ: &[(f64, &str)] = &[
     (20.0, "20 Hz (50ms)"),
@@ -81,17 +80,16 @@ fn colored_cell(ui: &mut egui::Ui, text: String, status: CellStatus) {
     }
     if status == CellStatus::Current {
         let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
-        ui.painter().rect_stroke(ui.max_rect(), 0.0, stroke, egui::StrokeKind::Inside);
+        ui.painter()
+            .rect_stroke(ui.max_rect(), 0.0, stroke, egui::StrokeKind::Inside);
     }
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     ui.centered_and_justified(|ui| ui.label(text));
 }
 
 const COL_WIDTHS: [f32; 21] = [
-    24.0, 28.0, 40.0,
-    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0,
-    55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0,
-    45.0, 65.0, 70.0, 160.0,
+    24.0, 28.0, 40.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0, 55.0,
+    55.0, 45.0, 65.0, 70.0, 160.0,
 ];
 const GROUP_ROW_HEIGHT: f32 = 18.0;
 const HEADER_ROW_HEIGHT: f32 = 18.0;
@@ -128,11 +126,14 @@ impl PaTableDelegate<'_> {
 }
 
 impl egui_table::TableDelegate for PaTableDelegate<'_> {
-    fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {
-    }
+    fn prepare(&mut self, _info: &egui_table::PrefetchInfo) {}
 
     fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell_inf: &egui_table::HeaderCellInfo) {
-        let egui_table::HeaderCellInfo { group_index, row_nr, .. } = cell_inf;
+        let egui_table::HeaderCellInfo {
+            group_index,
+            row_nr,
+            ..
+        } = cell_inf;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         match row_nr {
             0 => {
@@ -154,8 +155,7 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
         }
     }
 
-    fn row_ui(&mut self, _ui: &mut egui::Ui, _row_nr: u64) {
-    }
+    fn row_ui(&mut self, _ui: &mut egui::Ui, _row_nr: u64) {}
 
     fn cell_ui(&mut self, ui: &mut egui::Ui, cell_info: &egui_table::CellInfo) {
         let egui_table::CellInfo { row_nr, col_nr, .. } = *cell_info;
@@ -205,7 +205,11 @@ impl egui_table::TableDelegate for PaTableDelegate<'_> {
                 ui.label(entry.rtc6705_level.to_string());
             }
             19 => {
-                ui.label(self.limits[row_nr].map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+                ui.label(
+                    self.limits[row_nr]
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
             }
             20 => {
                 ui.label(status_text(self.level_status[row_nr].as_ref()));
@@ -276,23 +280,44 @@ pub fn show(
             None => "Power meter: (no reading yet)".to_string(),
         });
 
-        let power_points: Vec<[f64; 2]> = power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
-        let temp_points_raw: Vec<[f64; 2]> = pa_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
-        let mcu_temp_points_raw: Vec<[f64; 2]> = mcu_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
-        let latest_t = power_history.back().map(|&(t, _)| t).unwrap_or(0.0)
+        let power_points: Vec<[f64; 2]> = power_history
+            .iter()
+            .map(|&(t, mw)| [t, mw as f64])
+            .collect();
+        let temp_points_raw: Vec<[f64; 2]> = pa_temp_history
+            .iter()
+            .map(|&(t, c)| [t, c as f64])
+            .collect();
+        let mcu_temp_points_raw: Vec<[f64; 2]> = mcu_temp_history
+            .iter()
+            .map(|&(t, c)| [t, c as f64])
+            .collect();
+        let latest_t = power_history
+            .back()
+            .map(|&(t, _)| t)
+            .unwrap_or(0.0)
             .max(pa_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0))
             .max(mcu_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0));
 
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
-        let combined_temp_points: Vec<[f64; 2]> =
-            temp_points_raw.iter().chain(mcu_temp_points_raw.iter()).copied().collect();
+        let combined_temp_points: Vec<[f64; 2]> = temp_points_raw
+            .iter()
+            .chain(mcu_temp_points_raw.iter())
+            .copied()
+            .collect();
         let (temp_lo, temp_hi) = min_max_or(&combined_temp_points, 0.0, 1.0);
-        let temp_to_power = move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
-        let power_to_temp = move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
-        let temp_points_scaled: PlotPoints =
-            temp_points_raw.iter().map(|&[t, c]| [t, temp_to_power(c)]).collect();
-        let mcu_temp_points_scaled: PlotPoints =
-            mcu_temp_points_raw.iter().map(|&[t, c]| [t, temp_to_power(c)]).collect();
+        let temp_to_power =
+            move |t: f64| power_lo + (t - temp_lo) / (temp_hi - temp_lo) * (power_hi - power_lo);
+        let power_to_temp =
+            move |p: f64| temp_lo + (p - power_lo) / (power_hi - power_lo) * (temp_hi - temp_lo);
+        let temp_points_scaled: PlotPoints = temp_points_raw
+            .iter()
+            .map(|&[t, c]| [t, temp_to_power(c)])
+            .collect();
+        let mcu_temp_points_scaled: PlotPoints = mcu_temp_points_raw
+            .iter()
+            .map(|&[t, c]| [t, temp_to_power(c)])
+            .collect();
         let power_points: PlotPoints = power_points.into();
 
         let left_axis = AxisHints::new_y().label("mW").placement(HPlacement::Left);
@@ -315,10 +340,14 @@ pub fn show(
         let plot_response = plot.show(ui, |plot_ui| {
             plot_ui.line(Line::new("Power (mW)", power_points));
             if !temp_points_raw.is_empty() {
-                plot_ui.line(Line::new("PA temp (°C)", temp_points_scaled).color(egui::Color32::YELLOW));
+                plot_ui.line(
+                    Line::new("PA temp (°C)", temp_points_scaled).color(egui::Color32::YELLOW),
+                );
             }
             if !mcu_temp_points_raw.is_empty() {
-                plot_ui.line(Line::new("MCU temp (°C)", mcu_temp_points_scaled).color(egui::Color32::ORANGE));
+                plot_ui.line(
+                    Line::new("MCU temp (°C)", mcu_temp_points_scaled).color(egui::Color32::ORANGE),
+                );
             }
         });
         plot_response.response.context_menu(|ui| {
@@ -332,7 +361,11 @@ pub fn show(
         ui.label("Update frequency:");
         let (mut hz, max_hz, mut atten_db) = {
             let meter = shared.meter.lock().unwrap();
-            (meter.update_hz, meter.kind.max_update_hz() as f64, meter.attenuation_db)
+            (
+                meter.update_hz,
+                meter.kind.max_update_hz() as f64,
+                meter.attenuation_db,
+            )
         };
         let selected_label = CANDIDATE_HZ
             .iter()
@@ -350,7 +383,12 @@ pub fn show(
 
         ui.separator();
         ui.label("Attenuation:");
-        let response = ui.add(egui::DragValue::new(&mut atten_db).suffix(" dB").range(-50.0..=100.0).speed(0.1));
+        let response = ui.add(
+            egui::DragValue::new(&mut atten_db)
+                .suffix(" dB")
+                .range(-50.0..=100.0)
+                .speed(0.1),
+        );
         if response.changed() {
             shared.meter.lock().unwrap().attenuation_db = atten_db;
             let mut settings = AppSettings::load();
@@ -362,18 +400,27 @@ pub fn show(
     ui.separator();
     ui.heading("PA calibration table");
 
-    let sweep_active = sweep.lock().unwrap().as_ref().map(|e| e.is_active()).unwrap_or(false);
+    let sweep_active = sweep
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| e.is_active())
+        .unwrap_or(false);
 
     let awaiting_freq_mhz = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match &e.state {
-            calibration_engine::EngineState::AwaitingFreqConfirm { freq_mhz, .. } => Some(*freq_mhz),
+            calibration_engine::EngineState::AwaitingFreqConfirm { freq_mhz, .. } => {
+                Some(*freq_mhz)
+            }
             _ => None,
         })
     };
     if let Some(freq_mhz) = awaiting_freq_mhz {
         let prompt_mhz = match shared.meter.lock().unwrap().kind.capability() {
-            FrequencyCapability::ManualBand { bands_mhz } => nearest_band(&bands_mhz, freq_mhz as u32),
+            FrequencyCapability::ManualBand { bands_mhz } => {
+                nearest_band(&bands_mhz, freq_mhz as u32)
+            }
             _ => freq_mhz as u32,
         };
         egui::Window::new("Set power meter frequency")
@@ -381,7 +428,9 @@ pub fn show(
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("Set your power meter to {prompt_mhz} MHz, then continue."));
+                ui.label(format!(
+                    "Set your power meter to {prompt_mhz} MHz, then continue."
+                ));
                 ui.horizontal(|ui| {
                     if ui.button("Confirm").clicked() {
                         let _ = cmd_tx.send(Command::ConfirmFrequency);
@@ -396,9 +445,13 @@ pub fn show(
     let connection_lost = {
         let g = sweep.lock().unwrap();
         g.as_ref().and_then(|e| match &e.state {
-            calibration_engine::EngineState::ConnectionLost { level, freq_mhz, vbias_mv_at_loss, reason, .. } => {
-                Some((*level, *freq_mhz, *vbias_mv_at_loss, *reason))
-            }
+            calibration_engine::EngineState::ConnectionLost {
+                level,
+                freq_mhz,
+                vbias_mv_at_loss,
+                reason,
+                ..
+            } => Some((*level, *freq_mhz, *vbias_mv_at_loss, *reason)),
             _ => None,
         })
     };
@@ -434,7 +487,11 @@ pub fn show(
     }
 
     let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
-    let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
+    let frequencies: [u16; 7] = pa_table
+        .iter()
+        .find(|e| e.idx == 0)
+        .map(|e| e.value)
+        .unwrap_or([0; 7]);
     let entries: Vec<msp::PaCalibration> = pa_table.iter().filter(|e| e.idx > 0).cloned().collect();
 
     let mut cal_status = Vec::with_capacity(entries.len());
@@ -452,7 +509,9 @@ pub fn show(
                         return CellStatus::Current;
                     }
                 }
-                g.as_ref().and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
+                g.as_ref()
+                    .and_then(|e| e.cal_cell_status.get(&(entry.idx, i)).copied())
+                    .unwrap_or(CellStatus::Default)
             });
             let det: [CellStatus; 7] = std::array::from_fn(|i| {
                 if let Some(cur) = &current {
@@ -460,12 +519,20 @@ pub fn show(
                         return CellStatus::Current;
                     }
                 }
-                g.as_ref().and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied()).unwrap_or(CellStatus::Default)
+                g.as_ref()
+                    .and_then(|e| e.det_cell_status.get(&(entry.idx, i)).copied())
+                    .unwrap_or(CellStatus::Default)
             });
             cal_status.push(cal);
             det_status.push(det);
-            level_status.push(g.as_ref().and_then(|e| e.per_level_status.get(&entry.idx).cloned()));
-            limits.push(g.as_ref().and_then(|e| e.hard_limits.get(&entry.idx).copied()));
+            level_status.push(
+                g.as_ref()
+                    .and_then(|e| e.per_level_status.get(&entry.idx).cloned()),
+            );
+            limits.push(
+                g.as_ref()
+                    .and_then(|e| e.hard_limits.get(&entry.idx).copied()),
+            );
         }
     }
 
@@ -482,22 +549,17 @@ pub fn show(
         row_height: DATA_ROW_HEIGHT,
     };
 
-    let columns: Vec<egui_table::Column> =
-        COL_WIDTHS.iter().enumerate().map(|(index, &w)| {
-
+    let columns: Vec<egui_table::Column> = COL_WIDTHS
+        .iter()
+        .enumerate()
+        .map(|(index, &w)| {
             let last = index == COL_WIDTHS.len() - 1;
 
-            let range = if last {
-                w..=(w * 4.0)
-            } else {
-                w..=w
-            };
+            let range = if last { w..=(w * 4.0) } else { w..=w };
 
-            egui_table::Column::new(w)
-                .resizable(false)
-                .range(range)
+            egui_table::Column::new(w).resizable(false).range(range)
         })
-            .collect();
+        .collect();
     let num_rows = delegate.entries.len() as f32;
     let table_height = GROUP_ROW_HEIGHT + HEADER_ROW_HEIGHT + num_rows * DATA_ROW_HEIGHT + 4.0;
     ui.allocate_ui(egui::vec2(ui.available_width(), table_height), |ui| {
@@ -526,7 +588,11 @@ pub fn show(
     {
         let g = sweep.lock().unwrap();
         let overall = g.as_ref().map(|engine| engine.progress()).unwrap_or(0.0);
-        ui.add(egui::ProgressBar::new(overall).text("Overall").show_percentage());
+        ui.add(
+            egui::ProgressBar::new(overall)
+                .text("Overall")
+                .show_percentage(),
+        );
     }
 
     ui.separator();
@@ -545,14 +611,21 @@ pub fn show(
     let any_checked = page.checked.values().any(|&v| v);
     let overall_ready = {
         let (vtx_state, meter_state) = shared.port_states();
-        conn_status::OverallState::from_ports(vtx_state, meter_state) == conn_status::OverallState::Ready
+        conn_status::OverallState::from_ports(vtx_state, meter_state)
+            == conn_status::OverallState::Ready
     };
     let debug = {
         let g = sweep.lock().unwrap();
         g.as_ref().map(|e| e.debug_state())
     };
     let (scan_phase, drop_active, fine_bound_mv, fine_highest_avg_mw, detector) = match debug {
-        Some(d) => (d.scan_phase, d.drop_detector_active, d.fine_bound_mv, d.fine_highest_avg_mw, d.detector),
+        Some(d) => (
+            d.scan_phase,
+            d.drop_detector_active,
+            d.fine_bound_mv,
+            d.fine_highest_avg_mw,
+            d.detector,
+        ),
         None => ("Inactive", false, None, None, None),
     };
 
@@ -563,7 +636,10 @@ pub fn show(
     let prev_control_h: f32 = ui.data(|d| d.get_temp(control_h_id)).unwrap_or(0.0);
     let prev_settings_h: f32 = ui.data(|d| d.get_temp(settings_h_id)).unwrap_or(0.0);
     let prev_debug_h: f32 = ui.data(|d| d.get_temp(debug_h_id)).unwrap_or(0.0);
-    let target_h = prev_control_h.max(prev_settings_h).max(prev_debug_h).min(MAX_GROUP_HEIGHT);
+    let target_h = prev_control_h
+        .max(prev_settings_h)
+        .max(prev_debug_h)
+        .min(MAX_GROUP_HEIGHT);
     let mut new_heights = [0.0f32; 3];
 
     ui.columns(3, |columns| {
@@ -571,107 +647,162 @@ pub fn show(
             ui.set_min_width(ui.available_width());
             let top = ui.cursor().top();
             ui.strong("Controls");
-            egui::ScrollArea::horizontal().id_salt("control_scroll").show(ui, |ui| {
-            egui::Grid::new("calibration_control_grid").num_columns(2).show(ui, |ui| {
-                grid_label(ui, "Calibration");
-                ui.horizontal(|ui| {
-                    let automatic_enabled = !automatic_mode && overall_ready && (manual_mode || any_checked);
-                    if ui.add_enabled(automatic_enabled, egui::Button::new("Automatic")).clicked() {
-                        if manual_mode {
-                            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-                            levels.sort_unstable();
-                            let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
-                        } else {
-                            page.show_confirm_dialog = true;
-                        }
-                    }
+            egui::ScrollArea::horizontal()
+                .id_salt("control_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("calibration_control_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            grid_label(ui, "Calibration");
+                            ui.horizontal(|ui| {
+                                let automatic_enabled = !automatic_mode
+                                    && overall_ready
+                                    && (manual_mode || any_checked);
+                                if ui
+                                    .add_enabled(automatic_enabled, egui::Button::new("Automatic"))
+                                    .clicked()
+                                {
+                                    if manual_mode {
+                                        let mut levels: Vec<u8> = page
+                                            .checked
+                                            .iter()
+                                            .filter(|&(_, &v)| v)
+                                            .map(|(&k, _)| k)
+                                            .collect();
+                                        levels.sort_unstable();
+                                        let _ = cmd_tx.send(Command::StartSweep {
+                                            levels,
+                                            tolerance_pct: page.tolerance_pct,
+                                        });
+                                    } else {
+                                        page.show_confirm_dialog = true;
+                                    }
+                                }
 
-                    let manual_enabled = !automatic_mode && !manual_mode && overall_ready && any_checked;
-                    if ui.add_enabled(manual_enabled, egui::Button::new("Manual")).clicked() {
-                        let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
-                        levels.sort_unstable();
-                        let _ = cmd_tx.send(Command::StartManual { levels });
-                    }
+                                let manual_enabled =
+                                    !automatic_mode && !manual_mode && overall_ready && any_checked;
+                                if ui
+                                    .add_enabled(manual_enabled, egui::Button::new("Manual"))
+                                    .clicked()
+                                {
+                                    let mut levels: Vec<u8> = page
+                                        .checked
+                                        .iter()
+                                        .filter(|&(_, &v)| v)
+                                        .map(|(&k, _)| k)
+                                        .collect();
+                                    levels.sort_unstable();
+                                    let _ = cmd_tx.send(Command::StartManual { levels });
+                                }
 
-                    if ui.add_enabled(sweep_active, egui::Button::new("Stop")).clicked() {
-                        let _ = cmd_tx.send(Command::AbortSweep);
-                    }
-                    if ui.add_enabled(sweep_active, egui::Button::new("Skip >")).clicked() {
-                        page.pending_skip_count += 1;
-                        page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
-                    }
-                    if ui.add_enabled(manual_mode, egui::Button::new("Save >")).clicked() {
-                        let _ = cmd_tx.send(Command::ManualNext);
-                    }
+                                if ui
+                                    .add_enabled(sweep_active, egui::Button::new("Stop"))
+                                    .clicked()
+                                {
+                                    let _ = cmd_tx.send(Command::AbortSweep);
+                                }
+                                if ui
+                                    .add_enabled(sweep_active, egui::Button::new("Skip >"))
+                                    .clicked()
+                                {
+                                    page.pending_skip_count += 1;
+                                    page.skip_debounce_until = Some(Instant::now() + SKIP_DEBOUNCE);
+                                }
+                                if ui
+                                    .add_enabled(manual_mode, egui::Button::new("Save >"))
+                                    .clicked()
+                                {
+                                    let _ = cmd_tx.send(Command::ManualNext);
+                                }
+                            });
+                            ui.end_row();
+
+                            if let Some(deadline) = page.skip_debounce_until {
+                                let now = Instant::now();
+                                if now >= deadline {
+                                    let count = page.pending_skip_count;
+                                    page.pending_skip_count = 0;
+                                    page.skip_debounce_until = None;
+                                    if count > 0 {
+                                        let _ = cmd_tx.send(Command::SkipMultiple { count });
+                                    }
+                                } else {
+                                    ui.ctx().request_repaint_after(deadline - now);
+                                }
+                            }
+
+                            if any_checked && !overall_ready {
+                                grid_label(ui, "");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Both VTX and power meter must be Ready to calibrate.",
+                                    )
+                                    .weak()
+                                    .italics(),
+                                );
+                                ui.end_row();
+                            }
+
+                            let mut current_mv = manual_dac_mv;
+                            let step = if page.fine_step { 1.0 } else { 25.0 };
+                            let message = if page.fine_step {
+                                "DAC mV (+/-1mv)"
+                            } else {
+                                "DAC mV (+/-25mV)"
+                            };
+                            grid_label(ui, message);
+                            let response = ui.add_enabled(
+                                manual_mode,
+                                egui::Slider::new(&mut current_mv, 0..=3300)
+                                    .clamping(SliderClamping::Never)
+                                    .drag_value_speed(0.1)
+                                    .step_by(step),
+                            );
+                            if response.changed() {
+                                let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
+                            }
+                            ui.end_row();
+
+                            grid_label(ui, "Fine");
+                            ui.add_enabled(
+                                manual_mode,
+                                egui::Checkbox::new(&mut page.fine_step, ""),
+                            );
+                            ui.end_row();
+
+                            grid_label(ui, "PA");
+                            let mut pa_on = pa_boost_on.unwrap_or(false);
+                            if ui
+                                .add_enabled(manual_mode, egui::Checkbox::new(&mut pa_on, ""))
+                                .changed()
+                            {
+                                let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
+                            }
+                            ui.end_row();
+                        });
+                    ui.separator();
+                    egui::Grid::new("calibration_storage_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            grid_label(ui, "");
+                            if ui
+                                .add_enabled(!sweep_active, egui::Button::new("Send to VTX"))
+                                .clicked()
+                            {
+                                let _ = cmd_tx.send(Command::SendCalTableToVtx);
+                            }
+                            ui.end_row();
+
+                            grid_label(ui, "");
+                            if ui
+                                .add_enabled(!sweep_active, egui::Button::new("Erase Calibration"))
+                                .clicked()
+                            {
+                                page.show_erase_confirm_dialog = true;
+                            }
+                            ui.end_row();
+                        });
                 });
-                ui.end_row();
-
-                if let Some(deadline) = page.skip_debounce_until {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        let count = page.pending_skip_count;
-                        page.pending_skip_count = 0;
-                        page.skip_debounce_until = None;
-                        if count > 0 {
-                            let _ = cmd_tx.send(Command::SkipMultiple { count });
-                        }
-                    } else {
-                        ui.ctx().request_repaint_after(deadline - now);
-                    }
-                }
-
-                if any_checked && !overall_ready {
-                    grid_label(ui, "");
-                    ui.label(
-                        egui::RichText::new("Both VTX and power meter must be Ready to calibrate.")
-                            .weak()
-                            .italics(),
-                    );
-                    ui.end_row();
-                }
-
-                let mut current_mv = manual_dac_mv;
-                let step = if page.fine_step { 1.0 } else { 25.0 };
-                let message = if page.fine_step { "DAC mV (+/-1mv)" } else { "DAC mV (+/-25mV)" };
-                grid_label(ui, message);
-                let response = ui.add_enabled(
-                    manual_mode,
-                    egui::Slider::new(&mut current_mv, 0..=3300)
-                        .clamping(SliderClamping::Never)
-                        .drag_value_speed(0.1)
-                        .step_by(step),
-                );
-                if response.changed() {
-                    let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
-                }
-                ui.end_row();
-
-                grid_label(ui, "Fine");
-                ui.add_enabled(manual_mode, egui::Checkbox::new(&mut page.fine_step, ""));
-                ui.end_row();
-
-                grid_label(ui, "PA");
-                let mut pa_on = pa_boost_on.unwrap_or(false);
-                if ui.add_enabled(manual_mode, egui::Checkbox::new(&mut pa_on, "")).changed() {
-                    let _ = cmd_tx.send(Command::SetPaBoost { on: pa_on });
-                }
-                ui.end_row();
-            });
-                ui.separator();
-                egui::Grid::new("calibration_storage_grid").num_columns(2).show(ui, |ui| {
-                    grid_label(ui, "");
-                    if ui.add_enabled(!sweep_active, egui::Button::new("Send to VTX")).clicked() {
-                        let _ = cmd_tx.send(Command::SendCalTableToVtx);
-                    }
-                    ui.end_row();
-
-                    grid_label(ui, "");
-                    if ui.add_enabled(!sweep_active, egui::Button::new("Erase Calibration")).clicked() {
-                        page.show_erase_confirm_dialog = true;
-                    }
-                    ui.end_row();
-                });
-            });
             let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
             new_heights[0] = content_h;
             let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
@@ -684,18 +815,22 @@ pub fn show(
             ui.set_min_width(ui.available_width());
             let top = ui.cursor().top();
             ui.strong("Settings");
-            egui::ScrollArea::horizontal().id_salt("settings_scroll").show(ui, |ui| {
-            egui::Grid::new("calibration_settings_grid").num_columns(2).show(ui, |ui| {
-                grid_label(ui, "Scan detector tolerance");
-                ui.add(
-                    egui::DragValue::new(&mut page.tolerance_pct)
-                        .range(0.1..=50.0)
-                        .suffix("%")
-                        .speed(0.1),
-                );
-                ui.end_row();
-            });
-            });
+            egui::ScrollArea::horizontal()
+                .id_salt("settings_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("calibration_settings_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            grid_label(ui, "Scan detector tolerance");
+                            ui.add(
+                                egui::DragValue::new(&mut page.tolerance_pct)
+                                    .range(0.1..=50.0)
+                                    .suffix("%")
+                                    .speed(0.1),
+                            );
+                            ui.end_row();
+                        });
+                });
             let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
             new_heights[1] = content_h;
             let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
@@ -708,56 +843,60 @@ pub fn show(
             ui.set_min_width(ui.available_width());
             let top = ui.cursor().top();
             ui.strong("Debug");
-            egui::ScrollArea::horizontal().id_salt("debug_scroll").show(ui, |ui| {
-            egui::Grid::new("calibration_debug_grid").num_columns(2).show(ui, |ui| {
-                grid_label(ui, "Scan Phase");
-                ui.label(scan_phase);
-                ui.end_row();
+            egui::ScrollArea::horizontal()
+                .id_salt("debug_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("calibration_debug_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            grid_label(ui, "Scan Phase");
+                            ui.label(scan_phase);
+                            ui.end_row();
 
-                grid_label(ui, "Drop detector");
-                ui.label(if drop_active { "Active" } else { "Inactive" });
-                ui.end_row();
+                            grid_label(ui, "Drop detector");
+                            ui.label(if drop_active { "Active" } else { "Inactive" });
+                            ui.end_row();
 
-                grid_label(ui, "fine_bound_mv");
-                ui.label(match fine_bound_mv {
-                    Some(v) => v.to_string(),
-                    None => "None".to_string(),
+                            grid_label(ui, "fine_bound_mv");
+                            ui.label(match fine_bound_mv {
+                                Some(v) => v.to_string(),
+                                None => "None".to_string(),
+                            });
+                            ui.end_row();
+
+                            grid_label(ui, "fine_highest_average");
+                            ui.label(match fine_highest_avg_mw {
+                                Some(v) => format!("{v:.4}mW"),
+                                None => "None".to_string(),
+                            });
+                            ui.end_row();
+
+                            grid_label(ui, "Detector phase");
+                            ui.label(detector.as_ref().map(|d| d.phase).unwrap_or("None"));
+                            ui.end_row();
+
+                            grid_label(ui, "Detector below");
+                            ui.label(match detector.as_ref().and_then(|d| d.below) {
+                                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                                None => "None".to_string(),
+                            });
+                            ui.end_row();
+
+                            grid_label(ui, "Detector above");
+                            ui.label(match detector.as_ref().and_then(|d| d.above) {
+                                Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
+                                None => "None".to_string(),
+                            });
+                            ui.end_row();
+
+                            grid_label(ui, "Pinned counter");
+                            ui.label(match &detector {
+                                Some(d) => d.pinned_count.to_string(),
+                                None => "None".to_string(),
+                            });
+                            ui.end_row();
+                        });
                 });
-                ui.end_row();
-
-                grid_label(ui, "fine_highest_average");
-                ui.label(match fine_highest_avg_mw {
-                    Some(v) => format!("{v:.4}mW"),
-                    None => "None".to_string(),
-                });
-                ui.end_row();
-
-                grid_label(ui, "Detector phase");
-                ui.label(detector.as_ref().map(|d| d.phase).unwrap_or("None"));
-                ui.end_row();
-
-                grid_label(ui, "Detector below");
-                ui.label(match detector.as_ref().and_then(|d| d.below) {
-                    Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
-                    None => "None".to_string(),
-                });
-                ui.end_row();
-
-                grid_label(ui, "Detector above");
-                ui.label(match detector.as_ref().and_then(|d| d.above) {
-                    Some((mw, det_mv)) => format!("{mw:.4}mW / det={det_mv}"),
-                    None => "None".to_string(),
-                });
-                ui.end_row();
-
-                grid_label(ui, "Pinned counter");
-                ui.label(match &detector {
-                    Some(d) => d.pinned_count.to_string(),
-                    None => "None".to_string(),
-                });
-                ui.end_row();
-            });
-            });
             let content_h = (ui.cursor().top() - top).min(MAX_GROUP_HEIGHT);
             new_heights[2] = content_h;
             let extra = (target_h - content_h).max(0.0).min(MAX_GROUP_HEIGHT);
@@ -767,7 +906,11 @@ pub fn show(
         });
     });
 
-    let new_target_h = new_heights.iter().cloned().fold(0.0f32, f32::max).min(MAX_GROUP_HEIGHT);
+    let new_target_h = new_heights
+        .iter()
+        .cloned()
+        .fold(0.0f32, f32::max)
+        .min(MAX_GROUP_HEIGHT);
     ui.data_mut(|d| {
         d.insert_temp(control_h_id, new_heights[0]);
         d.insert_temp(settings_h_id, new_heights[1]);
@@ -786,7 +929,9 @@ pub fn show(
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("Recalibrate the checked power levels? This drives real RF output on the VTX.");
+                ui.label(
+                    "Recalibrate the checked power levels? This drives real RF output on the VTX.",
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Yes").clicked() {
                         confirmed = true;
@@ -801,9 +946,17 @@ pub fn show(
         }
         if confirmed {
             page.show_confirm_dialog = false;
-            let mut levels: Vec<u8> = page.checked.iter().filter(|&(_, &v)| v).map(|(&k, _)| k).collect();
+            let mut levels: Vec<u8> = page
+                .checked
+                .iter()
+                .filter(|&(_, &v)| v)
+                .map(|(&k, _)| k)
+                .collect();
             levels.sort_unstable();
-            let _ = cmd_tx.send(Command::StartSweep { levels, tolerance_pct: page.tolerance_pct });
+            let _ = cmd_tx.send(Command::StartSweep {
+                levels,
+                tolerance_pct: page.tolerance_pct,
+            });
         }
     }
 
@@ -816,7 +969,9 @@ pub fn show(
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("Reset EVERY level's calibration on the VTX back to its factory defaults?");
+                ui.label(
+                    "Reset EVERY level's calibration on the VTX back to its factory defaults?",
+                );
                 ui.label("This writes to EEPROM immediately and cannot be undone.");
                 ui.horizontal(|ui| {
                     if ui.button("Yes, erase").clicked() {

@@ -1,4 +1,3 @@
-
 mod app;
 mod calibration_engine;
 mod conn_status;
@@ -22,7 +21,10 @@ use vtxtable::{VtxSelectionState, VtxTableConfig};
 pub const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo/logo-1.png");
 
 #[derive(Parser, Debug)]
-#[command(name = "vtx-tool", about = "VTX Tool - RF PA calibration + VTX table tool")]
+#[command(
+    name = "vtx-tool",
+    about = "VTX Tool - RF PA calibration + VTX table tool"
+)]
 struct Args {
     #[arg(long)]
     vtx_port: Option<String>,
@@ -72,24 +74,28 @@ fn main() -> eframe::Result<()> {
         meter.kind = initial_meter_kind;
         meter.attenuation_db = initial_settings.attenuation_db;
     }
-    let (initial_vtx_table, vtx_table_ready_at_startup) = if initial_settings.vtx_table_path.is_empty() {
-        (VtxTableConfig::default(), false)
-    } else {
-        match VtxTableConfig::load_from_file(std::path::Path::new(&initial_settings.vtx_table_path)) {
-            Ok(loaded) => {
-                let ready = !loaded.bands.is_empty() && !loaded.power_levels.is_empty();
-                (loaded, ready)
+    let (initial_vtx_table, vtx_table_ready_at_startup) =
+        if initial_settings.vtx_table_path.is_empty() {
+            (VtxTableConfig::default(), false)
+        } else {
+            match VtxTableConfig::load_from_file(std::path::Path::new(
+                &initial_settings.vtx_table_path,
+            )) {
+                Ok(loaded) => {
+                    let ready = !loaded.bands.is_empty() && !loaded.power_levels.is_empty();
+                    (loaded, ready)
+                }
+                Err(_) => (VtxTableConfig::default(), false),
             }
-            Err(_) => (VtxTableConfig::default(), false),
-        }
-    };
+        };
     shared.table_sync.lock().unwrap().ready = vtx_table_ready_at_startup;
     let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
     let vtx_selection = Arc::new(Mutex::new(VtxSelectionState::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = mpsc::channel();
 
-    let auto_connect = args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
+    let auto_connect =
+        args.vtx_port.is_some() && args.meter_port.is_some() && args.meter_kind.is_some();
 
     let icon_image = image::load_from_memory(LOGO_BYTES)
         .expect("embedded logo.png should be a valid image")
@@ -111,10 +117,19 @@ fn main() -> eframe::Result<()> {
         "RF Calibration",
         native_options,
         Box::new(move |cc| {
-            worker::spawn(shared.clone(), vtx_table.clone(), vtx_selection.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
+            worker::spawn(
+                shared.clone(),
+                vtx_table.clone(),
+                vtx_selection.clone(),
+                sweep.clone(),
+                cmd_rx,
+                cc.egui_ctx.clone(),
+            );
 
             if auto_connect {
-                let _ = cmd_tx.send(worker::Command::ConnectVtx { port: initial_settings.vtx_port.clone() });
+                let _ = cmd_tx.send(worker::Command::ConnectVtx {
+                    port: initial_settings.vtx_port.clone(),
+                });
                 let _ = cmd_tx.send(worker::Command::ConnectMeter {
                     port: initial_settings.meter_port.clone(),
                     meter_kind: initial_meter_kind,

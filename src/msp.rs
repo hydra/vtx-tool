@@ -1,4 +1,3 @@
-
 use anyhow::{bail, Result};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -49,7 +48,11 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
     } else {
         (None, None, None, None)
     };
-    let session_active = if payload.len() >= 11 { Some(payload[10] != 0) } else { None };
+    let session_active = if payload.len() >= 11 {
+        Some(payload[10] != 0)
+    } else {
+        None
+    };
     let mcu_temp_c = if payload.len() >= 13 {
         let mcu_temp_c_x10 = (payload[11] as i16) | ((payload[12] as i16) << 8);
         Some(mcu_temp_c_x10 as f32 / 10.0)
@@ -78,7 +81,12 @@ pub fn decode_pa_calibration_reading(payload: &[u8]) -> Result<PaCalibrationRead
     })
 }
 
-pub fn encode_pa_calibration_request(power_level: u8, mv: Option<u16>, session_active: bool, boost_mode: u8) -> Vec<u8> {
+pub fn encode_pa_calibration_request(
+    power_level: u8,
+    mv: Option<u16>,
+    session_active: bool,
+    boost_mode: u8,
+) -> Vec<u8> {
     let mv = mv.unwrap_or(0);
     vec![
         power_level,
@@ -119,7 +127,11 @@ pub fn encode_displayport_draw_screen() -> Vec<u8> {
 pub fn encode_displayport_draw_string(row: u8, col: u8, text: &str) -> Vec<u8> {
     let max_len = DISPLAYPORT_COLUMNS.saturating_sub(col) as usize;
     let bytes = text.as_bytes();
-    let bytes = if bytes.len() > max_len { &bytes[..max_len] } else { bytes };
+    let bytes = if bytes.len() > max_len {
+        &bytes[..max_len]
+    } else {
+        bytes
+    };
     let mut v = vec![displayport_cmd::DRAW_STRING, row, col, 0];
     v.extend_from_slice(bytes);
     v
@@ -206,7 +218,10 @@ impl Default for VtxBand {
 
 pub fn decode_vtx_band(payload: &[u8]) -> Result<VtxBand> {
     if payload.len() < 29 {
-        bail!("SET_VTXTABLE_BAND payload too short: {} bytes", payload.len());
+        bail!(
+            "SET_VTXTABLE_BAND payload too short: {} bytes",
+            payload.len()
+        );
     }
     let name_len = (payload[1] as usize).min(8);
     let name = String::from_utf8_lossy(&payload[2..2 + name_len])
@@ -253,7 +268,10 @@ pub struct VtxPowerLevel {
 
 pub fn decode_vtx_power_level(payload: &[u8]) -> Result<VtxPowerLevel> {
     if payload.len() < 4 {
-        bail!("SET_VTXTABLE_POWERLEVEL payload too short: {} bytes", payload.len());
+        bail!(
+            "SET_VTXTABLE_POWERLEVEL payload too short: {} bytes",
+            payload.len()
+        );
     }
     let label_len = (payload[3] as usize).min(payload.len().saturating_sub(4));
     let label = String::from_utf8_lossy(&payload[4..4 + label_len]).to_string();
@@ -267,7 +285,12 @@ pub fn decode_vtx_power_level(payload: &[u8]) -> Result<VtxPowerLevel> {
 pub fn encode_vtx_power_level(pl: &VtxPowerLevel) -> Vec<u8> {
     let label_bytes = pl.label.as_bytes();
     let label_len = label_bytes.len().min(255) as u8;
-    let mut p = vec![pl.index, (pl.m_w & 0xff) as u8, (pl.m_w >> 8) as u8, label_len];
+    let mut p = vec![
+        pl.index,
+        (pl.m_w & 0xff) as u8,
+        (pl.m_w >> 8) as u8,
+        label_len,
+    ];
     p.extend_from_slice(&label_bytes[..label_len as usize]);
     p
 }
@@ -359,7 +382,12 @@ impl MspLink {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
             .open()?;
-        Ok(Self { port, can_send_at: Instant::now(), tx_count: 0, rx_count: 0 })
+        Ok(Self {
+            port,
+            can_send_at: Instant::now(),
+            tx_count: 0,
+            rx_count: 0,
+        })
     }
 
     pub fn can_send_now(&self) -> bool {

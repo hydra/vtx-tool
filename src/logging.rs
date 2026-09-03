@@ -1,4 +1,3 @@
-
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -138,19 +137,23 @@ impl egui_table::TableDelegate for LogTableDelegate<'_> {
             return;
         };
         let color = level_color(ui, entry.level);
-        Frame::new().inner_margin(Margin::symmetric(6, 2)).show(ui, |ui| {
-            match cell.col_nr {
+        Frame::new()
+            .inner_margin(Margin::symmetric(6, 2))
+            .show(ui, |ui| match cell.col_nr {
                 0 => {
                     ui.label(RichText::new(format_timestamp(entry.at)).monospace().weak());
                 }
                 1 => {
-                    ui.label(RichText::new(entry.level.to_string()).monospace().color(color));
+                    ui.label(
+                        RichText::new(entry.level.to_string())
+                            .monospace()
+                            .color(color),
+                    );
                 }
                 _ => {
                     ui.label(RichText::new(&entry.text).color(color));
                 }
-            }
-        });
+            });
     }
 
     fn default_row_height(&self) -> f32 {
@@ -176,10 +179,16 @@ pub fn show_panel(ui: &mut eframe::egui::Ui, title: &str, port_log: &PortLog) {
             .num_rows(port_log.messages.len() as u64)
             .columns(vec![
                 egui_table::Column::new(TIMESTAMP_COL_WIDTH)
-                    .range(Rangef::new(TIMESTAMP_COL_WIDTH - 4.0, TIMESTAMP_COL_WIDTH + 24.0))
+                    .range(Rangef::new(
+                        TIMESTAMP_COL_WIDTH - 4.0,
+                        TIMESTAMP_COL_WIDTH + 24.0,
+                    ))
                     .resizable(true),
                 egui_table::Column::new(SEVERITY_COL_WIDTH)
-                    .range(Rangef::new(SEVERITY_COL_WIDTH - 4.0, SEVERITY_COL_WIDTH + 16.0))
+                    .range(Rangef::new(
+                        SEVERITY_COL_WIDTH - 4.0,
+                        SEVERITY_COL_WIDTH + 16.0,
+                    ))
                     .resizable(true),
                 egui_table::Column::new(160.0),
             ])

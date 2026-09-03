@@ -1,4 +1,3 @@
-
 use crate::power_meter::PowerMeterKind;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

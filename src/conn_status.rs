@@ -1,4 +1,3 @@
-
 use eframe::egui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +23,9 @@ impl PortState {
     pub fn color(self) -> egui::Color32 {
         match self {
             PortState::Disconnected => egui::Color32::from_rgb(180, 70, 70),
-            PortState::Connecting | PortState::Disconnecting => egui::Color32::from_rgb(200, 160, 60),
+            PortState::Connecting | PortState::Disconnecting => {
+                egui::Color32::from_rgb(200, 160, 60)
+            }
             PortState::Ready => egui::Color32::from_rgb(70, 170, 100),
             PortState::LostCommunication => egui::Color32::from_rgb(200, 90, 40),
         }

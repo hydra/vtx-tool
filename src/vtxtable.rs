@@ -1,4 +1,3 @@
-
 use crate::msp::{VtxBand, VtxPowerLevel};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -92,12 +91,17 @@ impl VtxTableConfig {
             .map(|(i, &value)| VtxPowerLevel {
                 index: i as u8 + 1,
                 m_w: value,
-                label: power_labels.get(i).cloned().unwrap_or_else(|| value.to_string()),
+                label: power_labels
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| value.to_string()),
             })
             .collect();
 
         if cfg.bands.is_empty() && cfg.power_levels.is_empty() {
-            anyhow::bail!("no 'vtxtable band'/'vtxtable powervalues' lines found in the pasted text");
+            anyhow::bail!(
+                "no 'vtxtable band'/'vtxtable powervalues' lines found in the pasted text"
+            );
         }
 
         Ok(cfg)
@@ -134,7 +138,10 @@ impl VtxSelectionState {
             .bands
             .iter()
             .find(|b| b.index == self.selected_band)
-            .and_then(|b| b.freqs_mhz.get((self.selected_channel as usize).saturating_sub(1)))
+            .and_then(|b| {
+                b.freqs_mhz
+                    .get((self.selected_channel as usize).saturating_sub(1))
+            })
             .copied()
             .unwrap_or(self.selected_freq_mhz)
     }

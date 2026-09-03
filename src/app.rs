@@ -1,4 +1,3 @@
-
 use crate::conn_status;
 use crate::logging;
 use crate::logging::SharedLogs;
@@ -7,8 +6,8 @@ use crate::pages::calibration::CalibrationPageState;
 use crate::pages::vtx_table::VtxTablePageState;
 use crate::power_meter::PowerMeterKind;
 use crate::settings::AppSettings;
-use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
 use crate::state::SharedHandles;
+use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
 use crate::worker::{Command, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
@@ -77,10 +76,20 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Page) {
         match tab {
             Page::Home => pages::home::show(ui),
-            Page::VtxTable => pages::vtx_table::show(ui, self.shared, self.vtx_table, self.cmd_tx, self.vtx_table_page),
-            Page::Calibration => {
-                pages::calibration::show(ui, self.shared, self.sweep, self.cmd_tx, self.calibration_page)
-            }
+            Page::VtxTable => pages::vtx_table::show(
+                ui,
+                self.shared,
+                self.vtx_table,
+                self.cmd_tx,
+                self.vtx_table_page,
+            ),
+            Page::Calibration => pages::calibration::show(
+                ui,
+                self.shared,
+                self.sweep,
+                self.cmd_tx,
+                self.calibration_page,
+            ),
         }
     }
 }
