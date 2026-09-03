@@ -1,8 +1,9 @@
 
 use crate::msp::{VtxBand, VtxPowerLevel};
 use crate::settings::AppSettings;
+use crate::state::SharedHandles;
 use crate::vtxtable::VtxTableConfig;
-use crate::worker::{Command, SharedState};
+use crate::worker::Command;
 use eframe::egui;
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -69,7 +70,7 @@ fn resize_power_levels(cfg: &mut VtxTableConfig, target: usize, removed: &mut Ve
 
 pub fn show(
     ui: &mut egui::Ui,
-    shared: &Arc<Mutex<SharedState>>,
+    shared: &SharedHandles,
     vtx_table: &Arc<Mutex<VtxTableConfig>>,
     cmd_tx: &Sender<Command>,
     page: &mut VtxTablePageState,
@@ -79,14 +80,14 @@ pub fn show(
     ui.heading("VTX Table");
 
     {
-        let mut s = shared.lock().unwrap();
+        let mut sync = shared.table_sync.lock().unwrap();
         ui.horizontal(|ui| {
-            ui.checkbox(&mut s.vtx_table_ready, "Ready");
+            ui.checkbox(&mut sync.ready, "Ready");
             ui.separator();
             ui.label("Synchronized:");
             ui.colored_label(
-                if s.vtx_table_synchronized { egui::Color32::GREEN } else { egui::Color32::RED },
-                if s.vtx_table_synchronized { "True" } else { "False" },
+                if sync.synchronized { egui::Color32::GREEN } else { egui::Color32::RED },
+                if sync.synchronized { "True" } else { "False" },
             );
         });
     }
@@ -275,9 +276,9 @@ pub fn show(
     });
 
     if modified {
-        let mut s = shared.lock().unwrap();
-        s.vtx_table_ready = false;
-        s.vtx_table_synchronized = false;
+        let mut sync = shared.table_sync.lock().unwrap();
+        sync.ready = false;
+        sync.synchronized = false;
     }
 
     ui.separator();
@@ -289,8 +290,8 @@ pub fn show(
                 let _ = cmd_tx.send(Command::RefreshVtxConfig);
             }
         });
-        let s = shared.lock().unwrap();
-        match &s.vtx_config {
+        let vtx = shared.vtx.lock().unwrap();
+        match &vtx.config {
             Some(c) => ui.label(format!(
                 "band={} channel={} freq={} power={} pit={}",
                 c.band, c.channel, c.frequency_mhz, c.power, c.pitmode

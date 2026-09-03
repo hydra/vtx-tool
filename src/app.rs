@@ -8,7 +8,8 @@ use crate::pages::vtx_table::VtxTablePageState;
 use crate::power_meter::PowerMeterKind;
 use crate::settings::AppSettings;
 use crate::vtxtable::{VtxSelectionState, VtxTableConfig};
-use crate::worker::{Command, SharedState, SharedSweep};
+use crate::state::SharedHandles;
+use crate::worker::{Command, SharedSweep};
 use eframe::egui;
 use eframe::Frame;
 
@@ -54,7 +55,7 @@ impl Page {
 }
 
 struct TabViewer<'a> {
-    shared: &'a Arc<Mutex<SharedState>>,
+    shared: &'a SharedHandles,
     vtx_table: &'a Arc<Mutex<VtxTableConfig>>,
     sweep: &'a SharedSweep,
     cmd_tx: &'a Sender<Command>,
@@ -85,7 +86,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 }
 
 pub struct App {
-    state: Arc<Mutex<SharedState>>,
+    shared: SharedHandles,
     vtx_table: Arc<Mutex<VtxTableConfig>>,
     vtx_selection: Arc<Mutex<VtxSelectionState>>,
     sweep: SharedSweep,
@@ -102,7 +103,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        state: Arc<Mutex<SharedState>>,
+        shared: SharedHandles,
         vtx_table: Arc<Mutex<VtxTableConfig>>,
         vtx_selection: Arc<Mutex<VtxSelectionState>>,
         sweep: SharedSweep,
@@ -112,7 +113,7 @@ impl App {
         initial_meter_kind: PowerMeterKind,
     ) -> Self {
         Self {
-            state,
+            shared,
             vtx_table,
             vtx_selection,
             sweep,
@@ -187,10 +188,7 @@ impl eframe::App for App {
 
                 ui.separator();
                 egui::CollapsingHeader::new("Connection").default_open(true).show_unindented(ui, |ui| {
-                    let (vtx_state, meter_state) = {
-                        let s = self.state.lock().unwrap();
-                        (s.vtx_port_state, s.meter_port_state)
-                    };
+                    let (vtx_state, meter_state) = self.shared.port_states();
 
                     egui::Grid::new("connection_grid").num_columns(2).show(ui, |ui| {
                         grid_label(ui, "VTX");
@@ -256,10 +254,12 @@ impl eframe::App for App {
                                         .selectable_value(&mut self.meter_kind, kind, kind.name())
                                         .changed()
                                     {
-                                        let mut s = self.state.lock().unwrap();
-                                        s.meter_kind = kind;
-                                        s.update_hz = s.update_hz.min(kind.max_update_hz() as f64);
-                                        drop(s);
+                                        {
+                                            let mut meter = self.shared.meter.lock().unwrap();
+                                            meter.kind = kind;
+                                            meter.update_hz =
+                                                meter.update_hz.min(kind.max_update_hz() as f64);
+                                        }
                                         let mut settings = AppSettings::load();
                                         settings.meter_kind = kind;
                                         let _ = settings.save();
@@ -403,8 +403,8 @@ impl eframe::App for App {
                 ui.separator();
                 egui::CollapsingHeader::new("VTX Status").default_open(true).show_unindented(ui, |ui| {
                     let (vtx_status, vtx_last_seen_at) = {
-                        let s = self.state.lock().unwrap();
-                        (s.vtx_status.clone(), s.vtx_last_seen_at.clone())
+                        let vtx = self.shared.vtx.lock().unwrap();
+                        (vtx.status.clone(), vtx.last_seen_at.clone())
                     };
                     match vtx_status {
                         Some(status) => {
@@ -489,11 +489,10 @@ impl eframe::App for App {
 
                 ui.separator();
                 egui::CollapsingHeader::new("OSD Status").default_open(true).show_unindented(ui, |ui| {
-                    let (osd_canvas, osd_keepalive_at) = {
-                        let s = self.state.lock().unwrap();
-                        (s.osd_canvas, s.osd_keepalive_at.clone())
+                    let (osd_canvas, osd_keepalive_at, mut osd_debug_overlay_enabled) = {
+                        let osd = self.shared.osd.lock().unwrap();
+                        (osd.canvas, osd.keepalive_at.clone(), osd.debug_overlay_enabled)
                     };
-                    let mut osd_debug_overlay_enabled = self.state.lock().unwrap().osd_debug_overlay_enabled;
                     egui::Grid::new("osd_status_grid").num_columns(2).show(ui, |ui| {
                         grid_label(ui, "Size");
                         ui.label(match osd_canvas {
@@ -511,7 +510,7 @@ impl eframe::App for App {
 
                         grid_label(ui, "Debug overlay");
                         if ui.checkbox(&mut osd_debug_overlay_enabled, "").changed() {
-                            self.state.lock().unwrap().osd_debug_overlay_enabled = osd_debug_overlay_enabled;
+                            self.shared.osd.lock().unwrap().debug_overlay_enabled = osd_debug_overlay_enabled;
                         }
                         ui.end_row();
                     });
@@ -521,7 +520,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             let mut viewer = TabViewer {
-                shared: &self.state,
+                shared: &self.shared,
                 vtx_table: &self.vtx_table,
                 sweep: &self.sweep,
                 cmd_tx: &self.cmd_tx,

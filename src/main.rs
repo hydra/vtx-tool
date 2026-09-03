@@ -7,6 +7,7 @@ mod msp;
 mod pages;
 mod power_meter;
 mod settings;
+mod state;
 mod vtxtable;
 mod worker;
 
@@ -65,9 +66,12 @@ fn main() -> eframe::Result<()> {
     }
     let initial_meter_kind = initial_settings.meter_kind;
 
-    let state = Arc::new(Mutex::new(worker::SharedState::default()));
-    state.lock().unwrap().meter_kind = initial_meter_kind;
-    state.lock().unwrap().attenuation_db = initial_settings.attenuation_db;
+    let shared = state::SharedHandles::new();
+    {
+        let mut meter = shared.meter.lock().unwrap();
+        meter.kind = initial_meter_kind;
+        meter.attenuation_db = initial_settings.attenuation_db;
+    }
     let (initial_vtx_table, vtx_table_ready_at_startup) = if initial_settings.vtx_table_path.is_empty() {
         (VtxTableConfig::default(), false)
     } else {
@@ -79,7 +83,7 @@ fn main() -> eframe::Result<()> {
             Err(_) => (VtxTableConfig::default(), false),
         }
     };
-    state.lock().unwrap().vtx_table_ready = vtx_table_ready_at_startup;
+    shared.table_sync.lock().unwrap().ready = vtx_table_ready_at_startup;
     let vtx_table = Arc::new(Mutex::new(initial_vtx_table));
     let vtx_selection = Arc::new(Mutex::new(VtxSelectionState::default()));
     let sweep: worker::SharedSweep = Arc::new(Mutex::new(None));
@@ -107,7 +111,7 @@ fn main() -> eframe::Result<()> {
         "RF Calibration",
         native_options,
         Box::new(move |cc| {
-            worker::spawn(state.clone(), vtx_table.clone(), vtx_selection.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
+            worker::spawn(shared.clone(), vtx_table.clone(), vtx_selection.clone(), sweep.clone(), cmd_rx, cc.egui_ctx.clone());
 
             if auto_connect {
                 let _ = cmd_tx.send(worker::Command::ConnectVtx { port: initial_settings.vtx_port.clone() });
@@ -123,7 +127,7 @@ fn main() -> eframe::Result<()> {
             });
 
             Ok(Box::new(app::App::new(
-                state.clone(),
+                shared.clone(),
                 vtx_table.clone(),
                 vtx_selection.clone(),
                 sweep.clone(),

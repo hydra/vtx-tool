@@ -5,12 +5,12 @@ use crate::conn_status;
 use crate::msp;
 use crate::power_meter::{nearest_band, FrequencyCapability};
 use crate::settings::AppSettings;
-use crate::worker::{Command, SharedState, SharedSweep, HISTORY_WINDOW_SECS};
+use crate::state::SharedHandles;
+use crate::worker::{Command, SharedSweep, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use egui::SliderClamping;
 use egui_table::AutoSizeMode;
@@ -248,7 +248,7 @@ fn min_max_or(points: &[[f64; 2]], default_lo: f64, default_hi: f64) -> (f64, f6
 
 pub fn show(
     ui: &mut egui::Ui,
-    shared: &Arc<Mutex<SharedState>>,
+    shared: &SharedHandles,
     sweep: &SharedSweep,
     cmd_tx: &Sender<Command>,
     page: &mut CalibrationPageState,
@@ -258,8 +258,16 @@ pub fn show(
     ui.separator();
 
     {
-        let state = shared.lock().unwrap();
-        ui.label(match state.last_dbm {
+        let (last_dbm, power_history) = {
+            let meter = shared.meter.lock().unwrap();
+            (meter.last_dbm, meter.power_history.clone())
+        };
+        let (pa_temp_history, mcu_temp_history) = {
+            let vtx = shared.vtx.lock().unwrap();
+            (vtx.pa_temp_history.clone(), vtx.mcu_temp_history.clone())
+        };
+
+        ui.label(match last_dbm {
             Some(dbm) => format!(
                 "Power meter: {:.2} dBm  ({})",
                 dbm,
@@ -268,12 +276,12 @@ pub fn show(
             None => "Power meter: (no reading yet)".to_string(),
         });
 
-        let power_points: Vec<[f64; 2]> = state.power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
-        let temp_points_raw: Vec<[f64; 2]> = state.temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
-        let mcu_temp_points_raw: Vec<[f64; 2]> = state.mcu_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
-        let latest_t = state.power_history.back().map(|&(t, _)| t).unwrap_or(0.0)
-            .max(state.temp_history.back().map(|&(t, _)| t).unwrap_or(0.0))
-            .max(state.mcu_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0));
+        let power_points: Vec<[f64; 2]> = power_history.iter().map(|&(t, mw)| [t, mw as f64]).collect();
+        let temp_points_raw: Vec<[f64; 2]> = pa_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
+        let mcu_temp_points_raw: Vec<[f64; 2]> = mcu_temp_history.iter().map(|&(t, c)| [t, c as f64]).collect();
+        let latest_t = power_history.back().map(|&(t, _)| t).unwrap_or(0.0)
+            .max(pa_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0))
+            .max(mcu_temp_history.back().map(|&(t, _)| t).unwrap_or(0.0));
 
         let (power_lo, power_hi) = min_max_or(&power_points, 0.0, 1.0);
         let combined_temp_points: Vec<[f64; 2]> =
@@ -322,8 +330,10 @@ pub fn show(
 
     ui.horizontal(|ui| {
         ui.label("Update frequency:");
-        let mut hz = shared.lock().unwrap().update_hz;
-        let max_hz = shared.lock().unwrap().meter_kind.max_update_hz() as f64;
+        let (mut hz, max_hz, mut atten_db) = {
+            let meter = shared.meter.lock().unwrap();
+            (meter.update_hz, meter.kind.max_update_hz() as f64, meter.attenuation_db)
+        };
         let selected_label = CANDIDATE_HZ
             .iter()
             .find(|&&(h, _)| h == hz)
@@ -336,14 +346,13 @@ pub fn show(
                     ui.selectable_value(&mut hz, h, l);
                 }
             });
-        shared.lock().unwrap().update_hz = hz;
+        shared.meter.lock().unwrap().update_hz = hz;
 
         ui.separator();
         ui.label("Attenuation:");
-        let mut atten_db = shared.lock().unwrap().attenuation_db;
         let response = ui.add(egui::DragValue::new(&mut atten_db).suffix(" dB").range(-50.0..=100.0).speed(0.1));
         if response.changed() {
-            shared.lock().unwrap().attenuation_db = atten_db;
+            shared.meter.lock().unwrap().attenuation_db = atten_db;
             let mut settings = AppSettings::load();
             settings.attenuation_db = atten_db;
             let _ = settings.save();
@@ -363,7 +372,7 @@ pub fn show(
         })
     };
     if let Some(freq_mhz) = awaiting_freq_mhz {
-        let prompt_mhz = match shared.lock().unwrap().meter_kind.capability() {
+        let prompt_mhz = match shared.meter.lock().unwrap().kind.capability() {
             FrequencyCapability::ManualBand { bands_mhz } => nearest_band(&bands_mhz, freq_mhz as u32),
             _ => freq_mhz as u32,
         };
@@ -394,10 +403,7 @@ pub fn show(
         })
     };
     if let Some((level, freq_mhz, vbias_mv_at_loss, reason)) = connection_lost {
-        let (vtx_state, meter_state) = {
-            let s = shared.lock().unwrap();
-            (s.vtx_port_state, s.meter_port_state)
-        };
+        let (vtx_state, meter_state) = shared.port_states();
         egui::Window::new("Connection error")
             .collapsible(false)
             .resizable(false)
@@ -427,7 +433,7 @@ pub fn show(
             });
     }
 
-    let pa_table = shared.lock().unwrap().pa_table.clone();
+    let pa_table = shared.vtx.lock().unwrap().pa_table.clone();
     let frequencies: [u16; 7] = pa_table.iter().find(|e| e.idx == 0).map(|e| e.value).unwrap_or([0; 7]);
     let entries: Vec<msp::PaCalibration> = pa_table.iter().filter(|e| e.idx > 0).cloned().collect();
 
@@ -533,13 +539,13 @@ pub fn show(
         }
     };
     let pa_boost_on = {
-        let s = shared.lock().unwrap();
-        s.vtx_status.as_ref().and_then(|v| v.boost_on)
+        let vtx = shared.vtx.lock().unwrap();
+        vtx.status.as_ref().and_then(|v| v.boost_on)
     };
     let any_checked = page.checked.values().any(|&v| v);
     let overall_ready = {
-        let s = shared.lock().unwrap();
-        conn_status::OverallState::from_ports(s.vtx_port_state, s.meter_port_state) == conn_status::OverallState::Ready
+        let (vtx_state, meter_state) = shared.port_states();
+        conn_status::OverallState::from_ports(vtx_state, meter_state) == conn_status::OverallState::Ready
     };
     let debug = {
         let g = sweep.lock().unwrap();
