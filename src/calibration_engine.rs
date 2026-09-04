@@ -130,6 +130,13 @@ const HEARTBEAT_BACKOFF_MV: i32 = 50;
 const PINNED_LIMIT: u32 = 5;
 const SEND_INTERVAL: Duration = Duration::from_millis(100);
 
+const SCAN_PA_SAMPLE_COUNT: usize = 4;
+const DETECTOR_BACKOFF_SAMPLE_COUNT: usize = 1;
+const DETECTOR_BRACKET_SAMPLE_COUNT: usize = 10;
+const DETECTOR_BRACKET_SKIP_FIRST: usize = 5;
+const DETECTOR_BRACKET_SEED_STEP_MV: i32 = 4;
+const DETECTOR_BRACKET_CONVERGE_MV: i32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeMode {
     Automatic,
@@ -149,7 +156,7 @@ pub(crate) struct ScanPaState {
     settle_started_instant: Option<Instant>,
     settle_timed_out: bool,
     coarse_steps_taken: u32,
-    last_below_target_mv: Option<i32>,
+    last_below_target: Option<(i32, f32)>,
     coarse_step_mv: i32,
     fine_bound_mv: Option<i32>,
     fine_started_at_secs: Option<f64>,
@@ -163,12 +170,19 @@ pub(crate) enum ScanDetectorPhase {
     Bracket,
 }
 
+#[derive(Clone, Copy)]
+struct BracketPoint {
+    vbias_mv: i32,
+    avg_mw: f32,
+    detector_mv: u16,
+}
+
 pub(crate) struct ScanDetectorState {
     phase: ScanDetectorPhase,
     vbias_mv: i32,
     wait: Option<SampleWait>,
-    below: Option<(f32, u16)>,
-    above: Option<(f32, u16)>,
+    below: Option<BracketPoint>,
+    above: Option<BracketPoint>,
     pinned_count: u32,
     last_reading: Option<msp::PaCalibrationReading>,
 }
@@ -912,7 +926,7 @@ impl SweepEngine {
                     },
                     settle_timed_out: false,
                     coarse_steps_taken: 0,
-                    last_below_target_mv: None,
+                    last_below_target: None,
                     coarse_step_mv: COARSE_RAMP_STEP_MV,
                     fine_bound_mv: None,
                     fine_started_at_secs: None,
@@ -1019,10 +1033,7 @@ impl SweepEngine {
                 self.send_calibration(link, level, st.vbias_mv)?;
                 self.last_send = Instant::now();
                 sent = true;
-                let (needed, skip) = match st.phase {
-                    ScanPaPhase::Fine | ScanPaPhase::CoarseRamp | ScanPaPhase::Settle => (4, 0),
-                };
-                st.wait = Some(SampleWait::new(now_seq, needed, skip));
+                st.wait = Some(SampleWait::new(now_seq, SCAN_PA_SAMPLE_COUNT, 0));
             }
             self.state = EngineState::Automatic(AutomaticStep::ScanPa(st));
             return Ok(sent);
@@ -1071,7 +1082,7 @@ impl SweepEngine {
             }
             ScanPaPhase::CoarseRamp => {
                 if avg_mw >= target_mw {
-                    let Some(fine_start) = st.last_below_target_mv else {
+                    let Some((below_vbias_mv, below_avg_mw)) = st.last_below_target else {
                         if st.settle_timed_out {
                             debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp's starting point still above target ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} right after settle phase timed out -- PA hadn't finished its boost-enable transient in time, not a genuinely unreachable target, skipping to the next frequency", st.vbias_mv);
                             self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::NotSettled);
@@ -1081,20 +1092,27 @@ impl SweepEngine {
                         }
                         return Ok(false);
                     };
-                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={} -- entering fine creep from last below-target point vbias_mv={fine_start}, settling {FINE_SETTLE_DELAY:?} before trusting any samples",
-                        st.vbias_mv);
+                    let overshoot_vbias_mv = st.vbias_mv;
+                    let fine_start_mv = interpolate_vbias_for_target(
+                        target_mw,
+                        (below_vbias_mv, below_avg_mw),
+                        (overshoot_vbias_mv, avg_mw),
+                    )
+                    .unwrap_or(below_vbias_mv);
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: coarse ramp overshot ({avg_mw:.4}mW >= {target_mw}mW) at vbias_mv={overshoot_vbias_mv} -- interpolating fine-creep start to vbias_mv={fine_start_mv} between below-target point (vbias_mv={below_vbias_mv}, {below_avg_mw:.4}mW) and overshoot, settling {FINE_SETTLE_DELAY:?} before trusting any samples");
                     let margin_mv = {
-                        let m = st.vbias_mv.abs() * 25 / 100;
+                        let m = overshoot_vbias_mv.abs() * 25 / 100;
                         if m == 0 {
                             st.coarse_step_mv
                         } else {
                             m
                         }
                     };
-                    let padded_bound_mv = (st.vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
-                    debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)", st.vbias_mv);
+                    let padded_bound_mv =
+                        (overshoot_vbias_mv + up * margin_mv).clamp(bound_lo, bound_hi);
+                    debug!(target: "vtx", "[sweep] ScanPa level={level}: fine creep ceiling padded from vbias_mv={overshoot_vbias_mv} to vbias_mv={padded_bound_mv} (+{margin_mv}mV toward more power)");
                     st.fine_bound_mv = Some(padded_bound_mv);
-                    st.vbias_mv = fine_start;
+                    st.vbias_mv = fine_start_mv;
                     st.phase = ScanPaPhase::Fine;
                     st.wait = None;
                     st.fine_started_at_secs = history.back().map(|e| e.0);
@@ -1116,7 +1134,7 @@ impl SweepEngine {
                         self.finish_scan_pa(level, st.vbias_mv, ScanPaOutcome::Uncalibrated);
                         return Ok(false);
                     }
-                    st.last_below_target_mv = Some(st.vbias_mv);
+                    st.last_below_target = Some((st.vbias_mv, avg_mw));
                     st.vbias_mv += up * next_step_mv;
                     st.coarse_steps_taken += 1;
                     st.wait = None;
@@ -1193,8 +1211,10 @@ impl SweepEngine {
                 self.last_send = Instant::now();
                 sent = true;
                 let (needed, skip) = match st.phase {
-                    ScanDetectorPhase::Backoff => (1, 0),
-                    ScanDetectorPhase::Bracket => (20, 10),
+                    ScanDetectorPhase::Backoff => (DETECTOR_BACKOFF_SAMPLE_COUNT, 0),
+                    ScanDetectorPhase::Bracket => {
+                        (DETECTOR_BRACKET_SAMPLE_COUNT, DETECTOR_BRACKET_SKIP_FIRST)
+                    }
                 };
                 st.wait = Some(SampleWait::new(now_seq, needed, skip));
             }
@@ -1258,19 +1278,50 @@ impl SweepEngine {
                 }
             }
             ScanDetectorPhase::Bracket => {
-                let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
-                let desired = if avg_mw < target_mw - dev {
-                    st.vbias_mv + up * 2
-                } else if avg_mw > target_mw + dev {
-                    st.vbias_mv - up * 2
-                } else if avg_mw < target_mw {
-                    debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'below' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
-                    st.below = Some((avg_mw, reading.detector_mv));
-                    st.vbias_mv + up
+                let point = BracketPoint {
+                    vbias_mv: st.vbias_mv,
+                    avg_mw,
+                    detector_mv: reading.detector_mv,
+                };
+                if avg_mw < target_mw {
+                    st.below = Some(point);
                 } else {
-                    debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket 'above' point captured vbias_mv={} avg={avg_mw:.4}mW detector={}", reading.vref_mv, reading.detector_mv);
-                    st.above = Some((avg_mw, reading.detector_mv));
-                    st.vbias_mv - up
+                    st.above = Some(point);
+                }
+                debug!(target: "vtx", "[sweep] ScanDetector level={level}: bracket point vbias_mv={} avg={avg_mw:.4}mW detector={} ({} target)",
+                    reading.vref_mv, reading.detector_mv,
+                    if avg_mw < target_mw { "below" } else { "at/above" });
+
+                if let (Some(below), Some(above)) = (st.below, st.above) {
+                    let dev = (target_mw * self.tolerance_pct / 100.0).max(0.1);
+                    let within_tolerance =
+                        target_mw - below.avg_mw <= dev && above.avg_mw - target_mw <= dev;
+                    let bracket_narrow =
+                        (above.vbias_mv - below.vbias_mv).abs() <= DETECTOR_BRACKET_CONVERGE_MV;
+                    if within_tolerance || bracket_narrow {
+                        let detector = interpolate(
+                            target_mw,
+                            (below.avg_mw, below.detector_mv),
+                            (above.avg_mw, above.detector_mv),
+                        );
+                        debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: bracket converged (below vbias_mv={} {:.4}mW, above vbias_mv={} {:.4}mW), interpolated detector={detector}",
+                            below.vbias_mv, below.avg_mw, above.vbias_mv, above.avg_mw);
+                        self.finish_scan_detector(level, detector, true);
+                        return Ok(false);
+                    }
+                }
+
+                let desired = match (st.below, st.above) {
+                    (Some(below), Some(above)) => interpolate_vbias_for_target(
+                        target_mw,
+                        (below.vbias_mv, below.avg_mw),
+                        (above.vbias_mv, above.avg_mw),
+                    )
+                    .filter(|v| *v != below.vbias_mv && *v != above.vbias_mv)
+                    .unwrap_or((below.vbias_mv + above.vbias_mv) / 2),
+                    (Some(_), None) => st.vbias_mv + up * DETECTOR_BRACKET_SEED_STEP_MV,
+                    (None, Some(_)) => st.vbias_mv - up * DETECTOR_BRACKET_SEED_STEP_MV,
+                    (None, None) => unreachable!("one bracket side was just recorded"),
                 };
                 let clamped = desired.clamp(bound_lo, bound_hi);
                 st.pinned_count = if desired != clamped {
@@ -1286,13 +1337,6 @@ impl SweepEngine {
                     debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: pinned at bound [{bound_lo},{bound_hi}] for {} attempts, target {target_mw}mW unreachable within the safe limit -- bailing with last-seen detector={} as a rough (not interpolated) fallback",
                             st.pinned_count, reading.detector_mv);
                     self.finish_scan_detector(level, reading.detector_mv, false);
-                    return Ok(false);
-                }
-
-                if let (Some(below), Some(above)) = (st.below, st.above) {
-                    let detector = interpolate(target_mw, below, above);
-                    debug!(target: "vtx", "[sweep] ScanDetector level={level} freq={freq_mhz}MHz: interpolated detector={detector} from below={below:?} above={above:?}");
-                    self.finish_scan_detector(level, detector, true);
                     return Ok(false);
                 }
             }
@@ -1379,8 +1423,8 @@ impl SweepEngine {
                         ScanDetectorPhase::Backoff => "Backoff",
                         ScanDetectorPhase::Bracket => "Bracket",
                     },
-                    below: st.below,
-                    above: st.above,
+                    below: st.below.map(|p| (p.avg_mw, p.detector_mv)),
+                    above: st.above.map(|p| (p.avg_mw, p.detector_mv)),
                     pinned_count: st.pinned_count,
                 }),
             },
@@ -1745,6 +1789,23 @@ impl SweepEngine {
         p[14] = 0;
         p
     }
+}
+
+fn interpolate_vbias_for_target(
+    target_mw: f32,
+    below: (i32, f32),
+    above: (i32, f32),
+) -> Option<i32> {
+    let (v0, m0) = (below.0 as f32, below.1);
+    let (v1, m1) = (above.0 as f32, above.1);
+    if (m1 - m0).abs() < f32::EPSILON {
+        return None;
+    }
+    let t = (target_mw - m0) / (m1 - m0);
+    let predicted = v0 + t * (v1 - v0);
+    let lo = below.0.min(above.0);
+    let hi = below.0.max(above.0);
+    Some((predicted.round() as i32).clamp(lo, hi))
 }
 
 fn interpolate(target_mw: f32, below: (f32, u16), above: (f32, u16)) -> u16 {
