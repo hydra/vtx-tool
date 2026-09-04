@@ -1,4 +1,4 @@
-use crate::app::grid_label;
+use crate::app::{grid_label, LEFT_COLUMN_MIN_WIDTH};
 use crate::calibration_engine::{self, CellStatus, LevelStatus};
 use crate::conn_status;
 use crate::msp;
@@ -22,6 +22,13 @@ const CANDIDATE_HZ: &[(f64, &str)] = &[
     (0.5, "0.5 Hz (2 seconds)"),
 ];
 
+const METER_OFFSET_TOOLTIP: &str = "Adjust to match any external attenuators. For ImmersionRC V1 power meters set this to the value of the external attenuator AND set the same value on the power meter itself.";
+
+// Reserved for the Slider's own value/drag-value text plus grid/frame spacing,
+// so the widened rail doesn't push the row past the group's edge.
+const DAC_SLIDER_RESERVED_WIDTH: f32 = 90.0;
+const DAC_SLIDER_MIN_WIDTH: f32 = 60.0;
+
 fn format_power(mw: f32) -> String {
     if mw >= 1000.0 {
         format!("{:.3} W", mw / 1000.0)
@@ -37,7 +44,6 @@ pub struct CalibrationPageState {
     pub checked: HashMap<u8, bool>,
     show_confirm_dialog: bool,
     show_erase_confirm_dialog: bool,
-    fine_step: bool,
     plot_reset_requested: bool,
     pending_skip_count: u32,
     skip_debounce_until: Option<Instant>,
@@ -50,7 +56,6 @@ impl Default for CalibrationPageState {
             checked: HashMap::new(),
             show_confirm_dialog: false,
             show_erase_confirm_dialog: false,
-            fine_step: false,
             plot_reset_requested: false,
             pending_skip_count: 0,
             skip_debounce_until: None,
@@ -382,13 +387,16 @@ pub fn show(
         shared.meter.lock().unwrap().update_hz = hz;
 
         ui.separator();
-        ui.label("Attenuation:");
-        let response = ui.add(
-            egui::DragValue::new(&mut atten_db)
-                .suffix(" dB")
-                .range(-50.0..=100.0)
-                .speed(0.1),
-        );
+        ui.label("Meter offset:")
+            .on_hover_text(METER_OFFSET_TOOLTIP);
+        let response = ui
+            .add(
+                egui::DragValue::new(&mut atten_db)
+                    .suffix(" dB")
+                    .range(-50.0..=100.0)
+                    .speed(0.1),
+            )
+            .on_hover_text(METER_OFFSET_TOOLTIP);
         if response.changed() {
             shared.meter.lock().unwrap().attenuation_db = atten_db;
             let mut settings = AppSettings::load();
@@ -644,7 +652,8 @@ pub fn show(
 
     ui.columns(3, |columns| {
         columns[0].group(|ui| {
-            ui.set_min_width(ui.available_width());
+            let group_width = ui.available_width();
+            ui.set_min_width(group_width);
             let top = ui.cursor().top();
             ui.strong("Controls");
             egui::ScrollArea::horizontal()
@@ -744,30 +753,29 @@ pub fn show(
                             }
 
                             let mut current_mv = manual_dac_mv;
-                            let step = if page.fine_step { 1.0 } else { 25.0 };
-                            let message = if page.fine_step {
-                                "DAC mV (+/-1mv)"
-                            } else {
-                                "DAC mV (+/-25mV)"
-                            };
-                            grid_label(ui, message);
-                            let response = ui.add_enabled(
-                                manual_mode,
-                                egui::Slider::new(&mut current_mv, 0..=3300)
-                                    .clamping(SliderClamping::Never)
-                                    .drag_value_speed(0.1)
-                                    .step_by(step),
-                            );
+                            grid_label(ui, "DAC mV (+/-1mV)");
+                            // Widen the slider's rail to the group's width (minus the
+                            // label column and room for its own value text) instead of
+                            // the ~100px style default -- narrower rails make every
+                            // drag jump by many mV per pixel.
+                            let dac_slider_width =
+                                (group_width - LEFT_COLUMN_MIN_WIDTH - DAC_SLIDER_RESERVED_WIDTH)
+                                    .max(DAC_SLIDER_MIN_WIDTH);
+                            let response = ui
+                                .scope(|ui| {
+                                    ui.spacing_mut().slider_width = dac_slider_width;
+                                    ui.add_enabled(
+                                        manual_mode,
+                                        egui::Slider::new(&mut current_mv, 0..=3300)
+                                            .clamping(SliderClamping::Never)
+                                            .drag_value_speed(0.1)
+                                            .step_by(1.0),
+                                    )
+                                })
+                                .inner;
                             if response.changed() {
                                 let _ = cmd_tx.send(Command::SetManualDac { mv: current_mv });
                             }
-                            ui.end_row();
-
-                            grid_label(ui, "Fine");
-                            ui.add_enabled(
-                                manual_mode,
-                                egui::Checkbox::new(&mut page.fine_step, ""),
-                            );
                             ui.end_row();
 
                             grid_label(ui, "PA");
