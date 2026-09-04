@@ -419,6 +419,9 @@ pub struct SweepEngine {
     warm_up_pending: bool,
     last_pa_temp_c: Option<f32>,
     last_mcu_temp_c: Option<f32>,
+    // Set while re-calibrating the current cell after it hit PA-failure / not-settled;
+    // cleared when the sweep moves on, so each cell gets at most one retry.
+    current_cell_retried: bool,
 }
 
 enum PendingSend {
@@ -497,6 +500,7 @@ impl SweepEngine {
             warm_up_pending: false,
             last_pa_temp_c: None,
             last_mcu_temp_c: None,
+            current_cell_retried: false,
         }
     }
 
@@ -505,6 +509,14 @@ impl SweepEngine {
             return 1.0;
         }
         self.completed_steps as f32 / self.total_steps as f32
+    }
+
+    fn lowest_power_level(&self) -> u8 {
+        self.target_mw_by_level
+            .iter()
+            .min_by_key(|&(_, &mw)| mw)
+            .map(|(&lvl, _)| lvl)
+            .unwrap_or(self.levels[0])
     }
 
     pub fn start(&mut self, capability: FrequencyCapability) {
@@ -520,6 +532,7 @@ impl SweepEngine {
         self.session_active = true;
         self.boost_mode = BoostMode::Auto;
         self.warm_up_pending = true;
+        self.current_cell_retried = false;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
         self.pending_sends.push_back(PendingSend::CalibrationState);
@@ -602,6 +615,7 @@ impl SweepEngine {
     }
 
     fn advance_position(&mut self) -> Option<(u8, usize)> {
+        self.current_cell_retried = false;
         let resume = match &self.state {
             EngineState::Manual => ResumeMode::Manual,
             _ => ResumeMode::Automatic,
@@ -721,6 +735,7 @@ impl SweepEngine {
         self.pending_frequency_push = None;
         self.manual_send_pending = false;
         self.warm_up_pending = false;
+        self.current_cell_retried = false;
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.clear();
@@ -738,6 +753,7 @@ impl SweepEngine {
             EngineState::Automatic(_) => ResumeMode::Automatic,
             _ => return None,
         };
+        self.current_cell_retried = false;
         let starting_level = self.levels[self.level_idx];
         debug!(target: "vtx", "[sweep] skip x{count} starting at level={starting_level} freq_idx={} ({}/{} steps completed)",
             self.freq_idx, self.completed_steps, self.total_steps);
@@ -1122,12 +1138,7 @@ impl SweepEngine {
         // endpoint is sign-dependent -- ~0mV for a normal PA, ~3300mV for one with
         // an inverted DAC sign -- so `coarse_ramp_start_vbias_mv` picks it. Never a
         // mid/high bias: at the wrong end an inverted PA would be at full power.
-        let soak_level = self
-            .target_mw_by_level
-            .iter()
-            .min_by_key(|&(_, &mw)| mw)
-            .map(|(&lvl, _)| lvl)
-            .unwrap_or(self.levels[self.level_idx]);
+        let soak_level = self.lowest_power_level();
         let (bound_lo, bound_hi) = self.effective_bounds(soak_level);
         WarmUpState {
             level: soak_level,
@@ -1174,6 +1185,8 @@ impl SweepEngine {
             self.pa_enable_settle_pending = false;
             self.boost_settle_until = None;
             self.warm_up_pending = false;
+            // Back to EnteringPoint at the current indices -- for a retry that is
+            // still the cell that just failed, so it is re-calibrated in place.
             self.state = EngineState::Automatic(AutomaticStep::EnteringPoint);
             return Ok(false);
         }
@@ -1931,10 +1944,32 @@ impl SweepEngine {
     }
 
     fn finish_scan_pa(&mut self, level: u8, vbias_mv: i32, outcome: ScanPaOutcome) {
-        self.completed_steps += 1;
-        let success = matches!(outcome, ScanPaOutcome::Success);
         let pa_failure = matches!(outcome, ScanPaOutcome::PaFailure);
         let not_settled = matches!(outcome, ScanPaOutcome::NotSettled);
+
+        // First thermal failure on this cell: drop the PA to its lowest power, let
+        // the temperature re-stabilise (the warm-up soak), then re-calibrate this
+        // same point in place -- once. The soak completion returns to EnteringPoint
+        // at the current indices, which we have not advanced.
+        if (pa_failure || not_settled) && !self.current_cell_retried {
+            self.current_cell_retried = true;
+            debug!(target: "vtx", "[sweep] ScanPa level={level} freq={}MHz: {} -- dropping the PA to minimum power, re-soaking, then retrying this point once",
+                self.frequencies[self.freq_idx],
+                if not_settled { "not settled" } else { "PA failure" });
+            let soak_level = self.lowest_power_level();
+            let (lo, hi) = self.effective_bounds(soak_level);
+            let low_mv = coarse_ramp_start_vbias_mv(self.sign_inverted, lo, hi);
+            self.pending_sends.push_back(PendingSend::DacLow {
+                level: soak_level,
+                vbias_mv: low_mv as u16,
+            });
+            self.warm_up_pending = true;
+            self.state = EngineState::Automatic(AutomaticStep::EnteringPoint);
+            return;
+        }
+
+        self.completed_steps += 1;
+        let success = matches!(outcome, ScanPaOutcome::Success);
         self.pending_result = Some(SweepResult {
             level,
             freq_idx: self.freq_idx,
