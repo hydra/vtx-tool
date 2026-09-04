@@ -137,6 +137,125 @@ const DETECTOR_BRACKET_SKIP_FIRST: usize = 5;
 const DETECTOR_BRACKET_SEED_STEP_MV: i32 = 4;
 const DETECTOR_BRACKET_CONVERGE_MV: i32 = 3;
 
+// Once, before the first calibration point, enable the PA at its LOWEST power
+// setting and hold it there until its temperature stops climbing. Calibrating a
+// cold PA produces bias/detector points that no longer hold once it self-heats to
+// its running temperature. Never drive the PA hard for this -- running it at
+// maximum can destroy the hardware, and its own quiescent dissipation while
+// enabled is enough to reach a stable operating temperature.
+const WARM_UP_TEMP_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const WARM_UP_MAX_DURATION: Duration = Duration::from_secs(120);
+// A well-placed NTC near the PA tracks junction temperature closely, so a short
+// flat window is enough. MCU temperature is always available but lags and moves
+// slowly, so it only earns an early exit after a longer minimum soak; with no
+// sensor at all we fall back to a fixed timed soak.
+const WARM_UP_BLIND_DURATION: Duration = Duration::from_secs(45);
+const WARM_UP_PA_MIN_DURATION: Duration = Duration::from_secs(8);
+const WARM_UP_PA_STABLE_WINDOW: Duration = Duration::from_secs(6);
+const WARM_UP_PA_STABLE_DELTA_C: f32 = 0.8;
+const WARM_UP_MCU_MIN_DURATION: Duration = Duration::from_secs(30);
+const WARM_UP_MCU_STABLE_WINDOW: Duration = Duration::from_secs(20);
+const WARM_UP_MCU_STABLE_DELTA_C: f32 = 0.6;
+
+fn plausible_temp_c(temp: Option<f32>) -> Option<f32> {
+    temp.filter(|t| t.is_finite() && (-40.0..=150.0).contains(t))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThermalProbe {
+    Pa,
+    Mcu,
+    None,
+}
+
+impl ThermalProbe {
+    fn select(pa_temp_c: Option<f32>, mcu_temp_c: Option<f32>) -> Self {
+        if plausible_temp_c(pa_temp_c).is_some() {
+            ThermalProbe::Pa
+        } else if plausible_temp_c(mcu_temp_c).is_some() {
+            ThermalProbe::Mcu
+        } else {
+            ThermalProbe::None
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            ThermalProbe::None => 0,
+            ThermalProbe::Mcu => 1,
+            ThermalProbe::Pa => 2,
+        }
+    }
+
+    fn sample(self, pa_temp_c: Option<f32>, mcu_temp_c: Option<f32>) -> Option<f32> {
+        match self {
+            ThermalProbe::Pa => plausible_temp_c(pa_temp_c),
+            ThermalProbe::Mcu => plausible_temp_c(mcu_temp_c),
+            ThermalProbe::None => None,
+        }
+    }
+
+    fn min_soak(self) -> Duration {
+        match self {
+            ThermalProbe::Pa => WARM_UP_PA_MIN_DURATION,
+            ThermalProbe::Mcu => WARM_UP_MCU_MIN_DURATION,
+            ThermalProbe::None => WARM_UP_BLIND_DURATION,
+        }
+    }
+
+    fn stable_window(self) -> Duration {
+        match self {
+            ThermalProbe::Mcu => WARM_UP_MCU_STABLE_WINDOW,
+            _ => WARM_UP_PA_STABLE_WINDOW,
+        }
+    }
+
+    fn stable_delta_c(self) -> f32 {
+        match self {
+            ThermalProbe::Mcu => WARM_UP_MCU_STABLE_DELTA_C,
+            _ => WARM_UP_PA_STABLE_DELTA_C,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ThermalProbe::Pa => "PA-NTC",
+            ThermalProbe::Mcu => "MCU-temp",
+            ThermalProbe::None => "timed",
+        }
+    }
+}
+
+fn warm_up_settled(st: &WarmUpState, elapsed: Duration) -> Option<&'static str> {
+    if elapsed >= WARM_UP_MAX_DURATION {
+        return Some("max soak time");
+    }
+    if st.probe == ThermalProbe::None {
+        return (elapsed >= WARM_UP_BLIND_DURATION).then_some("timed soak, no sensor");
+    }
+    if elapsed < st.probe.min_soak() {
+        return None;
+    }
+    let window = st.probe.stable_window();
+    let now = Instant::now();
+    let spans_window = st
+        .temps
+        .front()
+        .is_some_and(|&(t, _)| now.duration_since(t) >= window);
+    if !spans_window {
+        return None;
+    }
+    let cutoff = now.checked_sub(window).unwrap_or(now);
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &(t, temp) in &st.temps {
+        if t >= cutoff {
+            lo = lo.min(temp);
+            hi = hi.max(temp);
+        }
+    }
+    (hi.is_finite() && hi - lo <= st.probe.stable_delta_c()).then_some("temperature flattened")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeMode {
     Automatic,
@@ -187,8 +306,17 @@ pub(crate) struct ScanDetectorState {
     last_reading: Option<msp::PaCalibrationReading>,
 }
 
+pub(crate) struct WarmUpState {
+    level: u8,
+    vbias_mv: i32,
+    started: Instant,
+    probe: ThermalProbe,
+    temps: VecDeque<(Instant, f32)>,
+}
+
 pub(crate) enum AutomaticStep {
     EnteringPoint,
+    WarmUp(WarmUpState),
     ScanPa(ScanPaState),
     ScanDetector(ScanDetectorState),
 }
@@ -288,6 +416,9 @@ pub struct SweepEngine {
     last_boost_on: Option<bool>,
     boost_settle_until: Option<Instant>,
     pa_enable_settle_pending: bool,
+    warm_up_pending: bool,
+    last_pa_temp_c: Option<f32>,
+    last_mcu_temp_c: Option<f32>,
 }
 
 enum PendingSend {
@@ -363,6 +494,9 @@ impl SweepEngine {
             last_boost_on: None,
             boost_settle_until: None,
             pa_enable_settle_pending: false,
+            warm_up_pending: false,
+            last_pa_temp_c: None,
+            last_mcu_temp_c: None,
         }
     }
 
@@ -385,6 +519,7 @@ impl SweepEngine {
         self.meter_capability = capability;
         self.session_active = true;
         self.boost_mode = BoostMode::Auto;
+        self.warm_up_pending = true;
         debug!(target: "vtx", "[sweep] starting: {} levels {:?}, {} frequencies {:?}, tolerance={}%, sign_inverted={}, sweep_hz={}, meter_capability={:?}",
             self.levels.len(), self.levels, self.frequencies.len(), self.frequencies, self.tolerance_pct, self.sign_inverted, self.sweep_hz, self.meter_capability);
         self.pending_sends.push_back(PendingSend::CalibrationState);
@@ -585,6 +720,7 @@ impl SweepEngine {
         self.state = EngineState::Idle;
         self.pending_frequency_push = None;
         self.manual_send_pending = false;
+        self.warm_up_pending = false;
         self.session_active = false;
         self.boost_mode = BoostMode::Auto;
         self.pending_sends.clear();
@@ -780,6 +916,12 @@ impl SweepEngine {
                 }
                 self.last_boost_on = Some(boost_on);
             }
+            if let Some(t) = plausible_temp_c(reading.pa_temp_c) {
+                self.last_pa_temp_c = Some(t);
+            }
+            if let Some(t) = plausible_temp_c(reading.mcu_temp_c) {
+                self.last_mcu_temp_c = Some(t);
+            }
         }
 
         if !self.pending_sends.is_empty() {
@@ -875,6 +1017,7 @@ impl SweepEngine {
         let vbias_mv_now = match &self.state {
             EngineState::Automatic(AutomaticStep::ScanPa(st)) => st.vbias_mv,
             EngineState::Automatic(AutomaticStep::ScanDetector(st)) => st.vbias_mv,
+            EngineState::Automatic(AutomaticStep::WarmUp(st)) => st.vbias_mv,
             _ => 0,
         };
         if self.maybe_trip_connection_lost(vtx_ready, meter_ready, vbias_mv_now) {
@@ -906,6 +1049,19 @@ impl SweepEngine {
         };
 
         match step {
+            AutomaticStep::EnteringPoint if self.warm_up_pending => {
+                let st = self.build_warm_up_state();
+                debug!(target: "vtx", "[sweep] warming up: PA at its lowest-power DAC endpoint (level={} vbias_mv={} boost=On, sign_inverted={}), soaking on the {} sensor (max {WARM_UP_MAX_DURATION:?})",
+                    st.level, st.vbias_mv, self.sign_inverted, st.probe.label());
+                for &lvl in &self.levels {
+                    self.per_level_status.insert(
+                        lvl,
+                        LevelStatus::InProgress(format!("warming up ({} soak)", st.probe.label())),
+                    );
+                }
+                self.tick_warm_up(link, throttled, st)
+            }
+            AutomaticStep::WarmUp(st) => self.tick_warm_up(link, throttled, st),
             AutomaticStep::EnteringPoint => {
                 let (bound_lo, bound_hi) = self.effective_bounds(level);
                 let start_vbias_mv =
@@ -959,6 +1115,81 @@ impl SweepEngine {
                 link, history, now_seq, throttled, level, freq_mhz, target_mw, st,
             ),
         }
+    }
+
+    fn build_warm_up_state(&self) -> WarmUpState {
+        // Soak at the LOWEST power level and its lowest-power DAC endpoint. That
+        // endpoint is sign-dependent -- ~0mV for a normal PA, ~3300mV for one with
+        // an inverted DAC sign -- so `coarse_ramp_start_vbias_mv` picks it. Never a
+        // mid/high bias: at the wrong end an inverted PA would be at full power.
+        let soak_level = self
+            .target_mw_by_level
+            .iter()
+            .min_by_key(|&(_, &mw)| mw)
+            .map(|(&lvl, _)| lvl)
+            .unwrap_or(self.levels[self.level_idx]);
+        let (bound_lo, bound_hi) = self.effective_bounds(soak_level);
+        WarmUpState {
+            level: soak_level,
+            vbias_mv: coarse_ramp_start_vbias_mv(self.sign_inverted, bound_lo, bound_hi),
+            started: Instant::now(),
+            probe: ThermalProbe::select(self.last_pa_temp_c, self.last_mcu_temp_c),
+            temps: VecDeque::new(),
+        }
+    }
+
+    fn tick_warm_up(
+        &mut self,
+        link: &mut MspLink,
+        throttled: bool,
+        mut st: WarmUpState,
+    ) -> anyhow::Result<bool> {
+        // A status frame carrying the NTC may only arrive after the soak starts;
+        // upgrade to the better sensor when it appears, never downgrade on a blip.
+        let available = ThermalProbe::select(self.last_pa_temp_c, self.last_mcu_temp_c);
+        if available.rank() > st.probe.rank() {
+            st.probe = available;
+            st.temps.clear();
+        }
+
+        let now = Instant::now();
+        let sample_due = st
+            .temps
+            .back()
+            .map(|&(t, _)| now.duration_since(t) >= WARM_UP_TEMP_SAMPLE_INTERVAL)
+            .unwrap_or(true);
+        if sample_due {
+            if let Some(temp_c) = st.probe.sample(self.last_pa_temp_c, self.last_mcu_temp_c) {
+                st.temps.push_back((now, temp_c));
+                let window = st.probe.stable_window();
+                while st.temps.len() > 2 && now.duration_since(st.temps[1].0) > window {
+                    st.temps.pop_front();
+                }
+            }
+        }
+
+        let elapsed = st.started.elapsed();
+        if let Some(reason) = warm_up_settled(&st, elapsed) {
+            debug!(target: "vtx", "[sweep] warm-up done after {elapsed:?} ({reason}) -- starting calibration");
+            self.pa_enable_settle_pending = false;
+            self.boost_settle_until = None;
+            self.warm_up_pending = false;
+            self.state = EngineState::Automatic(AutomaticStep::EnteringPoint);
+            return Ok(false);
+        }
+
+        // Hold the DAC at the sign-correct lowest-power endpoint with boost forced
+        // On -- the firmware applies `mv` to the DAC literally (pid off), and the
+        // Auto boost byte left the rail, and the PA, off. This is the minimum
+        // powered state; it never approaches full power for either DAC sign.
+        let mut sent = false;
+        if !throttled {
+            self.send_calibration_with_boost(link, st.level, st.vbias_mv, BoostMode::On)?;
+            self.last_send = Instant::now();
+            sent = true;
+        }
+        self.state = EngineState::Automatic(AutomaticStep::WarmUp(st));
+        Ok(sent)
     }
 
     fn tick_scan_pa(
@@ -1413,6 +1644,13 @@ impl SweepEngine {
                     detector: None,
                 }
             }
+            EngineState::Automatic(AutomaticStep::WarmUp(_)) => StepDebugInfo {
+                scan_phase: "WarmUp",
+                drop_detector_active: false,
+                fine_bound_mv: None,
+                fine_highest_avg_mw: None,
+                detector: None,
+            },
             EngineState::Automatic(AutomaticStep::ScanDetector(st)) => StepDebugInfo {
                 scan_phase: "Inactive",
                 drop_detector_active: false,
@@ -1502,6 +1740,7 @@ impl SweepEngine {
         let vbias_mv_at_loss = match &self.state {
             EngineState::Automatic(AutomaticStep::ScanPa(st)) => st.vbias_mv,
             EngineState::Automatic(AutomaticStep::ScanDetector(st)) => st.vbias_mv,
+            EngineState::Automatic(AutomaticStep::WarmUp(st)) => st.vbias_mv,
             _ => 0,
         };
         let level = self.levels.get(self.level_idx).copied().unwrap_or(0);
@@ -1667,13 +1906,24 @@ impl SweepEngine {
         level: u8,
         vbias_mv: i32,
     ) -> anyhow::Result<()> {
+        let boost = self.boost_mode;
+        self.send_calibration_with_boost(link, level, vbias_mv, boost)
+    }
+
+    fn send_calibration_with_boost(
+        &mut self,
+        link: &mut MspLink,
+        level: u8,
+        vbias_mv: i32,
+        boost: BoostMode,
+    ) -> anyhow::Result<()> {
         let (lo, hi) = self.effective_bounds(level);
         let vbias_mv = vbias_mv.clamp(lo, hi) as u16;
         let payload = msp::encode_pa_calibration_request(
             level,
             Some(vbias_mv),
             self.session_active,
-            self.boost_mode.wire_byte(),
+            boost.wire_byte(),
         );
         link.send_v2(function::SET_PACALIBRATION, Some(&payload))?;
         link.note_sent(MspCommandKind::Calibration);
