@@ -72,7 +72,8 @@ pub fn spawn(
         let mut last_meter_read = Instant::now();
         let mut vtx_last_seen: Option<Instant> = None;
         let mut meter_last_seen: Option<Instant> = None;
-        let mut last_meter_alive_check = Instant::now();
+        // Timestamp of the last serial command sent to the meter (any kind).
+        let mut last_meter_command = Instant::now();
         let mut vtx_port_path: Option<String> = None;
         let mut meter_port_path: Option<String> = None;
         let mut vtx_last_reconnect_attempt = Instant::now();
@@ -206,8 +207,7 @@ pub fn spawn(
                                     meter_port_path = Some(port.clone());
                                     shared.meter.lock().unwrap().port_state = PortState::Ready;
                                     last_meter_read = Instant::now() - Duration::from_secs(1);
-                                    last_meter_alive_check =
-                                        Instant::now() - Duration::from_secs(1);
+                                    last_meter_command = Instant::now() - Duration::from_secs(1);
                                 }
                                 Err(e) => {
                                     error!(target: "meter", "open failed: {e}");
@@ -803,6 +803,7 @@ pub fn spawn(
             let meter_ready = meter_last_seen
                 .map(|t| t.elapsed() < READY_WINDOW)
                 .unwrap_or(false);
+            let meter_command_gap = shared.meter.lock().unwrap().kind.min_command_gap();
             if let Some(link) = vtx.as_mut() {
                 let (history_snapshot, reading_seq) = {
                     let meter_state = shared.meter.lock().unwrap();
@@ -822,17 +823,27 @@ pub fn spawn(
                         Ok(_sent) => {}
                         Err(e) => error!(target: "vtx", "sweep step failed: {e}"),
                     }
-                    if let Some(freq) = engine.pending_meter_frequency.take() {
-                        if let Some(m) = meter.as_mut() {
+                    match (
+                        engine.pending_meter_frequency,
+                        meter.as_mut(),
+                        last_meter_command.elapsed() >= meter_command_gap,
+                    ) {
+                        (Some(freq), None, _) => {
+                            engine.pending_meter_frequency = None;
+                            error!(target: "meter", "sweep requested set_frequency({freq}) but the power meter isn't connected");
+                        }
+                        (Some(freq), Some(m), true) => {
+                            engine.pending_meter_frequency = None;
                             match m.set_frequency(freq) {
                                 Ok(()) => {
                                     debug!(target: "meter", "set_frequency({freq}) requested")
                                 }
                                 Err(e) => error!(target: "meter", "set_frequency failed: {e}"),
                             }
-                        } else {
-                            error!(target: "meter", "sweep requested set_frequency({freq}) but the power meter isn't connected");
+                            last_meter_command = Instant::now();
                         }
+                        // Meter present but inside the inter-command gap: retry next iteration.
+                        _ => {}
                     }
                     if let Some(result) = engine.pending_result.take() {
                         if result.success {
@@ -867,48 +878,56 @@ pub fn spawn(
                 }
             }
 
-            if let Some(m) = meter.as_mut() {
-                let interval = {
-                    let hz = shared.meter.lock().unwrap().update_hz.max(0.01);
-                    Duration::from_secs_f64(1.0 / hz)
-                };
-                if last_meter_read.elapsed() >= interval {
-                    last_meter_read = Instant::now();
-                    match m.read_dbm(Duration::from_millis(300)) {
-                        Ok(raw_dbm) => {
-                            let attenuation_db = shared.meter.lock().unwrap().attenuation_db;
-                            let dbm = raw_dbm + attenuation_db;
-                            let mw = 10f32.powf(dbm / 10.0);
-                            debug!(target: "meter", "{raw_dbm:.2} dBm raw, {dbm:.2} dBm corrected (+{attenuation_db:.1}dB) ({mw:.6} mW)");
-                            let elapsed = start.elapsed().as_secs_f64();
-                            let mut meter_state = shared.meter.lock().unwrap();
-                            meter_state.last_dbm = Some(dbm);
-                            meter_state.power_history.push_back((elapsed, mw));
-                            meter_state.reading_seq += 1;
-                        }
-                        Err(e) => error!(target: "meter", "read failed: {e}"),
-                    }
-                    ctx.request_repaint();
-                }
-            }
-
+            // One serial command to the meter per loop iteration, never closer than
+            // `meter_command_gap` to the previous one. A power read doubles as an
+            // aliveness signal; `check_alive` only fills in when a read isn't due and
+            // the last confirmed contact has gone stale.
             let mut meter_link_lost = false;
             if let Some(m) = meter.as_mut() {
-                if last_meter_alive_check.elapsed() >= Duration::from_millis(100) {
-                    last_meter_alive_check = Instant::now();
-                    match m.check_alive(Duration::from_millis(300)) {
-                        Ok(()) => meter_last_seen = Some(Instant::now()),
-                        Err(e) => {
-                            let is_timeout = e
-                                .downcast_ref::<std::io::Error>()
-                                .map(|io| io.kind() == std::io::ErrorKind::TimedOut)
-                                .unwrap_or(false);
-                            if is_timeout {
-                                debug!(target: "meter", "alive-check timed out, retrying");
-                            } else {
+                let read_interval = {
+                    let hz = shared.meter.lock().unwrap().update_hz.max(0.01);
+                    Duration::from_secs_f64(1.0 / hz).max(meter_command_gap)
+                };
+                let read_due = last_meter_read.elapsed() >= read_interval;
+                let contact_stale = meter_last_seen
+                    .map(|t| t.elapsed() >= READY_WINDOW)
+                    .unwrap_or(true);
+                if last_meter_command.elapsed() >= meter_command_gap && (read_due || contact_stale)
+                {
+                    if read_due {
+                        last_meter_read = Instant::now();
+                        let result = m.read_dbm(Duration::from_millis(300));
+                        last_meter_command = Instant::now();
+                        match result {
+                            Ok(raw_dbm) => {
+                                meter_last_seen = Some(Instant::now());
+                                let attenuation_db = shared.meter.lock().unwrap().attenuation_db;
+                                let dbm = raw_dbm + attenuation_db;
+                                let mw = 10f32.powf(dbm / 10.0);
+                                debug!(target: "meter", "{raw_dbm:.2} dBm raw, {dbm:.2} dBm corrected (+{attenuation_db:.1}dB) ({mw:.6} mW)");
+                                let elapsed = start.elapsed().as_secs_f64();
+                                let mut meter_state = shared.meter.lock().unwrap();
+                                meter_state.last_dbm = Some(dbm);
+                                meter_state.power_history.push_back((elapsed, mw));
+                                meter_state.reading_seq += 1;
+                            }
+                            Err(e) if is_hard_meter_error(&e) => {
                                 error!(target: "meter", "power meter link error, disconnecting: {e}");
                                 meter_link_lost = true;
                             }
+                            Err(e) => error!(target: "meter", "read failed: {e}"),
+                        }
+                        ctx.request_repaint();
+                    } else {
+                        let result = m.check_alive(Duration::from_millis(300));
+                        last_meter_command = Instant::now();
+                        match result {
+                            Ok(()) => meter_last_seen = Some(Instant::now()),
+                            Err(e) if is_hard_meter_error(&e) => {
+                                error!(target: "meter", "power meter link error, disconnecting: {e}");
+                                meter_link_lost = true;
+                            }
+                            Err(_) => debug!(target: "meter", "alive-check timed out, retrying"),
                         }
                     }
                 }
@@ -952,7 +971,7 @@ pub fn spawn(
                                 meter_last_seen = None;
                                 shared.meter.lock().unwrap().port_state = PortState::Ready;
                                 last_meter_read = Instant::now() - Duration::from_secs(1);
-                                last_meter_alive_check = Instant::now() - Duration::from_secs(1);
+                                last_meter_command = Instant::now() - Duration::from_secs(1);
                             }
                             Err(e) => {
                                 debug!(target: "meter", "reconnect attempt for {path} failed: {e}")
@@ -965,6 +984,17 @@ pub fn spawn(
             std::thread::sleep(Duration::from_millis(10));
         }
     });
+}
+
+/// A meter error that means the link is gone (as opposed to a slow reply or a
+/// garbled line, which just get logged and retried).
+fn is_hard_meter_error(e: &anyhow::Error) -> bool {
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return io.kind() != std::io::ErrorKind::TimedOut;
+    }
+    // Non-IO errors are parse failures on an otherwise-live link, except an
+    // explicit end-of-stream from the port.
+    e.to_string().contains("closed the connection")
 }
 
 fn build_status_displayport_frames(status: &VtxStatus) -> Vec<Vec<u8>> {

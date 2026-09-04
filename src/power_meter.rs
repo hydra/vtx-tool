@@ -67,6 +67,14 @@ impl PowerMeterKind {
         }
     }
 
+    /// Minimum spacing between *any* two serial commands. The ImmersionRC firmware
+    /// garbles its reply (`Syntax`, a truncated number, or its power-on banner) if
+    /// the next command lands before the previous one has been fully answered, so
+    /// power reads, alive checks and frequency sets all share this floor.
+    pub fn min_command_gap(self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.max_update_hz().max(1) as f64)
+    }
+
     pub fn capability(self) -> FrequencyCapability {
         match self {
             PowerMeterKind::ImmersionRcV1 => FrequencyCapability::ManualBand {
